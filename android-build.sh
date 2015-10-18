@@ -29,7 +29,8 @@ build() {
 		tar xvf ../libtool-2.4.6.tar.gz || exit 1
 		cd libtool-2.4.6
 		mkdir -p install
-		../../setCrossEnvironment-$ARCH.sh ./configure --host=$TOOLCHAIN --prefix=`pwd`/install --disable-shared || exit 1
+		env CFLAGS=-DLT_DEBUG_LOADERS=1 \
+			../../setCrossEnvironment-$ARCH.sh ./configure --host=$TOOLCHAIN --prefix=`pwd`/install --disable-shared || exit 1
 		make -j$NCPU || exit 1
 		make install || exit 1
 		cd ..
@@ -89,6 +90,7 @@ build() {
 		LIBSNDFILE_CFLAGS=-I`pwd`/libsndfile-1.0.25/install/include \
 		LIBSNDFILE_LIBS="-L`pwd`/libsndfile-1.0.25/install/lib -lsndfile" \
 		ALLOW_UNRESOLVED_SYMBOLS=1 \
+		ac_cv_func_mkfifo=yes \
 		../setCrossEnvironment-$ARCH.sh \
 		  ../configure            \
 		  --prefix=`pwd`/install  \
@@ -125,7 +127,6 @@ build() {
 		  --disable-systemd-login \
 		  --disable-systemd-journal \
 		  --disable-manpages      \
-		  --enable-force-preopen  \
 		  --without-caps          \
 		|| exit 1
 
