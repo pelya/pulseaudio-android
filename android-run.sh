@@ -6,7 +6,8 @@ adb shell ls -l /data/local/tmp/pulseaudio | grep rwx || PUSH=true
 
 $PUSH && {
 	adb shell 'sh -c "rm -r /data/local/tmp/*"'
-	adb push armeabi-v7a/install/bin/pulseaudio /data/local/tmp/pulseaudio
+	adb push busybox /data/local/tmp/
+	adb push armeabi-v7a/install/bin/pulseaudio /data/local/tmp/
 	adb push armeabi-v7a/install/lib/libpulse.so.0.18.2 /data/local/tmp/
 	adb shell ln -s libpulse.so.0.18.2 /data/local/tmp/libpulse.so.0
 	adb shell ln -s libpulse.so.0.18.2 /data/local/tmp/libpulse.so
