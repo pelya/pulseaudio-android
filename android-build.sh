@@ -83,10 +83,12 @@ build() {
 		LDFLAGS="-L`pwd`/libtool-2.4.6/install/lib \
 			-L`pwd`/json-c-12916e229c769da4929f6df7f038ab51cf0cb067/install/lib \
 			-L`pwd`/libsndfile-1.0.25/install/lib -pie" \
+		LIBS="-ljson-c -lsndfile" \
 		LIBJSON_CFLAGS=-I`pwd`/json-c-12916e229c769da4929f6df7f038ab51cf0cb067/install/include \
 		LIBJSON_LIBS="-L`pwd`/json-c-12916e229c769da4929f6df7f038ab51cf0cb067/install/lib -ljson-c" \
 		LIBSNDFILE_CFLAGS=-I`pwd`/libsndfile-1.0.25/install/include \
 		LIBSNDFILE_LIBS="-L`pwd`/libsndfile-1.0.25/install/lib -lsndfile" \
+		ALLOW_UNRESOLVED_SYMBOLS=1 \
 		../setCrossEnvironment-$ARCH.sh \
 		  ../configure            \
 		  --prefix=`pwd`/install  \
@@ -95,7 +97,7 @@ build() {
 		  --disable-rpath         \
 		  --disable-neon-opt      \
 		  --enable-static         \
-		  --disable-shared        \
+		  --enable-shared         \
 		  --disable-x11           \
 		  --disable-tests         \
 		  --disable-oss-output    \
@@ -123,15 +125,17 @@ build() {
 		  --disable-systemd-login \
 		  --disable-systemd-journal \
 		  --disable-manpages      \
-		  --enable-static-bins    \
 		  --enable-force-preopen  \
 		  --without-caps          \
 		|| exit 1
+
+		#  --enable-static-bins    \
+		#  --disable-shared        \
+
 	} || exit 1
 
 	make -j$NCPU V=1 || exit 1
-	make install || exit 1
-	../setCrossEnvironment-$ARCH.sh sh -c '$STRIP --strip-unneeded install/bin/pulseaudio' || exit 1
+	make install-strip || exit 1
 	cd ..
 }
 

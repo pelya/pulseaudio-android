@@ -6,4 +6,6 @@ adb shell ls -l /data/local/tmp/pulseaudio | grep rwx || {
 }
 
 
-adb shell "cd /data/local/tmp ; HOME=/data/local/tmp ./pulseaudio --disable-shm -n -F pulseaudio.conf --use-pid-file=false --log-target=stderr --log-level=debug --daemonize=false"
+adb shell "cd /data/local/tmp ; HOME=/data/local/tmp TMPDIR=/data/local/tmp \
+	./pulseaudio --disable-shm -n -F pulseaudio.conf --daemonize=false \
+	--use-pid-file=false --log-target=stderr --log-level=debug"
