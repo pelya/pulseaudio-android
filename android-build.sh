@@ -11,7 +11,9 @@ ARCH_LIST="armeabi x86 mips"
 	env NOCONFIGURE=1 ./bootstrap.sh || exit 1
 }
 
-for ARCH in $ARCH_LIST; do
+build() {
+
+	ARCH=$1
 
 	case $ARCH in
 		x86) TOOLCHAIN=i686-linux-android;;
@@ -131,4 +133,10 @@ for ARCH in $ARCH_LIST; do
 	make install || exit 1
 	../setCrossEnvironment-$ARCH.sh sh -c '$STRIP --strip-unneeded install/bin/pulseaudio' || exit 1
 	cd ..
+}
+
+for ARCH in $ARCH_LIST; do
+	build $ARCH &
 done
+
+wait
