@@ -1,7 +1,7 @@
 #!/bin/sh
 
 NCPU=4
-ARCH_LIST="armeabi x86 mips"
+ARCH_LIST="armeabi x86 mips armeabi-v7a"
 
 [ -e libtool-2.4.6.tar.gz ] || wget http://ftpmirror.gnu.org/libtool/libtool-2.4.6.tar.gz || exit 1
 [ -e 12916e229c769da4929f6df7f038ab51cf0cb067.tar.gz ] || wget https://github.com/json-c/json-c/archive/12916e229c769da4929f6df7f038ab51cf0cb067.tar.gz || exit 1
