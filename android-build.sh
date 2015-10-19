@@ -147,6 +147,6 @@ done
 wait
 
 for ARCH in $ARCH_LIST; do
-	cp -f $ARCH/install/bin/pulseaudio pulseaudio-$ARCH || exit 1
+	[ -e $ARCH/install/bin/pulseaudio ] || exit 1
 done
 exit 0
