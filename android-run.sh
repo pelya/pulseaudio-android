@@ -8,9 +8,9 @@ $PUSH && {
 	adb shell 'sh -c "rm -r /data/local/tmp/*"'
 	adb push busybox /data/local/tmp/
 	adb push armeabi-v7a/install/bin/pulseaudio /data/local/tmp/
-	adb push armeabi-v7a/install/lib/libpulse.so.0.18.2 /data/local/tmp/
-	adb shell ln -s libpulse.so.0.18.2 /data/local/tmp/libpulse.so.0
-	adb shell ln -s libpulse.so.0.18.2 /data/local/tmp/libpulse.so
+	adb push armeabi-v7a/install/lib/libpulse.so.0.18.2 /data/local/tmp/libpulse.so.0
+	#adb shell ln -s libpulse.so.0.18.2 /data/local/tmp/libpulse.so.0
+	#adb shell ln -s libpulse.so.0.18.2 /data/local/tmp/libpulse.so
 	adb push armeabi-v7a/install/lib/libpulsecore-7.0.so /data/local/tmp/
 	adb push armeabi-v7a/install/lib/pulseaudio/libpulsecommon-7.0.so /data/local/tmp/
 	adb push android-pulseaudio.conf /data/local/tmp/pulseaudio.conf
