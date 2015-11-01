@@ -552,8 +552,12 @@ static bool on_center(pa_channel_position_t p) {
     return !!(PA_CHANNEL_POSITION_MASK(p) & PA_CHANNEL_POSITION_MASK_CENTER);
 }
 
+static bool on_hfe(pa_channel_position_t p) {
+    return !!(PA_CHANNEL_POSITION_MASK(p) & PA_CHANNEL_POSITION_MASK_HFE);
+}
+
 static bool on_lfe(pa_channel_position_t p) {
-    return p == PA_CHANNEL_POSITION_LFE;
+    return !!(PA_CHANNEL_POSITION_MASK(p) & PA_CHANNEL_POSITION_MASK_LFE);
 }
 
 static bool on_front(pa_channel_position_t p) {
@@ -635,7 +639,12 @@ int pa_cvolume_compatible_with_channel_map(const pa_cvolume *v, const pa_channel
     return v->channels == cm->channels;
 }
 
-static void get_avg_lr(const pa_channel_map *map, const pa_cvolume *v, pa_volume_t *l, pa_volume_t *r) {
+/*
+ * Returns the average volume of l and r, where l and r are two disjoint sets of channels
+ * (e g left and right, or front and rear).
+ */
+static void get_avg(const pa_channel_map *map, const pa_cvolume *v, pa_volume_t *l, pa_volume_t *r,
+                    bool (*on_l)(pa_channel_position_t), bool (*on_r)(pa_channel_position_t)) {
     int c;
     pa_volume_t left = 0, right = 0;
     unsigned n_left = 0, n_right = 0;
@@ -647,10 +656,10 @@ static void get_avg_lr(const pa_channel_map *map, const pa_cvolume *v, pa_volume
     pa_assert(r);
 
     for (c = 0; c < map->channels; c++) {
-        if (on_left(map->map[c])) {
+        if (on_l(map->map[c])) {
             left += v->values[c];
             n_left++;
-        } else if (on_right(map->map[c])) {
+        } else if (on_r(map->map[c])) {
             right += v->values[c];
             n_right++;
         }
@@ -678,7 +687,7 @@ float pa_cvolume_get_balance(const pa_cvolume *v, const pa_channel_map *map) {
     if (!pa_channel_map_can_balance(map))
         return 0.0f;
 
-    get_avg_lr(map, v, &left, &right);
+    get_avg(map, v, &left, &right, on_left, on_right);
 
     if (left == right)
         return 0.0f;
@@ -698,21 +707,13 @@ float pa_cvolume_get_balance(const pa_cvolume *v, const pa_channel_map *map) {
         return 1.0f - ((float) left / (float) right);
 }
 
-pa_cvolume* pa_cvolume_set_balance(pa_cvolume *v, const pa_channel_map *map, float new_balance) {
+static pa_cvolume* set_balance(pa_cvolume *v, const pa_channel_map *map, float new_balance,
+                               bool (*on_l)(pa_channel_position_t), bool (*on_r)(pa_channel_position_t)) {
+
     pa_volume_t left, nleft, right, nright, m;
     unsigned c;
 
-    pa_assert(map);
-    pa_assert(v);
-
-    pa_return_val_if_fail(pa_cvolume_compatible_with_channel_map(v, map), NULL);
-    pa_return_val_if_fail(new_balance >= -1.0f, NULL);
-    pa_return_val_if_fail(new_balance <= 1.0f, NULL);
-
-    if (!pa_channel_map_can_balance(map))
-        return v;
-
-    get_avg_lr(map, v, &left, &right);
+    get_avg(map, v, &left, &right, on_l, on_r);
 
     m = PA_MAX(left, right);
 
@@ -725,12 +726,12 @@ pa_cvolume* pa_cvolume_set_balance(pa_cvolume *v, const pa_channel_map *map, flo
     }
 
     for (c = 0; c < map->channels; c++) {
-        if (on_left(map->map[c])) {
+        if (on_l(map->map[c])) {
             if (left == 0)
                 v->values[c] = nleft;
             else
                 v->values[c] = (pa_volume_t) PA_CLAMP_VOLUME(((uint64_t) v->values[c] * (uint64_t) nleft) / (uint64_t) left);
-        } else if (on_right(map->map[c])) {
+        } else if (on_r(map->map[c])) {
             if (right == 0)
                 v->values[c] = nright;
             else
@@ -739,6 +740,21 @@ pa_cvolume* pa_cvolume_set_balance(pa_cvolume *v, const pa_channel_map *map, flo
     }
 
     return v;
+}
+
+
+pa_cvolume* pa_cvolume_set_balance(pa_cvolume *v, const pa_channel_map *map, float new_balance) {
+    pa_assert(map);
+    pa_assert(v);
+
+    pa_return_val_if_fail(pa_cvolume_compatible_with_channel_map(v, map), NULL);
+    pa_return_val_if_fail(new_balance >= -1.0f, NULL);
+    pa_return_val_if_fail(new_balance <= 1.0f, NULL);
+
+    if (!pa_channel_map_can_balance(map))
+        return v;
+
+    return set_balance(v, map, new_balance, on_left, on_right);
 }
 
 pa_cvolume* pa_cvolume_scale(pa_cvolume *v, pa_volume_t max) {
@@ -785,40 +801,8 @@ pa_cvolume* pa_cvolume_scale_mask(pa_cvolume *v, pa_volume_t max, pa_channel_map
     return v;
 }
 
-static void get_avg_fr(const pa_channel_map *map, const pa_cvolume *v, pa_volume_t *f, pa_volume_t *r) {
-    int c;
-    pa_volume_t front = 0, rear = 0;
-    unsigned n_front = 0, n_rear = 0;
-
-    pa_assert(v);
-    pa_assert(map);
-    pa_assert(map->channels == v->channels);
-    pa_assert(f);
-    pa_assert(r);
-
-    for (c = 0; c < map->channels; c++) {
-        if (on_front(map->map[c])) {
-            front += v->values[c];
-            n_front++;
-        } else if (on_rear(map->map[c])) {
-            rear += v->values[c];
-            n_rear++;
-        }
-    }
-
-    if (n_front <= 0)
-        *f = PA_VOLUME_NORM;
-    else
-        *f = front / n_front;
-
-    if (n_rear <= 0)
-        *r = PA_VOLUME_NORM;
-    else
-        *r = rear / n_rear;
-}
-
 float pa_cvolume_get_fade(const pa_cvolume *v, const pa_channel_map *map) {
-    pa_volume_t front, rear;
+    pa_volume_t rear, front;
 
     pa_assert(v);
     pa_assert(map);
@@ -828,7 +812,7 @@ float pa_cvolume_get_fade(const pa_cvolume *v, const pa_channel_map *map) {
     if (!pa_channel_map_can_fade(map))
         return 0.0f;
 
-    get_avg_fr(map, v, &front, &rear);
+    get_avg(map, v, &rear, &front, on_rear, on_front);
 
     if (front == rear)
         return 0.0f;
@@ -840,9 +824,6 @@ float pa_cvolume_get_fade(const pa_cvolume *v, const pa_channel_map *map) {
 }
 
 pa_cvolume* pa_cvolume_set_fade(pa_cvolume *v, const pa_channel_map *map, float new_fade) {
-    pa_volume_t front, nfront, rear, nrear, m;
-    unsigned c;
-
     pa_assert(map);
     pa_assert(v);
 
@@ -853,33 +834,43 @@ pa_cvolume* pa_cvolume_set_fade(pa_cvolume *v, const pa_channel_map *map, float 
     if (!pa_channel_map_can_fade(map))
         return v;
 
-    get_avg_fr(map, v, &front, &rear);
+    return set_balance(v, map, new_fade, on_rear, on_front);
+}
 
-    m = PA_MAX(front, rear);
+float pa_cvolume_get_lfe_balance(const pa_cvolume *v, const pa_channel_map *map) {
+    pa_volume_t hfe, lfe;
 
-    if (new_fade <= 0) {
-        nfront = (new_fade + 1.0f) * m;
-        nrear = m;
-    } else {
-        nrear = (1.0f - new_fade) * m;
-        nfront = m;
-    }
+    pa_assert(v);
+    pa_assert(map);
 
-    for (c = 0; c < map->channels; c++) {
-        if (on_front(map->map[c])) {
-            if (front == 0)
-                v->values[c] = nfront;
-            else
-                v->values[c] = (pa_volume_t) PA_CLAMP_VOLUME(((uint64_t) v->values[c] * (uint64_t) nfront) / (uint64_t) front);
-        } else if (on_rear(map->map[c])) {
-            if (rear == 0)
-                v->values[c] = nrear;
-            else
-                v->values[c] = (pa_volume_t) PA_CLAMP_VOLUME(((uint64_t) v->values[c] * (uint64_t) nrear) / (uint64_t) rear);
-        }
-    }
+    pa_return_val_if_fail(pa_cvolume_compatible_with_channel_map(v, map), 0.0f);
 
-    return v;
+    if (!pa_channel_map_can_lfe_balance(map))
+        return 0.0f;
+
+    get_avg(map, v, &hfe, &lfe, on_hfe, on_lfe);
+
+    if (hfe == lfe)
+        return 0.0f;
+
+    if (hfe > lfe)
+        return -1.0f + ((float) lfe / (float) hfe);
+    else
+        return 1.0f - ((float) hfe / (float) lfe);
+}
+
+pa_cvolume* pa_cvolume_set_lfe_balance(pa_cvolume *v, const pa_channel_map *map, float new_balance) {
+    pa_assert(map);
+    pa_assert(v);
+
+    pa_return_val_if_fail(pa_cvolume_compatible_with_channel_map(v, map), NULL);
+    pa_return_val_if_fail(new_balance >= -1.0f, NULL);
+    pa_return_val_if_fail(new_balance <= 1.0f, NULL);
+
+    if (!pa_channel_map_can_lfe_balance(map))
+        return v;
+
+    return set_balance(v, map, new_balance, on_hfe, on_lfe);
 }
 
 pa_cvolume* pa_cvolume_set_position(
