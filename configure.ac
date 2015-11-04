@@ -845,6 +845,29 @@ AC_SUBST(HAVE_WAVEOUT)
 AM_CONDITIONAL([HAVE_WAVEOUT], [test "x$HAVE_WAVEOUT" = x1])
 AS_IF([test "x$HAVE_WAVEOUT" = "x1"], AC_DEFINE([HAVE_WAVEOUT], 1, [Have WaveOut audio?]))
 
+#### OpenSL ES  (optional) ####
+
+AC_ARG_ENABLE([opensles],
+    AS_HELP_STRING([--disable-opensles],[Disable optional Android OpenSL ES support]))
+
+OPENSLES_CFLAGS=
+OPENSLES_LIBS=
+
+AS_IF([test "x$enable_opensles" != "xno"],
+    [
+        HAVE_OPENSLES=1
+        AC_CHECK_HEADER(SLES/OpenSLES_Android.h, [], [HAVE_OPENSLES=0])
+        AC_CHECK_LIB(OpenSLES, slCreateEngine, [OPENSLES_LIBS=-lOpenSLES], [HAVE_OPENSLES=0])
+    ],
+    HAVE_OPENSLES=0)
+
+AS_IF([test "x$enable_opensles" = "xyes" && test "x$HAVE_OPENSLES" = "x0"],
+    [AC_MSG_ERROR([*** OpenSL ES support not found])])
+
+AC_SUBST(OPENSLES_CFLAGS)
+AC_SUBST(OPENSLES_LIBS)
+AM_CONDITIONAL([HAVE_OPENSLES], [test "x$HAVE_OPENSLES" = x1])
+
 #### GLib 2 support (optional) ####
 
 AC_ARG_ENABLE([glib2],
