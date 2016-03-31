@@ -122,6 +122,7 @@ build() {
 		  --disable-udev          \
 		  --disable-hal-compat    \
 		  --disable-openssl       \
+                  --disable-opensles      \
 		  --disable-xen           \
 		  --disable-systemd-daemon \
 		  --disable-systemd-login \
