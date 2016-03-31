@@ -1384,11 +1384,6 @@ modlibexec_LTLIBRARIES += \
 		module-waveout.la
 endif
 
-if HAVE_OPENSLES
-modlibexec_LTLIBRARIES += \
-		module-opensles.la
-endif
-
 if HAVE_HAL_COMPAT
 modlibexec_LTLIBRARIES += \
 		module-hal-detect.la
