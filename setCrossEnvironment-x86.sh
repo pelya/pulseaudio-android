@@ -3,7 +3,7 @@
 IFS='
 '
 
-MYARCH=linux-x86
+MYARCH=linux-x86_64
 if uname -s | grep -i "linux" > /dev/null ; then
 	MYARCH=linux-x86_64
 fi
@@ -31,7 +31,7 @@ fi
 ARCH=x86
 
 CFLAGS="\
--ffunction-sections -funwind-tables -no-canonical-prefixes \
+-fpic -ffunction-sections -funwind-tables -no-canonical-prefixes \
 -fstack-protector -O2 -g -DNDEBUG \
 -fomit-frame-pointer -fstrict-aliasing -funswitch-loops \
 -finline-limit=300 \

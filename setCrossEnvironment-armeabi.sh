@@ -3,7 +3,7 @@
 IFS='
 '
 
-MYARCH=linux-x86
+MYARCH=linux-x86_64
 if uname -s | grep -i "linux" > /dev/null ; then
 	MYARCH=linux-x86_64
 fi
