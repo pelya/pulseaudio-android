@@ -34,3 +34,8 @@ missing
 mkinstalldirs
 stamp-*
 .dirstamp
+
+/armeabi-v7a/
+/armeabi/
+/mips/
+/x86/
