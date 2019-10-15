@@ -1,7 +1,9 @@
 #!/bin/sh
 
 NCPU=4
-ARCH_LIST="armeabi x86 mips armeabi-v7a"
+ARCH_LIST="arm64-v8a x86_64 x86 armeabi-v7a"
+ARCH_LIST="arm64-v8a"
+
 
 [ -e libtool-2.4.6.tar.gz ] || wget http://ftpmirror.gnu.org/libtool/libtool-2.4.6.tar.gz || exit 1
 [ -e 12916e229c769da4929f6df7f038ab51cf0cb067.tar.gz ] || wget https://github.com/json-c/json-c/archive/12916e229c769da4929f6df7f038ab51cf0cb067.tar.gz || exit 1
@@ -16,27 +18,36 @@ build() {
 	ARCH=$1
 
 	case $ARCH in
+		arm64-v8a) TOOLCHAIN=aarch64-linux-android;;
+		x86_64) TOOLCHAIN=x86_64-linux-android;;
+		armeabi-v7a) TOOLCHAIN=arm-linux-androideabi;;
 		x86) TOOLCHAIN=i686-linux-android;;
-		mips) TOOLCHAIN=mipsel-linux-android;;
-		*) TOOLCHAIN=arm-linux-androideabi;;
 	esac
 
 	mkdir -p $ARCH
 	cd $ARCH
 
-	[ -e libtool-2.4.6/install/lib/libltdl.a ] || {
-		rm -rf libtool-2.4.6
-		tar xvf ../libtool-2.4.6.tar.gz || exit 1
-		cd libtool-2.4.6
+	[ -e libtool-master/install/lib/libltdl.so ] || {
+		rm -rf libtool-master
+		tar xvf ../libtool-master.tar.gz || exit 1
+		cd libtool-master
 		mkdir -p install
+		./bootstrap || exit 1
 		env CFLAGS=-DLT_DEBUG_LOADERS=1 \
-			../../setCrossEnvironment-$ARCH.sh ./configure --host=$TOOLCHAIN --prefix=`pwd`/install --disable-shared || exit 1
-		make -j$NCPU || exit 1
-		make install || exit 1
+			../../setCrossEnvironment-$ARCH.sh ./configure --host=$TOOLCHAIN --prefix=`pwd`/install || exit 1
+		#env CFLAGS=-DLT_DEBUG_LOADERS=1 \
+		#	./configure --prefix=`pwd`/install || exit 1
+		make -j$NCPU V=1
+		mkdir -p install/lib
+		#../../setCrossEnvironment-$ARCH.sh sh -c \
+		#	'$AR rcs install/lib/libltdl.a libltdl/.libs/*.o libltdl/loaders/.libs/*.o' || exit 1
+		../../setCrossEnvironment-$ARCH.sh sh -c \
+			'$CC $LDFLAGS -shared -o install/lib/libltdl.so libltdl/.libs/*.o libltdl/loaders/.libs/*.o' || exit 1
+		make install-data || exit 1
 		cd ..
 	} || exit 1
 
-	[ -e json-c-12916e229c769da4929f6df7f038ab51cf0cb067/install/lib/libjson-c.a ] || {
+	[ -e json-c-12916e229c769da4929f6df7f038ab51cf0cb067/install/lib/libjson-c.so ] || {
 		rm -rf json-c-12916e229c769da4929f6df7f038ab51cf0cb067
 		tar xvf ../12916e229c769da4929f6df7f038ab51cf0cb067.tar.gz || exit 1
 		cd json-c-12916e229c769da4929f6df7f038ab51cf0cb067
@@ -46,14 +57,20 @@ build() {
 			--host=$TOOLCHAIN \
 			--prefix=`pwd`/install \
 			--disable-shared \
+			--enable-static \
 			--with-gnu-ld \
 			|| exit 1
 		make -j$NCPU || exit 1
-		make install || exit 1
+		make install-data || exit 1
+		mkdir -p install/lib
+		#../../setCrossEnvironment-$ARCH.sh sh -c \
+		#	'$AR rcs install/lib/libjson-c.a *.o' || exit 1
+		../../setCrossEnvironment-$ARCH.sh sh -c \
+			'$CC $LDFLAGS -shared -o install/lib/libjson-c.so *.o' || exit 1
 		cd ..
 	} || exit 1
 
-	[ -e libsndfile-1.0.25/install/lib/libsndfile.a ] || {
+	[ -e libsndfile-1.0.25/install/lib/libsndfile.so ] || {
 		rm -rf libsndfile-1.0.25
 		tar xvf ../libsndfile-1.0.25.tar.gz || exit 1
 		cd libsndfile-1.0.25
@@ -67,10 +84,16 @@ build() {
 			--disable-shared \
 			--disable-external-libs \
 			--disable-alsa \
+			--enable-static \
 			|| exit 1
 		echo 'int main () {}' > programs/sndfile-play.c
-		make -j$NCPU || exit 1
-		make install || exit 1
+		make -j$NCPU V=1 -k
+		make install-data || exit 1
+		mkdir -p install/lib
+		#../../setCrossEnvironment-$ARCH.sh sh -c \
+		#	'$AR rcs install/lib/libsndfile.a src/*.o src/*/*.o' || exit 1
+		../../setCrossEnvironment-$ARCH.sh sh -c \
+			'$CC $LDFLAGS -shared -o install/lib/libsndfile.so src/*.o src/*/*.o' || exit 1
 		cd ..
 	} || exit 1
 
@@ -78,10 +101,12 @@ build() {
 
 	[ -e Makefile ] || {
 		env \
-		CFLAGS="-I`pwd`/libtool-2.4.6/install/include \
+		CFLAGS=" \
+			-I`pwd`/libtool-master/install/include \
 			-I`pwd`/json-c-12916e229c769da4929f6df7f038ab51cf0cb067/install/include/json-c \
 			-I`pwd`/libsndfile-1.0.25/install/include" \
-		LDFLAGS="-L`pwd`/libtool-2.4.6/install/lib \
+		LDFLAGS=" \
+			-L`pwd`/libtool-master/install/lib \
 			-L`pwd`/json-c-12916e229c769da4929f6df7f038ab51cf0cb067/install/lib \
 			-L`pwd`/libsndfile-1.0.25/install/lib -pie" \
 		LIBS="-ljson-c -lsndfile" \
@@ -98,7 +123,7 @@ build() {
 		  --disable-nls           \
 		  --disable-rpath         \
 		  --disable-neon-opt      \
-		  --enable-static         \
+		  --disable-static        \
 		  --enable-shared         \
 		  --disable-x11           \
 		  --disable-tests         \
@@ -135,7 +160,8 @@ build() {
 
 	} || exit 1
 
-	make -j$NCPU V=1 || exit 1
+	#make -j$NCPU V=1 || exit 1
+	make -j1 V=1 || exit 1
 	make install-strip || exit 1
 	cd ..
 }
