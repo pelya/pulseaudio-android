@@ -26,23 +26,33 @@
 #include <SLES/OpenSLES_Android.h>
 #endif
 
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <errno.h>
+#include <poll.h>
 
-#include <pulse/xmalloc.h>
+#include <pulse/rtclock.h>
 #include <pulse/timeval.h>
+#include <pulse/xmalloc.h>
 
+#include <pulsecore/i18n.h>
+#include <pulsecore/macro.h>
 #include <pulsecore/sink.h>
-#include <pulsecore/source.h>
 #include <pulsecore/module.h>
-#include <pulsecore/modargs.h>
-#include <pulsecore/sample-util.h>
+#include <pulsecore/core-error.h>
 #include <pulsecore/core-util.h>
+#include <pulsecore/modargs.h>
 #include <pulsecore/log.h>
 #include <pulsecore/thread.h>
 #include <pulsecore/thread-mq.h>
+#include <pulsecore/rtpoll.h>
 
 #include "module-opensles-symdef.h"
 
-PA_MODULE_AUTHOR("Sergii Pylypenko");
+PA_MODULE_AUTHOR("Sergii Pylypenko, VideoLAN");
 PA_MODULE_DESCRIPTION("OpenSL ES Android Sink");
 PA_MODULE_VERSION(PACKAGE_VERSION);
 PA_MODULE_LOAD_ONCE(false);
@@ -53,6 +63,8 @@ PA_MODULE_USAGE(
         "rate=<sample rate> "
         "channels=<number of channels> "
         "channel_map=<channel map>");
+
+#define DEFAULT_SINK_NAME "opensles"
 
 struct userdata {
     pa_core *core;
@@ -265,8 +277,8 @@ int pa__init(pa_module *m) {
     data.driver = __FILE__;
     data.module = m;
     pa_sink_new_data_set_name(&data, pa_modargs_get_value(ma, "sink_name", DEFAULT_SINK_NAME));
-    pa_proplist_sets(data.proplist, PA_PROP_DEVICE_STRING, u->filename);
-    pa_proplist_setf(data.proplist, PA_PROP_DEVICE_DESCRIPTION, "Unix FIFO sink %s", u->filename);
+    //pa_proplist_sets(data.proplist, PA_PROP_DEVICE_STRING, u->filename);
+    //pa_proplist_setf(data.proplist, PA_PROP_DEVICE_DESCRIPTION, "Unix FIFO sink %s", u->filename);
     pa_sink_new_data_set_sample_spec(&data, &ss);
     pa_sink_new_data_set_channel_map(&data, &map);
 

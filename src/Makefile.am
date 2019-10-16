@@ -149,7 +149,8 @@ pulseaudio_SOURCES = \
 		daemon/main.c
 
 pulseaudio_CFLAGS = $(AM_CFLAGS) $(CAP_CFLAGS)
-pulseaudio_LDADD = $(AM_LDADD) libpulsecore-@PA_MAJORMINOR@.la libpulsecommon-@PA_MAJORMINOR@.la libpulse.la $(LIBLTDL) $(CAP_LIBS)
+# OpenSLES system library must be loaded by pulseaudio binary before it loads module-opensles, because dynamic library loader on Android is buggy
+pulseaudio_LDADD = $(AM_LDADD) libpulsecore-@PA_MAJORMINOR@.la libpulsecommon-@PA_MAJORMINOR@.la libpulse.la $(LIBLTDL) $(CAP_LIBS) $(OPENSLES_LIBS)
 # This is needed because automake doesn't properly expand the foreach below
 pulseaudio_DEPENDENCIES = libpulsecore-@PA_MAJORMINOR@.la libpulsecommon-@PA_MAJORMINOR@.la libpulse.la $(PREOPEN_LIBS)
 
@@ -1500,6 +1501,7 @@ SYMDEF_FILES = \
 		module-coreaudio-device-symdef.h \
 		module-solaris-symdef.h \
 		module-waveout-symdef.h \
+		module-opensles-symdef.h \
 		module-detect-symdef.h \
 		module-rtp-send-symdef.h \
 		module-rtp-recv-symdef.h \
@@ -1921,6 +1923,12 @@ module_waveout_la_SOURCES = modules/module-waveout.c
 module_waveout_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_waveout_la_LIBADD = $(MODULE_LIBADD) -lwinmm
 module_waveout_la_CFLAGS = $(AM_CFLAGS)
+
+# Android OpenSLES output
+module_opensles_la_SOURCES = modules/module-opensles.c
+module_opensles_la_LDFLAGS = $(MODULE_LDFLAGS)
+module_opensles_la_LIBADD = $(MODULE_LIBADD) $(OPENSLES_LIBS)
+module_opensles_la_CFLAGS = $(AM_CFLAGS) $(OPENSLES_CFLAGS)
 
 # Hardware autodetection module
 module_detect_la_SOURCES = modules/module-detect.c
