@@ -199,16 +199,23 @@ pa_volume_t pa_cvolume_min_mask(const pa_cvolume *a, const pa_channel_map *cm, p
 }
 
 pa_volume_t pa_sw_volume_multiply(pa_volume_t a, pa_volume_t b) {
+    uint64_t result;
 
     pa_return_val_if_fail(PA_VOLUME_IS_VALID(a), PA_VOLUME_INVALID);
     pa_return_val_if_fail(PA_VOLUME_IS_VALID(b), PA_VOLUME_INVALID);
 
     /* cbrt((a/PA_VOLUME_NORM)^3*(b/PA_VOLUME_NORM)^3)*PA_VOLUME_NORM = a*b/PA_VOLUME_NORM */
 
-    return (pa_volume_t) PA_CLAMP_VOLUME((((uint64_t) a * (uint64_t) b + (uint64_t) PA_VOLUME_NORM / 2ULL) / (uint64_t) PA_VOLUME_NORM));
+    result = ((uint64_t) a * (uint64_t) b + (uint64_t) PA_VOLUME_NORM / 2ULL) / (uint64_t) PA_VOLUME_NORM;
+
+    if (result > (uint64_t)PA_VOLUME_MAX)
+        pa_log_warn("pa_sw_volume_multiply: Volume exceeds maximum allowed value and will be clipped. Please check your volume settings.");
+
+    return (pa_volume_t) PA_CLAMP_VOLUME(result);
 }
 
 pa_volume_t pa_sw_volume_divide(pa_volume_t a, pa_volume_t b) {
+    uint64_t result;
 
     pa_return_val_if_fail(PA_VOLUME_IS_VALID(a), PA_VOLUME_INVALID);
     pa_return_val_if_fail(PA_VOLUME_IS_VALID(b), PA_VOLUME_INVALID);
@@ -216,7 +223,12 @@ pa_volume_t pa_sw_volume_divide(pa_volume_t a, pa_volume_t b) {
     if (b <= PA_VOLUME_MUTED)
         return 0;
 
-    return (pa_volume_t) (((uint64_t) a * (uint64_t) PA_VOLUME_NORM + (uint64_t) b / 2ULL) / (uint64_t) b);
+    result = ((uint64_t) a * (uint64_t) PA_VOLUME_NORM + (uint64_t) b / 2ULL) / (uint64_t) b;
+
+    if (result > (uint64_t)PA_VOLUME_MAX)
+        pa_log_warn("pa_sw_volume_divide: Volume exceeds maximum allowed value and will be clipped. Please check your volume settings.");
+
+    return (pa_volume_t) PA_CLAMP_VOLUME(result);
 }
 
 /* Amplitude, not power */
@@ -301,7 +313,7 @@ char *pa_cvolume_snprint(char *s, size_t l, const pa_cvolume *c) {
         l -= pa_snprintf(e, l, "%s%u: %3u%%",
                       first ? "" : " ",
                       channel,
-                      (c->values[channel]*100+PA_VOLUME_NORM/2)/PA_VOLUME_NORM);
+                      (unsigned)(((uint64_t)c->values[channel] * 100 + (uint64_t)PA_VOLUME_NORM / 2) / (uint64_t)PA_VOLUME_NORM));
 
         e = strchr(e, 0);
         first = false;
@@ -321,7 +333,7 @@ char *pa_volume_snprint(char *s, size_t l, pa_volume_t v) {
         return s;
     }
 
-    pa_snprintf(s, l, "%3u%%", (v*100+PA_VOLUME_NORM/2)/PA_VOLUME_NORM);
+    pa_snprintf(s, l, "%3u%%", (unsigned)(((uint64_t)v * 100 + (uint64_t)PA_VOLUME_NORM / 2) / (uint64_t)PA_VOLUME_NORM));
     return s;
 }
 
@@ -434,7 +446,7 @@ char *pa_volume_snprint_verbose(char *s, size_t l, pa_volume_t v, int print_dB) 
 
     pa_snprintf(s, l, "%" PRIu32 " / %3u%%%s%s",
                 v,
-                (v * 100 + PA_VOLUME_NORM / 2) / PA_VOLUME_NORM,
+                (unsigned)(((uint64_t)v * 100 + (uint64_t)PA_VOLUME_NORM / 2) / (uint64_t)PA_VOLUME_NORM),
                 print_dB ? " / " : "",
                 print_dB ? pa_sw_volume_snprint_dB(dB, sizeof(dB), v) : "");
 
@@ -465,10 +477,10 @@ pa_cvolume *pa_sw_cvolume_multiply(pa_cvolume *dest, const pa_cvolume *a, const 
     pa_return_val_if_fail(pa_cvolume_valid(a), NULL);
     pa_return_val_if_fail(pa_cvolume_valid(b), NULL);
 
-    for (i = 0; i < a->channels && i < b->channels; i++)
-        dest->values[i] = pa_sw_volume_multiply(a->values[i], b->values[i]);
+    dest->channels = PA_MIN(a->channels, b->channels);
 
-    dest->channels = (uint8_t) i;
+    for (i = 0; i < dest->channels; i++)
+        dest->values[i] = pa_sw_volume_multiply(a->values[i], b->values[i]);
 
     return dest;
 }
@@ -500,10 +512,10 @@ pa_cvolume *pa_sw_cvolume_divide(pa_cvolume *dest, const pa_cvolume *a, const pa
     pa_return_val_if_fail(pa_cvolume_valid(a), NULL);
     pa_return_val_if_fail(pa_cvolume_valid(b), NULL);
 
-    for (i = 0; i < a->channels && i < b->channels; i++)
-        dest->values[i] = pa_sw_volume_divide(a->values[i], b->values[i]);
+    dest->channels = PA_MIN(a->channels, b->channels);
 
-    dest->channels = (uint8_t) i;
+    for (i = 0; i < dest->channels; i++)
+        dest->values[i] = pa_sw_volume_divide(a->values[i], b->values[i]);
 
     return dest;
 }
@@ -777,7 +789,7 @@ pa_cvolume* pa_cvolume_scale(pa_cvolume *v, pa_volume_t max) {
     return v;
 }
 
-pa_cvolume* pa_cvolume_scale_mask(pa_cvolume *v, pa_volume_t max, pa_channel_map *cm, pa_channel_position_mask_t mask) {
+pa_cvolume* pa_cvolume_scale_mask(pa_cvolume *v, pa_volume_t max, const pa_channel_map *cm, pa_channel_position_mask_t mask) {
     unsigned c;
     pa_volume_t t = 0;
 
@@ -899,7 +911,7 @@ pa_cvolume* pa_cvolume_set_position(
 }
 
 pa_volume_t pa_cvolume_get_position(
-        pa_cvolume *cv,
+        const pa_cvolume *cv,
         const pa_channel_map *map,
         pa_channel_position_t t) {
 
@@ -930,10 +942,10 @@ pa_cvolume* pa_cvolume_merge(pa_cvolume *dest, const pa_cvolume *a, const pa_cvo
     pa_return_val_if_fail(pa_cvolume_valid(a), NULL);
     pa_return_val_if_fail(pa_cvolume_valid(b), NULL);
 
-    for (i = 0; i < a->channels && i < b->channels; i++)
-        dest->values[i] = PA_MAX(a->values[i], b->values[i]);
+    dest->channels = PA_MIN(a->channels, b->channels);
 
-    dest->channels = (uint8_t) i;
+    for (i = 0; i < dest->channels; i++)
+        dest->values[i] = PA_MAX(a->values[i], b->values[i]);
 
     return dest;
 }

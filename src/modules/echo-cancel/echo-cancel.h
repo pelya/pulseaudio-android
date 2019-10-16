@@ -64,13 +64,17 @@ struct pa_echo_canceller_params {
             /* This is a void* so that we don't have to convert this whole file
              * to C++ linkage. apm is a pointer to an AudioProcessing object */
             void *apm;
-            uint32_t blocksize;
-            pa_sample_spec sample_spec;
+            unsigned int blocksize; /* in frames */
+            pa_sample_spec rec_ss, play_ss, out_ss;
+            float *rec_buffer[PA_CHANNELS_MAX], *play_buffer[PA_CHANNELS_MAX]; /* for deinterleaved buffers */
+            void *trace_callback;
             bool agc;
+            bool first;
+            unsigned int agc_start_volume;
         } webrtc;
 #endif
         /* each canceller-specific structure goes here */
-    } priv;
+    };
 
     /* Set this if canceller can do drift compensation. Also see set_drift()
      * below */
@@ -128,8 +132,8 @@ struct pa_echo_canceller {
 };
 
 /* Functions to be used by the canceller analog gain control routines */
-void pa_echo_canceller_get_capture_volume(pa_echo_canceller *ec, pa_cvolume *v);
-void pa_echo_canceller_set_capture_volume(pa_echo_canceller *ec, pa_cvolume *v);
+pa_volume_t pa_echo_canceller_get_capture_volume(pa_echo_canceller *ec);
+void pa_echo_canceller_set_capture_volume(pa_echo_canceller *ec, pa_volume_t volume);
 
 /* Computes EC block size in frames (rounded down to nearest power-of-2) based
  * on sample rate and milliseconds. */

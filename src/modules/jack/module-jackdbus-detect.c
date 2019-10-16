@@ -32,8 +32,6 @@
 #include <pulsecore/core-util.h>
 #include <pulsecore/dbus-shared.h>
 
-#include "module-jackdbus-detect-symdef.h"
-
 PA_MODULE_AUTHOR("David Henningsson");
 PA_MODULE_DESCRIPTION("Adds JACK sink/source ports when JACK is started");
 PA_MODULE_LOAD_ONCE(true);
@@ -111,7 +109,7 @@ static void ensure_ports_started(struct userdata* u) {
             } else {
                 args = pa_sprintf_malloc("connect=%s", pa_yes_no(u->autoconnect_ports));
             }
-            m = pa_module_load(u->core, modnames[i], args);
+            pa_module_load(&m, u->core, modnames[i], args);
             pa_xfree(args);
 
             if (m) {

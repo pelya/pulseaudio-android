@@ -28,8 +28,6 @@
 #include <pulsecore/log.h>
 #include <pulsecore/core-util.h>
 
-#include "module-hal-detect-symdef.h"
-
 PA_MODULE_AUTHOR("Lennart Poettering");
 PA_MODULE_DESCRIPTION("Compatibility module");
 PA_MODULE_VERSION(PACKAGE_VERSION);
@@ -64,7 +62,7 @@ int pa__init(pa_module*m) {
     pa_log_warn("We will now load module-udev-detect. Please make sure to remove module-hal-detect from your configuration.");
 
     t = pa_sprintf_malloc("tsched=%s", pa_yes_no(tsched));
-    n = pa_module_load(m->core, "module-udev-detect", t);
+    pa_module_load(&n, m->core, "module-udev-detect", t);
     pa_xfree(t);
 
     if (n)

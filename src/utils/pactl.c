@@ -167,10 +167,16 @@ static void stat_callback(pa_context *c, const pa_stat_info *i, void *userdata) 
     }
 
     pa_bytes_snprint(s, sizeof(s), i->memblock_total_size);
-    printf(_("Currently in use: %u blocks containing %s bytes total.\n"), i->memblock_total, s);
+    printf(ngettext("Currently in use: %u block containing %s bytes total.\n",
+                    "Currently in use: %u blocks containing %s bytes total.\n",
+                    i->memblock_total),
+           i->memblock_total, s);
 
     pa_bytes_snprint(s, sizeof(s), i->memblock_allocated_size);
-    printf(_("Allocated during whole lifetime: %u blocks containing %s bytes total.\n"), i->memblock_allocated, s);
+    printf(ngettext("Allocated during whole lifetime: %u block containing %s bytes total.\n",
+                    "Allocated during whole lifetime: %u blocks containing %s bytes total.\n",
+                    i->memblock_allocated),
+           i->memblock_allocated, s);
 
     pa_bytes_snprint(s, sizeof(s), i->scache_size);
     printf(_("Sample cache size: %s\n"), s);
@@ -881,8 +887,10 @@ static void fill_volume(pa_cvolume *cv, unsigned supported) {
     if (volume.channels == 1) {
         pa_cvolume_set(&volume, supported, volume.values[0]);
     } else if (volume.channels != supported) {
-        pa_log(_("Failed to set volume: You tried to set volumes for %d channels, whereas channel/s supported = %d\n"),
-            volume.channels, supported);
+        pa_log(ngettext("Failed to set volume: You tried to set volumes for %d channel, whereas channel(s) supported = %d\n",
+                        "Failed to set volume: You tried to set volumes for %d channels, whereas channel(s) supported = %d\n",
+                        volume.channels),
+               volume.channels, supported);
         quit(1);
         return;
     }
@@ -1037,7 +1045,7 @@ static void source_output_toggle_mute_callback(pa_context *c, const pa_source_ou
 #define MAX_FORMATS 256
 
 static void set_sink_formats(pa_context *c, uint32_t sink, const char *str) {
-    pa_format_info *f_arr[MAX_FORMATS];
+    pa_format_info *f_arr[MAX_FORMATS] = { 0, };
     char *format = NULL;
     const char *state = NULL;
     int i = 0;
@@ -1064,13 +1072,13 @@ static void set_sink_formats(pa_context *c, uint32_t sink, const char *str) {
 done:
     if (format)
         pa_xfree(format);
-    while(i--)
+    while (f_arr[i] && i--)
         pa_format_info_free(f_arr[i]);
 
     return;
 
 error:
-    while(i--)
+    while (f_arr[i] && i--)
         pa_format_info_free(f_arr[i]);
     quit(1);
     goto done;

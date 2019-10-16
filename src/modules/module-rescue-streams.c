@@ -31,8 +31,6 @@
 #include <pulsecore/namereg.h>
 #include <pulsecore/core-util.h>
 
-#include "module-rescue-streams-symdef.h"
-
 PA_MODULE_AUTHOR("Lennart Poettering");
 PA_MODULE_DESCRIPTION("When a sink/source is removed, try to move its streams to the default sink/source");
 PA_MODULE_VERSION(PACKAGE_VERSION);
@@ -96,7 +94,7 @@ static void build_group_ports(pa_hashmap *g_ports, pa_hashmap *s_ports) {
 }
 
 static pa_sink* find_evacuation_sink(pa_core *c, pa_sink_input *i, pa_sink *skip) {
-    pa_sink *target, *def, *fb_sink = NULL;
+    pa_sink *target, *fb_sink = NULL;
     uint32_t idx;
     pa_hashmap *all_ports;
     pa_device_port *best_port;
@@ -104,21 +102,19 @@ static pa_sink* find_evacuation_sink(pa_core *c, pa_sink_input *i, pa_sink *skip
     pa_assert(c);
     pa_assert(i);
 
-    def = pa_namereg_get_default_sink(c);
-
-    if (def && def != skip && pa_sink_input_may_move_to(i, def))
-        return def;
+    if (c->default_sink && c->default_sink != skip && pa_sink_input_may_move_to(i, c->default_sink))
+        return c->default_sink;
 
     all_ports = pa_hashmap_new(pa_idxset_trivial_hash_func, pa_idxset_trivial_compare_func);
 
     PA_IDXSET_FOREACH(target, c->sinks, idx) {
-        if (target == def)
+        if (target == c->default_sink)
             continue;
 
         if (target == skip)
             continue;
 
-        if (!PA_SINK_IS_LINKED(pa_sink_get_state(target)))
+        if (!PA_SINK_IS_LINKED(target->state))
             continue;
 
         if (!pa_sink_input_may_move_to(i, target))
@@ -140,7 +136,7 @@ static pa_sink* find_evacuation_sink(pa_core *c, pa_sink_input *i, pa_sink *skip
         target = fb_sink;
 
     if (!target)
-	pa_log_debug("No evacuation sink found.");
+        pa_log_debug("No evacuation sink found.");
 
     return target;
 }
@@ -204,7 +200,7 @@ static pa_hook_result_t sink_input_move_fail_hook_callback(pa_core *c, pa_sink_i
 }
 
 static pa_source* find_evacuation_source(pa_core *c, pa_source_output *o, pa_source *skip) {
-    pa_source *target, *def, *fb_source = NULL;
+    pa_source *target, *fb_source = NULL;
     uint32_t idx;
     pa_hashmap *all_ports;
     pa_device_port *best_port;
@@ -212,15 +208,13 @@ static pa_source* find_evacuation_source(pa_core *c, pa_source_output *o, pa_sou
     pa_assert(c);
     pa_assert(o);
 
-    def = pa_namereg_get_default_source(c);
-
-    if (def && def != skip && pa_source_output_may_move_to(o, def))
-        return def;
+    if (c->default_source && c->default_source != skip && pa_source_output_may_move_to(o, c->default_source))
+        return c->default_source;
 
     all_ports = pa_hashmap_new(pa_idxset_trivial_hash_func, pa_idxset_trivial_compare_func);
 
     PA_IDXSET_FOREACH(target, c->sources, idx) {
-        if (target == def)
+        if (target == c->default_source)
             continue;
 
         if (target == skip)
@@ -230,7 +224,7 @@ static pa_source* find_evacuation_source(pa_core *c, pa_source_output *o, pa_sou
         if (skip && !target->monitor_of != !skip->monitor_of)
             continue;
 
-        if (!PA_SOURCE_IS_LINKED(pa_source_get_state(target)))
+        if (!PA_SOURCE_IS_LINKED(target->state))
             continue;
 
         if (!pa_source_output_may_move_to(o, target))
@@ -309,7 +303,7 @@ static pa_hook_result_t source_output_move_fail_hook_callback(pa_core *c, pa_sou
         return PA_HOOK_OK;
 
     } else {
-        pa_log_info("Successfully moved output input %u \"%s\" to %s.", i->index,
+        pa_log_info("Successfully moved source output %u \"%s\" to %s.", i->index,
                     pa_strnull(pa_proplist_gets(i->proplist, PA_PROP_APPLICATION_NAME)), target->name);
         return PA_HOOK_STOP;
     }

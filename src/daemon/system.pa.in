@@ -19,14 +19,19 @@
 # mode.
 changequote(`[', `]')dnl Set up m4 quoting
 
+### Automatically restore the volume of streams and devices
+load-module module-device-restore
+load-module module-stream-restore
+load-module module-card-restore
+
 ### Automatically load driver modules depending on the hardware available
 ifelse(@HAVE_UDEV@, 1, [dnl
 .ifexists module-udev-detect@PA_SOEXT@
 load-module module-udev-detect
 .else
-], @HAVE_HAL@, 1, [dnl
-.ifexists module-hal-detect@PA_SOEXT@
-load-module module-hal-detect
+], @HAVE_COREAUDIO@, 1, [dnl
+.ifexists module-coreaudio-detect@PA_SOEXT@
+load-module module-coreaudio-detect
 .else
 ], [dnl
 .ifexists module-detect@PA_SOEXT@
@@ -40,10 +45,6 @@ load-module module-detect
 load-module module-esound-protocol-unix
 .endif
 load-module module-native-protocol-unix
-
-### Automatically restore the volume of streams and devices
-load-module module-stream-restore
-load-module module-device-restore
 
 ### Automatically restore the default sink/source when changed by the user
 ### during runtime

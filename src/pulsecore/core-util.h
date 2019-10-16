@@ -81,7 +81,6 @@ char *pa_strlcpy(char *b, const char *s, size_t l);
 
 char *pa_parent_dir(const char *fn);
 
-int pa_make_realtime(int rtprio);
 int pa_raise_priority(int nice_level);
 void pa_reset_priority(void);
 
@@ -109,9 +108,10 @@ static inline const char *pa_strna(const char *x) {
     return x ? x : "n/a";
 }
 
-char *pa_split(const char *c, const char*delimiters, const char **state);
-const char *pa_split_in_place(const char *c, const char*delimiters, int *n, const char **state);
+char *pa_split(const char *c, const char *delimiters, const char **state);
+const char *pa_split_in_place(const char *c, const char *delimiters, size_t *n, const char **state);
 char *pa_split_spaces(const char *c, const char **state);
+const char *pa_split_spaces_in_place(const char *c, size_t *n, const char **state);
 
 char *pa_strip_nl(char *s);
 char *pa_strip(char *s);
@@ -219,6 +219,7 @@ void pa_unset_env_recorded(void);
 bool pa_in_system_mode(void);
 
 #define pa_streq(a,b) (!strcmp((a),(b)))
+#define pa_strneq(a,b,n) (!strncmp((a),(b),(n)))
 
 /* Like pa_streq, but does not blow up on NULL pointers. */
 static inline bool pa_safe_streq(const char *a, const char *b) {
@@ -228,6 +229,7 @@ static inline bool pa_safe_streq(const char *a, const char *b) {
 }
 
 bool pa_str_in_list_spaces(const char *needle, const char *haystack);
+bool pa_str_in_list(const char *haystack, const char *delimiters, const char *needle);
 
 char *pa_get_host_name_malloc(void);
 char *pa_get_user_name_malloc(void);
@@ -249,6 +251,10 @@ void pa_reduce(unsigned *num, unsigned *den);
 
 unsigned pa_ncpus(void);
 
+/* Replaces all occurrences of `a' in `s' with `b'. The caller has to free the
+ * returned string. All parameters must be non-NULL and additionally `a' must
+ * not be a zero-length string.
+ */
 char *pa_replace(const char*s, const char*a, const char *b);
 
 /* Escapes p by inserting backslashes in front of backslashes. chars is a
@@ -297,5 +303,18 @@ bool pa_running_in_vm(void);
 #ifdef OS_IS_WIN32
 char *pa_win32_get_toplevel(HANDLE handle);
 #endif
+
+size_t pa_page_size(void);
+
+/* Rounds down */
+static inline void* PA_PAGE_ALIGN_PTR(const void *p) {
+    return (void*) (((size_t) p) & ~(pa_page_size() - 1));
+}
+
+/* Rounds up */
+static inline size_t PA_PAGE_ALIGN(size_t l) {
+    size_t page_size = pa_page_size();
+    return (l + page_size - 1) & ~(page_size - 1);
+}
 
 #endif

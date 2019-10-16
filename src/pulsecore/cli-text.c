@@ -27,6 +27,7 @@
 
 #include <pulsecore/module.h>
 #include <pulsecore/client.h>
+#include <pulsecore/card.h>
 #include <pulsecore/sink.h>
 #include <pulsecore/source.h>
 #include <pulsecore/sink-input.h>
@@ -101,19 +102,6 @@ char *pa_client_list_to_string(pa_core *c) {
     return pa_strbuf_to_string_free(s);
 }
 
-static const char *available_to_string(pa_available_t a) {
-    switch (a) {
-        case PA_AVAILABLE_UNKNOWN:
-            return "unknown";
-        case PA_AVAILABLE_NO:
-            return "no";
-        case PA_AVAILABLE_YES:
-            return "yes";
-        default:
-            return "invalid"; /* Should never happen! */
-    }
-}
-
 static void append_port_list(pa_strbuf *s, pa_hashmap *ports) {
     pa_device_port *p;
     void *state;
@@ -128,7 +116,7 @@ static void append_port_list(pa_strbuf *s, pa_hashmap *ports) {
         char *t = pa_proplist_to_string_sep(p->proplist, "\n\t\t\t\t");
         pa_strbuf_printf(s, "\t\t%s: %s (priority %u, latency offset %" PRId64 " usec, available: %s)\n",
             p->name, p->description, p->priority, p->latency_offset,
-            available_to_string(p->available));
+            pa_available_to_string(p->available));
         pa_strbuf_printf(s, "\t\t\tproperties:\n\t\t\t\t%s\n", t);
         pa_xfree(t);
     }
@@ -171,7 +159,7 @@ char *pa_card_list_to_string(pa_core *c) {
         pa_strbuf_puts(s, "\tprofiles:\n");
         PA_HASHMAP_FOREACH(profile, card->profiles, state)
             pa_strbuf_printf(s, "\t\t%s: %s (priority %u, available: %s)\n", profile->name, profile->description,
-                             profile->priority, available_to_string(profile->available));
+                             profile->priority, pa_available_to_string(profile->available));
 
         pa_strbuf_printf(
                 s,
@@ -196,43 +184,9 @@ char *pa_card_list_to_string(pa_core *c) {
     return pa_strbuf_to_string_free(s);
 }
 
-static const char *sink_state_to_string(pa_sink_state_t state) {
-    switch (state) {
-        case PA_SINK_INIT:
-            return "INIT";
-        case PA_SINK_RUNNING:
-            return "RUNNING";
-        case PA_SINK_SUSPENDED:
-            return "SUSPENDED";
-        case PA_SINK_IDLE:
-            return "IDLE";
-        case PA_SINK_UNLINKED:
-            return "UNLINKED";
-        default:
-            return "INVALID";
-    }
-}
-
-static const char *source_state_to_string(pa_source_state_t state) {
-    switch (state) {
-        case PA_SOURCE_INIT:
-            return "INIT";
-        case PA_SOURCE_RUNNING:
-            return "RUNNING";
-        case PA_SOURCE_SUSPENDED:
-            return "SUSPENDED";
-        case PA_SOURCE_IDLE:
-            return "IDLE";
-        case PA_SOURCE_UNLINKED:
-            return "UNLINKED";
-        default:
-            return "INVALID";
-    }
-}
-
 char *pa_sink_list_to_string(pa_core *c) {
     pa_strbuf *s;
-    pa_sink *sink, *default_sink;
+    pa_sink *sink;
     uint32_t idx = PA_IDXSET_INVALID;
     pa_assert(c);
 
@@ -240,14 +194,13 @@ char *pa_sink_list_to_string(pa_core *c) {
 
     pa_strbuf_printf(s, "%u sink(s) available.\n", pa_idxset_size(c->sinks));
 
-    default_sink = pa_namereg_get_default_sink(c);
-
     PA_IDXSET_FOREACH(sink, c->sinks, idx) {
         char ss[PA_SAMPLE_SPEC_SNPRINT_MAX],
             cv[PA_CVOLUME_SNPRINT_VERBOSE_MAX],
             v[PA_VOLUME_SNPRINT_VERBOSE_MAX],
             cm[PA_CHANNEL_MAP_SNPRINT_MAX], *t;
         const char *cmn;
+        char suspend_cause_buf[PA_SUSPEND_CAUSE_TO_STRING_BUF_SIZE];
 
         cmn = pa_channel_map_to_pretty_name(&sink->channel_map);
 
@@ -258,7 +211,7 @@ char *pa_sink_list_to_string(pa_core *c) {
             "\tdriver: <%s>\n"
             "\tflags: %s%s%s%s%s%s%s%s\n"
             "\tstate: %s\n"
-            "\tsuspend cause: %s%s%s%s\n"
+            "\tsuspend cause: %s\n"
             "\tpriority: %u\n"
             "\tvolume: %s\n"
             "\t        balance %0.2f\n"
@@ -273,7 +226,7 @@ char *pa_sink_list_to_string(pa_core *c) {
             "\tchannel map: %s%s%s\n"
             "\tused by: %u\n"
             "\tlinked by: %u\n",
-            sink == default_sink ? '*' : ' ',
+            sink == c->default_sink ? '*' : ' ',
             sink->index,
             sink->name,
             sink->driver,
@@ -285,11 +238,8 @@ char *pa_sink_list_to_string(pa_core *c) {
             sink->flags & PA_SINK_LATENCY ? "LATENCY " : "",
             sink->flags & PA_SINK_FLAT_VOLUME ? "FLAT_VOLUME " : "",
             sink->flags & PA_SINK_DYNAMIC_LATENCY ? "DYNAMIC_LATENCY" : "",
-            sink_state_to_string(pa_sink_get_state(sink)),
-            sink->suspend_cause & PA_SUSPEND_USER ? "USER " : "",
-            sink->suspend_cause & PA_SUSPEND_APPLICATION ? "APPLICATION " : "",
-            sink->suspend_cause & PA_SUSPEND_IDLE ? "IDLE " : "",
-            sink->suspend_cause & PA_SUSPEND_SESSION ? "SESSION" : "",
+            pa_sink_state_to_string(sink->state),
+            pa_suspend_cause_to_string(sink->suspend_cause, suspend_cause_buf),
             sink->priority,
             pa_cvolume_snprint_verbose(cv,
                                        sizeof(cv),
@@ -350,7 +300,7 @@ char *pa_sink_list_to_string(pa_core *c) {
 
 char *pa_source_list_to_string(pa_core *c) {
     pa_strbuf *s;
-    pa_source *source, *default_source;
+    pa_source *source;
     uint32_t idx = PA_IDXSET_INVALID;
     pa_assert(c);
 
@@ -358,14 +308,13 @@ char *pa_source_list_to_string(pa_core *c) {
 
     pa_strbuf_printf(s, "%u source(s) available.\n", pa_idxset_size(c->sources));
 
-    default_source = pa_namereg_get_default_source(c);
-
     PA_IDXSET_FOREACH(source, c->sources, idx) {
         char ss[PA_SAMPLE_SPEC_SNPRINT_MAX],
             cv[PA_CVOLUME_SNPRINT_VERBOSE_MAX],
             v[PA_VOLUME_SNPRINT_VERBOSE_MAX],
             cm[PA_CHANNEL_MAP_SNPRINT_MAX], *t;
         const char *cmn;
+        char suspend_cause_buf[PA_SUSPEND_CAUSE_TO_STRING_BUF_SIZE];
 
         cmn = pa_channel_map_to_pretty_name(&source->channel_map);
 
@@ -376,7 +325,7 @@ char *pa_source_list_to_string(pa_core *c) {
             "\tdriver: <%s>\n"
             "\tflags: %s%s%s%s%s%s%s\n"
             "\tstate: %s\n"
-            "\tsuspend cause: %s%s%s%s\n"
+            "\tsuspend cause: %s\n"
             "\tpriority: %u\n"
             "\tvolume: %s\n"
             "\t        balance %0.2f\n"
@@ -389,7 +338,7 @@ char *pa_source_list_to_string(pa_core *c) {
             "\tchannel map: %s%s%s\n"
             "\tused by: %u\n"
             "\tlinked by: %u\n",
-            source == default_source ? '*' : ' ',
+            source == c->default_source ? '*' : ' ',
             source->index,
             source->name,
             source->driver,
@@ -400,11 +349,8 @@ char *pa_source_list_to_string(pa_core *c) {
             source->flags & PA_SOURCE_DECIBEL_VOLUME ? "DECIBEL_VOLUME " : "",
             source->flags & PA_SOURCE_LATENCY ? "LATENCY " : "",
             source->flags & PA_SOURCE_DYNAMIC_LATENCY ? "DYNAMIC_LATENCY" : "",
-            source_state_to_string(pa_source_get_state(source)),
-            source->suspend_cause & PA_SUSPEND_USER ? "USER " : "",
-            source->suspend_cause & PA_SUSPEND_APPLICATION ? "APPLICATION " : "",
-            source->suspend_cause & PA_SUSPEND_IDLE ? "IDLE " : "",
-            source->suspend_cause & PA_SUSPEND_SESSION ? "SESSION" : "",
+            pa_source_state_to_string(source->state),
+            pa_suspend_cause_to_string(source->suspend_cause, suspend_cause_buf),
             source->priority,
             pa_cvolume_snprint_verbose(cv,
                                        sizeof(cv),
@@ -531,7 +477,7 @@ char *pa_source_output_list_to_string(pa_core *c) {
             o->flags & PA_SOURCE_OUTPUT_NO_CREATE_ON_SUSPEND ? "NO_CREATE_ON_SUSPEND " : "",
             o->flags & PA_SOURCE_OUTPUT_KILL_ON_SUSPEND ? "KILL_ON_SUSPEND " : "",
             o->flags & PA_SOURCE_OUTPUT_PASSTHROUGH ? "PASSTHROUGH " : "",
-            state_table[pa_source_output_get_state(o)],
+            state_table[o->state],
             o->source->index, o->source->name,
             volume_str,
             pa_yes_no(o->muted),
@@ -567,7 +513,6 @@ char *pa_sink_input_list_to_string(pa_core *c) {
     static const char* const state_table[] = {
         [PA_SINK_INPUT_INIT] = "INIT",
         [PA_SINK_INPUT_RUNNING] = "RUNNING",
-        [PA_SINK_INPUT_DRAINED] = "DRAINED",
         [PA_SINK_INPUT_CORKED] = "CORKED",
         [PA_SINK_INPUT_UNLINKED] = "UNLINKED"
     };
@@ -629,7 +574,7 @@ char *pa_sink_input_list_to_string(pa_core *c) {
             i->flags & PA_SINK_INPUT_NO_CREATE_ON_SUSPEND ? "NO_CREATE_SUSPEND " : "",
             i->flags & PA_SINK_INPUT_KILL_ON_SUSPEND ? "KILL_ON_SUSPEND " : "",
             i->flags & PA_SINK_INPUT_PASSTHROUGH ? "PASSTHROUGH " : "",
-            state_table[pa_sink_input_get_state(i)],
+            state_table[i->state],
             i->sink->index, i->sink->name,
             volume_str,
             pa_yes_no(i->muted),

@@ -1,0 +1,143 @@
+option('gcov',
+       type : 'boolean', value : false,
+       description : 'Enable optional gcov coverage analysis')
+option('man',
+       type : 'boolean',
+       description : 'Enable building and installation of man pages')
+option('tests',
+       type : 'boolean',
+       description : 'Enable unit tests')
+
+option('system_user',
+        type : 'string', value : 'pulse',
+        description : 'User for running the PulseAudio daemon as a system-wide instance (pulse)')
+option('system_group',
+        type : 'string', value : 'pulse',
+        description : 'Group for running the PulseAudio daemon as a system-wide instance (pulse)')
+option('access_group',
+        type : 'string', value : 'pulse-access',
+        description : 'Group which is allowed access to a system-wide PulseAudio daemon (pulse-access)')
+option('database',
+        type : 'combo', value : 'tdb',
+        choices : [ 'gdbm', 'tdb', 'simple' ],
+        description : 'Database backend')
+option('legacy-database-entry-format',
+       type : 'boolean',
+       description : 'Try to load legacy (< 1.0) database files (card, device and volume restore)')
+option('running-from-build-tree',
+       type : 'boolean',
+       description : 'Enable running from build tree')
+option('atomic-arm-linux-helpers',
+       type : 'boolean', value : true,
+       description : 'Use inline asm or libatomic_ops instead')
+option('atomic-arm-memory-barrier',
+       type : 'boolean', value : false,
+       description : 'Enable memory barriers (only really needed in SMP arm systems)')
+
+# Paths
+
+option('padsplibdir',
+       type : 'string',
+       description : 'Specify location where OSS wrapper library will be installed')
+# This one gets inserted into a shell double-quoted string, so needs to be escaped (\$LIB). Meson
+# removes a layer of escapes when parsing the description string, so we need to double the
+# backslashes for "meson configure" to display the right text.
+option('pulsedsp-location',
+       type : 'string',
+       description : 'Specify location where OSS wrapper library will be loaded from; can use \\$LIB')
+option('modlibexecdir',
+       type : 'string',
+       description : 'Specify location where modules will be installed')
+option('systemduserunitdir',
+       type : 'string',
+       description : 'Directory for systemd user service files')
+option('udevrulesdir',
+       type : 'string',
+       description : 'Directory for udev rules (defaults to /lib/udev/rules.d)')
+option('bashcompletiondir',
+       type : 'string',
+       description : 'Directory for bash completion files')
+option('zshcompletiondir',
+       type : 'string',
+       description : 'Zsh completions directory')
+
+# Optional features
+
+option('alsa',
+       type : 'feature', value : 'auto',
+       description : 'Optional ALSA support')
+option('asyncns',
+       type : 'feature', value : 'auto',
+       description : 'Optional Async DNS support')
+option('avahi',
+       type : 'feature', value : 'auto',
+       description : 'Optional Avahi support')
+option('bluez5',
+       type : 'boolean', value : 'true',
+       description : 'Optional BlueZ 5 support')
+option('bluez5-native-headset',
+       type : 'boolean',
+       description : 'Optional native headset backend support (BlueZ 5)')
+option('bluez5-ofono-headset',
+       type : 'boolean',
+       description : 'Optional oFono headset backend support (BlueZ 5)')
+option('dbus',
+       type : 'feature', value : 'auto',
+       description : 'Optional D-Bus support')
+option('fftw',
+       type : 'feature', value : 'auto',
+       description : 'Optional FFTW support')
+option('glib',
+       type : 'feature', value : 'auto',
+       description : 'Optional GLib 2 support')
+option('gsettings',
+       type : 'feature', value : 'auto',
+       description : 'Optional GSettings support')
+option('gtk',
+       type : 'feature', value : 'auto',
+       description : 'Optional Gtk+ 3 support')
+option('hal-compat',
+       type : 'boolean',
+       description : 'Optional HAL->udev transition compatibility support (needs udev)')
+option('ipv6',
+       type : 'boolean',
+       description : 'Optional IPv6 support')
+option('jack',
+       type : 'feature', value : 'auto',
+       description : 'Optional JACK support')
+option('lirc',
+       type : 'feature', value : 'auto',
+       description : 'Optional LIRC support')
+option('openssl',
+       type : 'feature', value : 'auto',
+       description : 'Optional OpenSSL support (used for Airtunes/RAOP)')
+option('orc',
+       type : 'feature', value : 'auto',
+       description : 'Optimized Inner Loop Runtime Compiler')
+option('samplerate',
+       type : 'feature', value : 'disabled',
+       description : 'Optional libsamplerate support (DEPRECATED)')
+option('soxr',
+       type : 'feature', value : 'auto',
+       description : 'Optional SoXR support (resampling)')
+option('speex',
+       type : 'feature', value : 'auto',
+       description : 'Optional Speex support (resampling, AEC)')
+option('systemd',
+       type : 'feature', value : 'auto',
+       description : 'Optional systemd support')
+option('udev',
+       type : 'feature', value : 'auto',
+       description : 'Optional udev support')
+option('x11',
+       type : 'feature', value : 'auto',
+       description : 'Optional X11 support')
+
+# Echo cancellation
+
+option('adrian-aec',
+       type : 'boolean',
+       description : 'Optional Adrian\'s echo canceller')
+option('webrtc-aec',
+       type : 'feature', value : 'auto',
+       description : 'Optional WebRTC-based echo canceller')

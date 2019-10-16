@@ -60,6 +60,7 @@ int main(int argc, char *argv[]) {
     dev = argc > 1 ? argv[1] : "front:0";
     cap = argc > 2 ? atoi(argv[2]) : 0;
     fillrate = argc > 3 ? atoi(argv[3]) : 1;
+    assert(fillrate > 0);
 
     samples = calloc(fillrate, CHANNELS*sizeof(uint16_t));
     assert(samples);
@@ -129,9 +130,6 @@ int main(int argc, char *argv[]) {
     assert(r == 0);
 
     r = snd_pcm_sw_params(pcm, swparams);
-    assert(r == 0);
-
-    r = snd_pcm_prepare(pcm);
     assert(r == 0);
 
     r = snd_pcm_sw_params_current(pcm, swparams);

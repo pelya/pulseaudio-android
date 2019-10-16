@@ -34,7 +34,7 @@ static unsigned packets_received;
 static unsigned packets_checksum;
 static size_t packets_length;
 
-static void packet_received(pa_pstream *p, pa_packet *packet, const pa_cmsg_ancil_data *ancil_data, void *userdata) {
+static void packet_received(pa_pstream *p, pa_packet *packet, pa_cmsg_ancil_data *ancil_data, void *userdata) {
     const uint8_t *pdata;
     size_t plen;
     unsigned i;
@@ -85,7 +85,7 @@ START_TEST (srbchannel_test) {
     int pipefd[4];
 
     pa_mainloop *ml = pa_mainloop_new();
-    pa_mempool *mp = pa_mempool_new(true, 0);
+    pa_mempool *mp = pa_mempool_new(PA_MEM_TYPE_SHARED_POSIX, 0, true);
     pa_iochannel *io1, *io2;
     pa_pstream *p1, *p2;
     pa_srbchannel *sr1, *sr2;
@@ -116,7 +116,7 @@ START_TEST (srbchannel_test) {
 
     pa_pstream_unref(p1);
     pa_pstream_unref(p2);
-    pa_mempool_free(mp);
+    pa_mempool_unref(mp);
     pa_mainloop_free(ml);
 }
 END_TEST

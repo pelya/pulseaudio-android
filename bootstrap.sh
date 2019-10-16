@@ -15,13 +15,6 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with PulseAudio; if not, see <http://www.gnu.org/licenses/>.
 
-case $(uname) in
-	*Darwin*)
-		LIBTOOLIZE="glibtoolize"
-		;;
-esac
-test "x$LIBTOOLIZE" = "x" && LIBTOOLIZE=libtoolize
-
 if [ -f .git/hooks/pre-commit.sample -a ! -f .git/hooks/pre-commit ] ; then
     cp -p .git/hooks/pre-commit.sample .git/hooks/pre-commit && \
     chmod +x .git/hooks/pre-commit && \
@@ -39,17 +32,17 @@ fi
 # configure file faulty.
 if ! pkg-config --version &>/dev/null; then
     echo "pkg-config is required to bootstrap this program"
-    DIE=1
+    exit 1
+fi
+# Other necessary programs
+if ! autopoint --version &>/dev/null ; then
+    echo "autopoint is required to bootstrap this program"
+    exit 1
 fi
 
-# Other necessary programs
-intltoolize --version >/dev/null || DIE=1
-test "$DIE" = 1 && exit 1
-
-autopoint --force
-AUTOPOINT='intltoolize --automake --copy' autoreconf --force --install --verbose
+autoreconf --force --install --verbose
 
 if test "x$NOCONFIGURE" = "x"; then
-    CFLAGS="$CFLAGS -g -O0" ./configure --sysconfdir=/etc --localstatedir=/var --enable-force-preopen "$@" && \
+    CFLAGS="$CFLAGS -g -O0" ./configure --enable-force-preopen "$@" && \
         make clean
 fi

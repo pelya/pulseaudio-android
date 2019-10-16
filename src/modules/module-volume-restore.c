@@ -28,8 +28,6 @@
 #include <pulsecore/log.h>
 #include <pulsecore/core-util.h>
 
-#include "module-volume-restore-symdef.h"
-
 PA_MODULE_AUTHOR("Lennart Poettering");
 PA_MODULE_DESCRIPTION("Compatibility module");
 PA_MODULE_VERSION(PACKAGE_VERSION);
@@ -65,7 +63,7 @@ int pa__init(pa_module*m) {
     pa_log_warn("We will now load module-stream-restore. Please make sure to remove module-volume-restore from your configuration.");
 
     t = pa_sprintf_malloc("restore_volume=%s restore_device=%s", pa_yes_no(restore_volume), pa_yes_no(restore_device));
-    n = pa_module_load(m->core, "module-stream-restore", t);
+    pa_module_load(&n, m->core, "module-stream-restore", t);
     pa_xfree(t);
 
     if (n)

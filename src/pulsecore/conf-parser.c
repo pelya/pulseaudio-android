@@ -21,6 +21,7 @@
 #include <config.h>
 #endif
 
+#include <dirent.h>
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>
@@ -103,7 +104,7 @@ static int parse_line(pa_config_parser_state *state) {
             }
         }
 
-        r = pa_config_parse(fn, NULL, state->item_table, state->proplist, state->userdata);
+        r = pa_config_parse(fn, NULL, state->item_table, state->proplist, false, state->userdata);
         pa_xfree(path);
         return r;
     }
@@ -152,8 +153,15 @@ static int parse_line(pa_config_parser_state *state) {
         return normal_assignment(state);
 }
 
+#ifndef OS_IS_WIN32
+static int conf_filter(const struct dirent *entry) {
+    return pa_endswith(entry->d_name, ".conf");
+}
+#endif
+
 /* Go through the file and parse each line */
-int pa_config_parse(const char *filename, FILE *f, const pa_config_item *t, pa_proplist *proplist, void *userdata) {
+int pa_config_parse(const char *filename, FILE *f, const pa_config_item *t, pa_proplist *proplist, bool use_dot_d,
+                    void *userdata) {
     int r = -1;
     bool do_close = !f;
     pa_config_parser_state state;
@@ -210,6 +218,78 @@ finish:
 
     if (do_close && f)
         fclose(f);
+
+    if (use_dot_d) {
+#ifdef OS_IS_WIN32
+        char *dir_name = pa_sprintf_malloc("%s.d", filename);
+        char *pattern = pa_sprintf_malloc("%s\\*.conf", dir_name);
+        HANDLE fh;
+        WIN32_FIND_DATA wfd;
+
+        fh = FindFirstFile(pattern, &wfd);
+        if (fh != INVALID_HANDLE_VALUE) {
+            do {
+                if (!(wfd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+                    char *filename2 = pa_sprintf_malloc("%s\\%s", dir_name, wfd.cFileName);
+                    pa_config_parse(filename2, NULL, t, proplist, false, userdata);
+                    pa_xfree(filename2);
+                }
+            } while (FindNextFile(fh, &wfd));
+            FindClose(fh);
+        } else {
+            DWORD err = GetLastError();
+
+            if (err == ERROR_PATH_NOT_FOUND) {
+                pa_log_debug("Pattern %s did not match any files, ignoring.", pattern);
+            } else {
+                LPVOID msgbuf;
+                DWORD fret = FormatMessage(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+                                           NULL, err, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), (LPTSTR)&msgbuf, 0, NULL);
+
+                if (fret != 0) {
+                    pa_log_warn("FindFirstFile(%s) failed with error %ld (%s), ignoring.", pattern, err, (char*)msgbuf);
+                    LocalFree(msgbuf);
+                } else {
+                    pa_log_warn("FindFirstFile(%s) failed with error %ld, ignoring.", pattern, err);
+                    pa_log_warn("FormatMessage failed with error %ld", GetLastError());
+                }
+            }
+        }
+
+        pa_xfree(pattern);
+        pa_xfree(dir_name);
+#else
+        char *dir_name;
+        int n;
+        struct dirent **entries = NULL;
+
+        dir_name = pa_sprintf_malloc("%s.d", filename);
+
+        n = scandir(dir_name, &entries, conf_filter, alphasort);
+        if (n >= 0) {
+            int i;
+
+            for (i = 0; i < n; i++) {
+                char *filename2;
+
+                filename2 = pa_sprintf_malloc("%s" PA_PATH_SEP "%s", dir_name, entries[i]->d_name);
+                pa_config_parse(filename2, NULL, t, proplist, false, userdata);
+                pa_xfree(filename2);
+
+                free(entries[i]);
+            }
+
+            free(entries);
+        } else {
+            if (errno == ENOENT)
+                pa_log_debug("%s does not exist, ignoring.", dir_name);
+            else
+                pa_log_warn("scandir(\"%s\") failed: %s", dir_name, pa_cstrerror(errno));
+        }
+
+        pa_xfree(dir_name);
+#endif
+    }
 
     return r;
 }

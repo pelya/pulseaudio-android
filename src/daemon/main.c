@@ -98,6 +98,15 @@
 #include "ltdl-bind-now.h"
 #include "server-lookup.h"
 
+#ifdef DISABLE_LIBTOOL_PRELOAD
+/* FIXME: work around a libtool bug by making sure we have 2 elements. Bug has
+ * been reported: https://debbugs.gnu.org/cgi/bugreport.cgi?bug=29576 */
+const lt_dlsymlist lt_preloaded_symbols[] = {
+    { "@PROGRAM@", NULL },
+    { NULL, NULL }
+};
+#endif
+
 #ifdef HAVE_LIBWRAP
 /* Only one instance of these variables */
 int allow_severity = LOG_INFO;
@@ -111,19 +120,21 @@ int deny_severity = LOG_WARNING;
 int __padsp_disabled__ = 7;
 #endif
 
-static void signal_callback(pa_mainloop_api*m, pa_signal_event *e, int sig, void *userdata) {
+static void signal_callback(pa_mainloop_api* m, pa_signal_event *e, int sig, void *userdata) {
+    pa_module *module = NULL;
+
     pa_log_info("Got signal %s.", pa_sig2str(sig));
 
     switch (sig) {
 #ifdef SIGUSR1
         case SIGUSR1:
-            pa_module_load(userdata, "module-cli", NULL);
+            pa_module_load(&module, userdata, "module-cli", NULL);
             break;
 #endif
 
 #ifdef SIGUSR2
         case SIGUSR2:
-            pa_module_load(userdata, "module-cli-protocol-unix", NULL);
+            pa_module_load(&module, userdata, "module-cli-protocol-unix", NULL);
             break;
 #endif
 
@@ -395,7 +406,7 @@ int main(int argc, char *argv[]) {
     pa_log_set_level(PA_LOG_NOTICE);
     pa_log_set_flags(PA_LOG_COLORS|PA_LOG_PRINT_FILE|PA_LOG_PRINT_LEVEL, PA_LOG_RESET);
 
-#if defined(__linux__) && defined(__OPTIMIZE__)
+#if !defined(HAVE_BIND_NOW) && defined(__linux__) && defined(__OPTIMIZE__)
     /*
        Disable lazy relocations to make usage of external libraries
        more deterministic for our RT threads. We abuse __OPTIMIZE__ as
@@ -550,7 +561,7 @@ int main(int argc, char *argv[]) {
         case PA_CMD_DUMP_CONF: {
 
             if (d < argc) {
-                pa_log("Too many arguments.\n");
+                pa_log("Too many arguments.");
                 goto finish;
             }
 
@@ -565,7 +576,7 @@ int main(int argc, char *argv[]) {
             int i;
 
             if (d < argc) {
-                pa_log("Too many arguments.\n");
+                pa_log("Too many arguments.");
                 goto finish;
             }
 
@@ -585,7 +596,7 @@ int main(int argc, char *argv[]) {
         case PA_CMD_VERSION :
 
             if (d < argc) {
-                pa_log("Too many arguments.\n");
+                pa_log("Too many arguments.");
                 goto finish;
             }
 
@@ -597,7 +608,7 @@ int main(int argc, char *argv[]) {
             pid_t pid;
 
             if (d < argc) {
-                pa_log("Too many arguments.\n");
+                pa_log("Too many arguments.");
                 goto finish;
             }
 
@@ -614,7 +625,7 @@ int main(int argc, char *argv[]) {
         case PA_CMD_KILL:
 
             if (d < argc) {
-                pa_log("Too many arguments.\n");
+                pa_log("Too many arguments.");
                 goto finish;
             }
 
@@ -628,7 +639,7 @@ int main(int argc, char *argv[]) {
         case PA_CMD_CLEANUP_SHM:
 
             if (d < argc) {
-                pa_log("Too many arguments.\n");
+                pa_log("Too many arguments.");
                 goto finish;
             }
 
@@ -642,7 +653,7 @@ int main(int argc, char *argv[]) {
     }
 
     if (d < argc) {
-        pa_log("Too many arguments.\n");
+        pa_log("Too many arguments.");
         goto finish;
     }
 
@@ -888,7 +899,7 @@ int main(int argc, char *argv[]) {
 
     pa_set_env_and_record("PULSE_INTERNAL", "1");
     pa_assert_se(chdir("/") == 0);
-    umask(0022);
+    umask(0077);
 
 #ifdef HAVE_SYS_RESOURCE_H
     set_all_rlimits(conf);
@@ -918,7 +929,7 @@ int main(int argc, char *argv[]) {
 
     pa_log_debug("Found %u CPUs.", pa_ncpus());
 
-    pa_log_info("Page size is %lu bytes", (unsigned long) PA_PAGE_SIZE);
+    pa_log_info("Page size is %zu bytes", pa_page_size());
 
 #ifdef HAVE_VALGRIND_MEMCHECK_H
     pa_log_debug("Compiled with Valgrind support: yes");
@@ -929,6 +940,12 @@ int main(int argc, char *argv[]) {
     pa_log_debug("Running in valgrind mode: %s", pa_yes_no(pa_in_valgrind()));
 
     pa_log_debug("Running in VM: %s", pa_yes_no(pa_running_in_vm()));
+
+#ifdef HAVE_RUNNING_FROM_BUILD_TREE
+    pa_log_debug("Running from build tree: %s", pa_yes_no(pa_run_from_build_tree()));
+#else
+    pa_log_debug("Running from build tree: no");
+#endif
 
 #ifdef __OPTIMIZE__
     pa_log_debug("Optimized build: yes");
@@ -971,8 +988,7 @@ int main(int argc, char *argv[]) {
     pa_log_info("Running in system mode: %s", pa_yes_no(pa_in_system_mode()));
 
     if (pa_in_system_mode())
-        pa_log_warn(_("OK, so you are running PA in system mode. Please note that you most likely shouldn't be doing that.\n"
-                      "If you do it nonetheless then it's your own fault if things don't work as expected.\n"
+        pa_log_warn(_("OK, so you are running PA in system mode. Please make sure that you actually do want to do that.\n"
                       "Please read http://www.freedesktop.org/wiki/Software/PulseAudio/Documentation/User/WhatIsWrongWithSystemWide/ for an explanation why system mode is usually a bad idea."));
 
     if (conf->use_pid_file) {
@@ -998,9 +1014,9 @@ int main(int argc, char *argv[]) {
     pa_disable_sigpipe();
 
     if (pa_rtclock_hrtimer())
-        pa_log_info("Fresh high-resolution timers available! Bon appetit.");
+        pa_log_info("System supports high resolution timers");
     else
-        pa_log_info("Dude, your kernel stinks! The chef's recommendation today is Linux with high-resolution timers enabled.");
+        pa_log_info("System appears to not support high resolution timers");
 
     if (conf->lock_memory) {
 #if defined(HAVE_SYS_MMAN_H) && !defined(__ANDROID__)
@@ -1017,7 +1033,9 @@ int main(int argc, char *argv[]) {
 
     pa_assert_se(mainloop = pa_mainloop_new());
 
-    if (!(c = pa_core_new(pa_mainloop_get_api(mainloop), !conf->disable_shm, conf->shm_size))) {
+    if (!(c = pa_core_new(pa_mainloop_get_api(mainloop), !conf->disable_shm,
+                          !conf->disable_shm && !conf->disable_memfd && pa_memfd_is_locally_supported(),
+                          conf->shm_size))) {
         pa_log(_("pa_core_new() failed."));
         goto finish;
     }
@@ -1035,7 +1053,9 @@ int main(int argc, char *argv[]) {
     c->resample_method = conf->resample_method;
     c->realtime_priority = conf->realtime_priority;
     c->realtime_scheduling = conf->realtime_scheduling;
+    c->avoid_resampling = conf->avoid_resampling;
     c->disable_remixing = conf->disable_remixing;
+    c->remixing_use_all_sink_channels = conf->remixing_use_all_sink_channels;
     c->disable_lfe_remixing = conf->disable_lfe_remixing;
     c->deferred_volume = conf->deferred_volume;
     c->running_as_daemon = conf->daemonize;
@@ -1068,25 +1088,31 @@ int main(int argc, char *argv[]) {
 #ifdef HAVE_DBUS
     pa_assert_se(dbus_threads_init_default());
 
-    if (start_server) {
+    if (start_server)
 #endif
+    {
+        const char *command_source = NULL;
+
         if (conf->load_default_script_file) {
             FILE *f;
 
             if ((f = pa_daemon_conf_open_default_script_file(conf))) {
                 r = pa_cli_command_execute_file_stream(c, f, buf, &conf->fail);
                 fclose(f);
+                command_source = pa_daemon_conf_get_default_script_file(conf);
             }
         }
 
-        if (r >= 0)
+        if (r >= 0) {
             r = pa_cli_command_execute(c, conf->script_commands, buf, &conf->fail);
+            command_source = _("command line arguments");
+        }
 
         pa_log_error("%s", s = pa_strbuf_to_string_free(buf));
         pa_xfree(s);
 
         if (r < 0 && conf->fail) {
-            pa_log(_("Failed to initialize daemon."));
+            pa_log(_("Failed to initialize daemon due to errors while executing startup commands. Source of commands: %s"), command_source);
             goto finish;
         }
 
@@ -1101,8 +1127,8 @@ int main(int argc, char *argv[]) {
          * think there's no way to contact the server, but receiving certain
          * signals could still cause modules to load. */
         conf->disallow_module_loading = true;
-    }
 #endif
+    }
 
     /* We completed the initial module loading, so let's disable it
      * from now on, if requested */

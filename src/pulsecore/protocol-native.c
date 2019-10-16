@@ -48,6 +48,7 @@
 #include <pulsecore/core-scache.h>
 #include <pulsecore/core-subscribe.h>
 #include <pulsecore/log.h>
+#include <pulsecore/mem.h>
 #include <pulsecore/strlist.h>
 #include <pulsecore/shared.h>
 #include <pulsecore/sample-util.h>
@@ -55,6 +56,7 @@
 #include <pulsecore/core-util.h>
 #include <pulsecore/ipacl.h>
 #include <pulsecore/thread-mq.h>
+#include <pulsecore/mem.h>
 
 #include "protocol-native.h"
 
@@ -173,6 +175,12 @@ struct pa_native_connection {
     bool is_local:1;
     uint32_t version;
     pa_client *client;
+    /* R/W mempool, one per client connection, for srbchannel transport.
+     * Both server and client can write to this shm area.
+     *
+     * Note: This will be NULL if our connection with the client does
+     * not support srbchannels */
+    pa_mempool *rw_mempool;
     pa_pstream *pstream;
     pa_pdispatch *pdispatch;
     pa_idxset *record_streams, *output_streams;
@@ -233,7 +241,7 @@ enum {
 static bool sink_input_process_underrun_cb(pa_sink_input *i);
 static int sink_input_pop_cb(pa_sink_input *i, size_t length, pa_memchunk *chunk);
 static void sink_input_kill_cb(pa_sink_input *i);
-static void sink_input_suspend_cb(pa_sink_input *i, bool suspend);
+static void sink_input_suspend_cb(pa_sink_input *i, pa_sink_state_t old_state, pa_suspend_cause_t old_suspend_cause);
 static void sink_input_moving_cb(pa_sink_input *i, pa_sink *dest);
 static void sink_input_process_rewind_cb(pa_sink_input *i, size_t nbytes);
 static void sink_input_update_max_rewind_cb(pa_sink_input *i, size_t nbytes);
@@ -245,162 +253,13 @@ static void playback_stream_request_bytes(struct playback_stream*s);
 
 static void source_output_kill_cb(pa_source_output *o);
 static void source_output_push_cb(pa_source_output *o, const pa_memchunk *chunk);
-static void source_output_suspend_cb(pa_source_output *o, bool suspend);
+static void source_output_suspend_cb(pa_source_output *o, pa_source_state_t old_state, pa_suspend_cause_t old_suspend_cause);
 static void source_output_moving_cb(pa_source_output *o, pa_source *dest);
 static pa_usec_t source_output_get_latency_cb(pa_source_output *o);
 static void source_output_send_event_cb(pa_source_output *o, const char *event, pa_proplist *pl);
 
 static int sink_input_process_msg(pa_msgobject *o, int code, void *userdata, int64_t offset, pa_memchunk *chunk);
 static int source_output_process_msg(pa_msgobject *o, int code, void *userdata, int64_t offset, pa_memchunk *chunk);
-
-static void command_exit(pa_pdispatch *pd, uint32_t command, uint32_t tag, pa_tagstruct *t, void *userdata);
-static void command_create_playback_stream(pa_pdispatch *pd, uint32_t command, uint32_t tag, pa_tagstruct *t, void *userdata);
-static void command_drain_playback_stream(pa_pdispatch *pd, uint32_t command, uint32_t tag, pa_tagstruct *t, void *userdata);
-static void command_create_record_stream(pa_pdispatch *pd, uint32_t command, uint32_t tag, pa_tagstruct *t, void *userdata);
-static void command_delete_stream(pa_pdispatch *pd, uint32_t command, uint32_t tag, pa_tagstruct *t, void *userdata);
-static void command_auth(pa_pdispatch *pd, uint32_t command, uint32_t tag, pa_tagstruct *t, void *userdata);
-static void command_set_client_name(pa_pdispatch *pd, uint32_t command, uint32_t tag, pa_tagstruct *t, void *userdata);
-static void command_lookup(pa_pdispatch *pd, uint32_t command, uint32_t tag, pa_tagstruct *t, void *userdata);
-static void command_stat(pa_pdispatch *pd, uint32_t command, uint32_t tag, pa_tagstruct *t, void *userdata);
-static void command_get_playback_latency(pa_pdispatch *pd, uint32_t command, uint32_t tag, pa_tagstruct *t, void *userdata);
-static void command_get_record_latency(pa_pdispatch *pd, uint32_t command, uint32_t tag, pa_tagstruct *t, void *userdata);
-static void command_create_upload_stream(pa_pdispatch *pd, uint32_t command, uint32_t tag, pa_tagstruct *t, void *userdata);
-static void command_finish_upload_stream(pa_pdispatch *pd, uint32_t command, uint32_t tag, pa_tagstruct *t, void *userdata);
-static void command_play_sample(pa_pdispatch *pd, uint32_t command, uint32_t tag, pa_tagstruct *t, void *userdata);
-static void command_remove_sample(pa_pdispatch *pd, uint32_t command, uint32_t tag, pa_tagstruct *t, void *userdata);
-static void command_get_info(pa_pdispatch *pd, uint32_t command, uint32_t tag, pa_tagstruct *t, void *userdata);
-static void command_get_info_list(pa_pdispatch *pd, uint32_t command, uint32_t tag, pa_tagstruct *t, void *userdata);
-static void command_get_server_info(pa_pdispatch *pd, uint32_t command, uint32_t tag, pa_tagstruct *t, void *userdata);
-static void command_subscribe(pa_pdispatch *pd, uint32_t command, uint32_t tag, pa_tagstruct *t, void *userdata);
-static void command_set_volume(pa_pdispatch *pd, uint32_t command, uint32_t tag, pa_tagstruct *t, void *userdata);
-static void command_set_mute(pa_pdispatch *pd, uint32_t command, uint32_t tag, pa_tagstruct *t, void *userdata);
-static void command_cork_playback_stream(pa_pdispatch *pd, uint32_t command, uint32_t tag, pa_tagstruct *t, void *userdata);
-static void command_trigger_or_flush_or_prebuf_playback_stream(pa_pdispatch *pd, uint32_t command, uint32_t tag, pa_tagstruct *t, void *userdata);
-static void command_set_default_sink_or_source(pa_pdispatch *pd, uint32_t command, uint32_t tag, pa_tagstruct *t, void *userdata);
-static void command_set_stream_name(pa_pdispatch *pd, uint32_t command, uint32_t tag, pa_tagstruct *t, void *userdata);
-static void command_kill(pa_pdispatch *pd, uint32_t command, uint32_t tag, pa_tagstruct *t, void *userdata);
-static void command_load_module(pa_pdispatch *pd, uint32_t command, uint32_t tag, pa_tagstruct *t, void *userdata);
-static void command_unload_module(pa_pdispatch *pd, uint32_t command, uint32_t tag, pa_tagstruct *t, void *userdata);
-static void command_cork_record_stream(pa_pdispatch *pd, uint32_t command, uint32_t tag, pa_tagstruct *t, void *userdata);
-static void command_flush_record_stream(pa_pdispatch *pd, uint32_t command, uint32_t tag, pa_tagstruct *t, void *userdata);
-static void command_move_stream(pa_pdispatch *pd, uint32_t command, uint32_t tag, pa_tagstruct *t, void *userdata);
-static void command_suspend(pa_pdispatch *pd, uint32_t command, uint32_t tag, pa_tagstruct *t, void *userdata);
-static void command_set_stream_buffer_attr(pa_pdispatch *pd, uint32_t command, uint32_t tag, pa_tagstruct *t, void *userdata);
-static void command_update_stream_sample_rate(pa_pdispatch *pd, uint32_t command, uint32_t tag, pa_tagstruct *t, void *userdata);
-static void command_update_proplist(pa_pdispatch *pd, uint32_t command, uint32_t tag, pa_tagstruct *t, void *userdata);
-static void command_remove_proplist(pa_pdispatch *pd, uint32_t command, uint32_t tag, pa_tagstruct *t, void *userdata);
-static void command_extension(pa_pdispatch *pd, uint32_t command, uint32_t tag, pa_tagstruct *t, void *userdata);
-static void command_set_card_profile(pa_pdispatch *pd, uint32_t command, uint32_t tag, pa_tagstruct *t, void *userdata);
-static void command_set_sink_or_source_port(pa_pdispatch *pd, uint32_t command, uint32_t tag, pa_tagstruct *t, void *userdata);
-static void command_set_port_latency_offset(pa_pdispatch *pd, uint32_t command, uint32_t tag, pa_tagstruct *t, void *userdata);
-static void command_enable_srbchannel(pa_pdispatch *pd, uint32_t command, uint32_t tag, pa_tagstruct *t, void *userdata);
-
-static const pa_pdispatch_cb_t command_table[PA_COMMAND_MAX] = {
-    [PA_COMMAND_ERROR] = NULL,
-    [PA_COMMAND_TIMEOUT] = NULL,
-    [PA_COMMAND_REPLY] = NULL,
-    [PA_COMMAND_CREATE_PLAYBACK_STREAM] = command_create_playback_stream,
-    [PA_COMMAND_DELETE_PLAYBACK_STREAM] = command_delete_stream,
-    [PA_COMMAND_DRAIN_PLAYBACK_STREAM] = command_drain_playback_stream,
-    [PA_COMMAND_CREATE_RECORD_STREAM] = command_create_record_stream,
-    [PA_COMMAND_DELETE_RECORD_STREAM] = command_delete_stream,
-    [PA_COMMAND_AUTH] = command_auth,
-    [PA_COMMAND_REQUEST] = NULL,
-    [PA_COMMAND_EXIT] = command_exit,
-    [PA_COMMAND_SET_CLIENT_NAME] = command_set_client_name,
-    [PA_COMMAND_LOOKUP_SINK] = command_lookup,
-    [PA_COMMAND_LOOKUP_SOURCE] = command_lookup,
-    [PA_COMMAND_STAT] = command_stat,
-    [PA_COMMAND_GET_PLAYBACK_LATENCY] = command_get_playback_latency,
-    [PA_COMMAND_GET_RECORD_LATENCY] = command_get_record_latency,
-    [PA_COMMAND_CREATE_UPLOAD_STREAM] = command_create_upload_stream,
-    [PA_COMMAND_DELETE_UPLOAD_STREAM] = command_delete_stream,
-    [PA_COMMAND_FINISH_UPLOAD_STREAM] = command_finish_upload_stream,
-    [PA_COMMAND_PLAY_SAMPLE] = command_play_sample,
-    [PA_COMMAND_REMOVE_SAMPLE] = command_remove_sample,
-    [PA_COMMAND_GET_SINK_INFO] = command_get_info,
-    [PA_COMMAND_GET_SOURCE_INFO] = command_get_info,
-    [PA_COMMAND_GET_CLIENT_INFO] = command_get_info,
-    [PA_COMMAND_GET_CARD_INFO] = command_get_info,
-    [PA_COMMAND_GET_MODULE_INFO] = command_get_info,
-    [PA_COMMAND_GET_SINK_INPUT_INFO] = command_get_info,
-    [PA_COMMAND_GET_SOURCE_OUTPUT_INFO] = command_get_info,
-    [PA_COMMAND_GET_SAMPLE_INFO] = command_get_info,
-    [PA_COMMAND_GET_SINK_INFO_LIST] = command_get_info_list,
-    [PA_COMMAND_GET_SOURCE_INFO_LIST] = command_get_info_list,
-    [PA_COMMAND_GET_MODULE_INFO_LIST] = command_get_info_list,
-    [PA_COMMAND_GET_CLIENT_INFO_LIST] = command_get_info_list,
-    [PA_COMMAND_GET_CARD_INFO_LIST] = command_get_info_list,
-    [PA_COMMAND_GET_SINK_INPUT_INFO_LIST] = command_get_info_list,
-    [PA_COMMAND_GET_SOURCE_OUTPUT_INFO_LIST] = command_get_info_list,
-    [PA_COMMAND_GET_SAMPLE_INFO_LIST] = command_get_info_list,
-    [PA_COMMAND_GET_SERVER_INFO] = command_get_server_info,
-    [PA_COMMAND_SUBSCRIBE] = command_subscribe,
-
-    [PA_COMMAND_SET_SINK_VOLUME] = command_set_volume,
-    [PA_COMMAND_SET_SINK_INPUT_VOLUME] = command_set_volume,
-    [PA_COMMAND_SET_SOURCE_VOLUME] = command_set_volume,
-    [PA_COMMAND_SET_SOURCE_OUTPUT_VOLUME] = command_set_volume,
-
-    [PA_COMMAND_SET_SINK_MUTE] = command_set_mute,
-    [PA_COMMAND_SET_SINK_INPUT_MUTE] = command_set_mute,
-    [PA_COMMAND_SET_SOURCE_MUTE] = command_set_mute,
-    [PA_COMMAND_SET_SOURCE_OUTPUT_MUTE] = command_set_mute,
-
-    [PA_COMMAND_SUSPEND_SINK] = command_suspend,
-    [PA_COMMAND_SUSPEND_SOURCE] = command_suspend,
-
-    [PA_COMMAND_CORK_PLAYBACK_STREAM] = command_cork_playback_stream,
-    [PA_COMMAND_FLUSH_PLAYBACK_STREAM] = command_trigger_or_flush_or_prebuf_playback_stream,
-    [PA_COMMAND_TRIGGER_PLAYBACK_STREAM] = command_trigger_or_flush_or_prebuf_playback_stream,
-    [PA_COMMAND_PREBUF_PLAYBACK_STREAM] = command_trigger_or_flush_or_prebuf_playback_stream,
-
-    [PA_COMMAND_CORK_RECORD_STREAM] = command_cork_record_stream,
-    [PA_COMMAND_FLUSH_RECORD_STREAM] = command_flush_record_stream,
-
-    [PA_COMMAND_SET_DEFAULT_SINK] = command_set_default_sink_or_source,
-    [PA_COMMAND_SET_DEFAULT_SOURCE] = command_set_default_sink_or_source,
-    [PA_COMMAND_SET_PLAYBACK_STREAM_NAME] = command_set_stream_name,
-    [PA_COMMAND_SET_RECORD_STREAM_NAME] = command_set_stream_name,
-    [PA_COMMAND_KILL_CLIENT] = command_kill,
-    [PA_COMMAND_KILL_SINK_INPUT] = command_kill,
-    [PA_COMMAND_KILL_SOURCE_OUTPUT] = command_kill,
-    [PA_COMMAND_LOAD_MODULE] = command_load_module,
-    [PA_COMMAND_UNLOAD_MODULE] = command_unload_module,
-
-    [PA_COMMAND_GET_AUTOLOAD_INFO___OBSOLETE] = NULL,
-    [PA_COMMAND_GET_AUTOLOAD_INFO_LIST___OBSOLETE] = NULL,
-    [PA_COMMAND_ADD_AUTOLOAD___OBSOLETE] = NULL,
-    [PA_COMMAND_REMOVE_AUTOLOAD___OBSOLETE] = NULL,
-
-    [PA_COMMAND_MOVE_SINK_INPUT] = command_move_stream,
-    [PA_COMMAND_MOVE_SOURCE_OUTPUT] = command_move_stream,
-
-    [PA_COMMAND_SET_PLAYBACK_STREAM_BUFFER_ATTR] = command_set_stream_buffer_attr,
-    [PA_COMMAND_SET_RECORD_STREAM_BUFFER_ATTR] = command_set_stream_buffer_attr,
-
-    [PA_COMMAND_UPDATE_PLAYBACK_STREAM_SAMPLE_RATE] = command_update_stream_sample_rate,
-    [PA_COMMAND_UPDATE_RECORD_STREAM_SAMPLE_RATE] = command_update_stream_sample_rate,
-
-    [PA_COMMAND_UPDATE_RECORD_STREAM_PROPLIST] = command_update_proplist,
-    [PA_COMMAND_UPDATE_PLAYBACK_STREAM_PROPLIST] = command_update_proplist,
-    [PA_COMMAND_UPDATE_CLIENT_PROPLIST] = command_update_proplist,
-
-    [PA_COMMAND_REMOVE_RECORD_STREAM_PROPLIST] = command_remove_proplist,
-    [PA_COMMAND_REMOVE_PLAYBACK_STREAM_PROPLIST] = command_remove_proplist,
-    [PA_COMMAND_REMOVE_CLIENT_PROPLIST] = command_remove_proplist,
-
-    [PA_COMMAND_SET_CARD_PROFILE] = command_set_card_profile,
-
-    [PA_COMMAND_SET_SINK_PORT] = command_set_sink_or_source_port,
-    [PA_COMMAND_SET_SOURCE_PORT] = command_set_sink_or_source_port,
-
-    [PA_COMMAND_SET_PORT_LATENCY_OFFSET] = command_set_port_latency_offset,
-
-    [PA_COMMAND_ENABLE_SRBCHANNEL] = command_enable_srbchannel,
-
-    [PA_COMMAND_EXTENSION] = command_extension
-};
 
 /* structure management */
 
@@ -597,7 +456,7 @@ static void fix_record_buffer_attr_pre(record_stream *s) {
          * guarantee it. */
 
         if (fragsize_usec != s->configured_source_latency)
-            pa_log_debug("Could not configure a sufficiently low latency. Early requests might not be satisifed.");
+            pa_log_debug("Could not configure a sufficiently low latency. Early requests might not be satisfied.");
 
     } else if (s->adjust_latency) {
 
@@ -657,6 +516,9 @@ static record_stream* record_stream_new(
         pa_sink_input *direct_on_input,
         int *ret) {
 
+    /* Note: This function takes ownership of the 'formats' param, so we need
+     * to take extra care to not leak it */
+
     record_stream *s;
     pa_source_output *source_output = NULL;
     pa_source_output_new_data data;
@@ -674,7 +536,7 @@ static record_stream* record_stream_new(
     data.module = c->options->module;
     data.client = c->client;
     if (source)
-        pa_source_output_new_data_set_source(&data, source, false);
+        pa_source_output_new_data_set_source(&data, source, false, true);
     if (pa_sample_spec_valid(ss))
         pa_source_output_new_data_set_sample_spec(&data, ss);
     if (pa_channel_map_valid(map))
@@ -1029,7 +891,7 @@ static void fix_playback_buffer_attr(playback_stream *s) {
          * guarantee it. */
 
         if (minreq_usec != s->configured_sink_latency)
-            pa_log_debug("Could not configure a sufficiently low latency. Early requests might not be satisifed.");
+            pa_log_debug("Could not configure a sufficiently low latency. Early requests might not be satisfied.");
 
     } else if (s->adjust_latency) {
 
@@ -1147,7 +1009,7 @@ static playback_stream* playback_stream_new(
     data.module = c->options->module;
     data.client = c->client;
     if (sink)
-        pa_sink_input_new_data_set_sink(&data, sink, false);
+        pa_sink_input_new_data_set_sink(&data, sink, false, true);
     if (pa_sample_spec_valid(ss))
         pa_sink_input_new_data_set_sample_spec(&data, ss);
     if (pa_channel_map_valid(map))
@@ -1252,8 +1114,7 @@ out:
 
 /* Called from IO context */
 static void playback_stream_request_bytes(playback_stream *s) {
-    size_t m, minreq;
-    int previous_missing;
+    size_t m;
 
     playback_stream_assert_ref(s);
 
@@ -1273,11 +1134,7 @@ static void playback_stream_request_bytes(playback_stream *s) {
     pa_log("request_bytes(%lu)", (unsigned long) m);
 #endif
 
-    previous_missing = pa_atomic_add(&s->missing, (int) m);
-    minreq = pa_memblockq_get_minreq(s->memblockq);
-
-    if (pa_memblockq_prebuf_active(s->memblockq) ||
-        (previous_missing < (int) minreq && previous_missing + (int) m >= (int) minreq))
+    if (pa_atomic_add(&s->missing, (int) m) <= 0)
         pa_asyncmsgq_post(pa_thread_mq_get()->outq, PA_MSGOBJECT(s), PLAYBACK_STREAM_MESSAGE_REQUEST_DATA, NULL, 0, NULL, NULL);
 }
 
@@ -1371,6 +1228,9 @@ static void native_connection_free(pa_object *o) {
 
     pa_pdispatch_unref(c->pdispatch);
     pa_pstream_unref(c->pstream);
+    if (c->rw_mempool)
+        pa_mempool_unref(c->rw_mempool);
+
     pa_client_free(c->client);
 
     pa_xfree(c);
@@ -1560,7 +1420,7 @@ static int sink_input_process_msg(pa_msgobject *o, int code, void *userdata, int
             s->read_index = pa_memblockq_get_read_index(s->memblockq);
             s->write_index = pa_memblockq_get_write_index(s->memblockq);
             s->render_memblockq_length = pa_memblockq_get_length(s->sink_input->thread_info.render_memblockq);
-            s->current_sink_latency = pa_sink_get_latency_within_thread(s->sink_input->sink);
+            s->current_sink_latency = pa_sink_get_latency_within_thread(s->sink_input->sink, false);
             s->underrun_for = s->sink_input->thread_info.underrun_for;
             s->playing_for = s->sink_input->thread_info.playing_for;
 
@@ -1758,11 +1618,19 @@ static void sink_input_send_event_cb(pa_sink_input *i, const char *event, pa_pro
 }
 
 /* Called from main context */
-static void sink_input_suspend_cb(pa_sink_input *i, bool suspend) {
+static void sink_input_suspend_cb(pa_sink_input *i, pa_sink_state_t old_state, pa_suspend_cause_t old_suspend_cause) {
     playback_stream *s;
     pa_tagstruct *t;
+    bool suspend;
 
     pa_sink_input_assert_ref(i);
+
+    /* State has not changed, nothing to do */
+    if (old_state == i->sink->state)
+        return;
+
+    suspend = (i->sink->state == PA_SINK_SUSPENDED);
+
     s = PLAYBACK_STREAM(i->userdata);
     playback_stream_assert_ref(s);
 
@@ -1802,7 +1670,7 @@ static void sink_input_moving_cb(pa_sink_input *i, pa_sink *dest) {
     pa_tagstruct_putu32(t, s->index);
     pa_tagstruct_putu32(t, dest->index);
     pa_tagstruct_puts(t, dest->name);
-    pa_tagstruct_put_boolean(t, pa_sink_get_state(dest) == PA_SINK_SUSPENDED);
+    pa_tagstruct_put_boolean(t, dest->state == PA_SINK_SUSPENDED);
 
     if (s->connection->version >= 13) {
         pa_tagstruct_putu32(t, s->buffer_attr.maxlength);
@@ -1829,8 +1697,8 @@ static int source_output_process_msg(pa_msgobject *_o, int code, void *userdata,
     switch (code) {
         case SOURCE_OUTPUT_MESSAGE_UPDATE_LATENCY:
             /* Atomically get a snapshot of all timing parameters... */
-            s->current_monitor_latency = o->source->monitor_of ? pa_sink_get_latency_within_thread(o->source->monitor_of) : 0;
-            s->current_source_latency = pa_source_get_latency_within_thread(o->source);
+            s->current_monitor_latency = o->source->monitor_of ? pa_sink_get_latency_within_thread(o->source->monitor_of, false) : 0;
+            s->current_source_latency = pa_source_get_latency_within_thread(o->source, false);
             s->on_the_fly_snapshot = pa_atomic_load(&s->on_the_fly);
             return 0;
     }
@@ -1896,11 +1764,19 @@ static void source_output_send_event_cb(pa_source_output *o, const char *event, 
 }
 
 /* Called from main context */
-static void source_output_suspend_cb(pa_source_output *o, bool suspend) {
+static void source_output_suspend_cb(pa_source_output *o, pa_source_state_t old_state, pa_suspend_cause_t old_suspend_cause) {
     record_stream *s;
     pa_tagstruct *t;
+    bool suspend;
 
     pa_source_output_assert_ref(o);
+
+    /* State has not changed, nothing to do */
+    if (old_state == o->source->state)
+        return;
+
+    suspend = (o->source->state == PA_SOURCE_SUSPENDED);
+
     s = RECORD_STREAM(o->userdata);
     record_stream_assert_ref(s);
 
@@ -1941,7 +1817,7 @@ static void source_output_moving_cb(pa_source_output *o, pa_source *dest) {
     pa_tagstruct_putu32(t, s->index);
     pa_tagstruct_putu32(t, dest->index);
     pa_tagstruct_puts(t, dest->name);
-    pa_tagstruct_put_boolean(t, pa_source_get_state(dest) == PA_SOURCE_SUSPENDED);
+    pa_tagstruct_put_boolean(t, dest->state == PA_SOURCE_SUSPENDED);
 
     if (s->connection->version >= 13) {
         pa_tagstruct_putu32(t, s->buffer_attr.maxlength);
@@ -2223,7 +2099,7 @@ static void command_create_playback_stream(pa_pdispatch *pd, uint32_t command, u
         pa_tagstruct_putu32(reply, s->sink_input->sink->index);
         pa_tagstruct_puts(reply, s->sink_input->sink->name);
 
-        pa_tagstruct_put_boolean(reply, pa_sink_get_state(s->sink_input->sink) == PA_SINK_SUSPENDED);
+        pa_tagstruct_put_boolean(reply, s->sink_input->sink->state == PA_SINK_SUSPENDED);
     }
 
     if (c->version >= 13)
@@ -2511,6 +2387,8 @@ static void command_create_record_stream(pa_pdispatch *pd, uint32_t command, uin
         (passthrough ? PA_SOURCE_OUTPUT_PASSTHROUGH : 0);
 
     s = record_stream_new(c, source, &ss, &map, formats, &attr, volume_set ? &volume : NULL, muted, muted_set, flags, p, adjust_latency, early_requests, relative_volume, peak_detect, direct_on_input, &ret);
+    /* We no longer own the formats idxset */
+    formats = NULL;
 
     CHECK_VALIDITY_GOTO(c->pstream, s, tag, ret, finish);
 
@@ -2537,7 +2415,7 @@ static void command_create_record_stream(pa_pdispatch *pd, uint32_t command, uin
         pa_tagstruct_putu32(reply, s->source_output->source->index);
         pa_tagstruct_puts(reply, s->source_output->source->name);
 
-        pa_tagstruct_put_boolean(reply, pa_source_get_state(s->source_output->source) == PA_SOURCE_SUSPENDED);
+        pa_tagstruct_put_boolean(reply, s->source_output->source->state == PA_SOURCE_SUSPENDED);
     }
 
     if (c->version >= 13)
@@ -2584,12 +2462,17 @@ static void command_exit(pa_pdispatch *pd, uint32_t command, uint32_t tag, pa_ta
     pa_pstream_send_simple_ack(c->pstream, tag); /* nonsense */
 }
 
-static void setup_srbchannel(pa_native_connection *c) {
+static void setup_srbchannel(pa_native_connection *c, pa_mem_type_t shm_type) {
     pa_srbchannel_template srbt;
     pa_srbchannel *srb;
     pa_memchunk mc;
     pa_tagstruct *t;
     int fdlist[2];
+
+#ifndef HAVE_CREDS
+    pa_log_debug("Disabling srbchannel, reason: No fd passing support");
+    return;
+#endif
 
     if (!c->options->srbchannel) {
         pa_log_debug("Disabling srbchannel, reason: Must be enabled by module parameter");
@@ -2606,15 +2489,31 @@ static void setup_srbchannel(pa_native_connection *c) {
         return;
     }
 
-    if (!c->protocol->core->rw_mempool) {
-        pa_log_debug("Disabling srbchannel, reason: No rw memory pool");
+    if (c->rw_mempool) {
+        pa_log_debug("Ignoring srbchannel setup, reason: received COMMAND_AUTH "
+                     "more than once");
         return;
     }
 
-    srb = pa_srbchannel_new(c->protocol->core->mainloop, c->protocol->core->rw_mempool);
+    if (!(c->rw_mempool = pa_mempool_new(shm_type, c->protocol->core->shm_size, true))) {
+        pa_log_warn("Disabling srbchannel, reason: Failed to allocate shared "
+                    "writable memory pool.");
+        return;
+    }
+
+    if (shm_type == PA_MEM_TYPE_SHARED_MEMFD) {
+        const char *reason;
+        if (pa_pstream_register_memfd_mempool(c->pstream, c->rw_mempool, &reason)) {
+            pa_log_warn("Disabling srbchannel, reason: Failed to register memfd mempool: %s", reason);
+            goto fail;
+        }
+    }
+    pa_mempool_set_is_remote_writable(c->rw_mempool, true);
+
+    srb = pa_srbchannel_new(c->protocol->core->mainloop, c->rw_mempool);
     if (!srb) {
         pa_log_debug("Failed to create srbchannel");
-        return;
+        goto fail;
     }
     pa_log_debug("Enabling srbchannel...");
     pa_srbchannel_export(srb, &srbt);
@@ -2625,7 +2524,7 @@ static void setup_srbchannel(pa_native_connection *c) {
     pa_tagstruct_putu32(t, (size_t) srb); /* tag */
     fdlist[0] = srbt.readfd;
     fdlist[1] = srbt.writefd;
-    pa_pstream_send_tagstruct_with_fds(c->pstream, t, 2, fdlist);
+    pa_pstream_send_tagstruct_with_fds(c->pstream, t, 2, fdlist, false);
 
     /* Send ringbuffer memblock to client */
     mc.memblock = srbt.memblock;
@@ -2634,6 +2533,13 @@ static void setup_srbchannel(pa_native_connection *c) {
     pa_pstream_send_memblock(c->pstream, 0, 0, 0, &mc);
 
     c->srbpending = srb;
+    return;
+
+fail:
+    if (c->rw_mempool) {
+        pa_mempool_unref(c->rw_mempool);
+        c->rw_mempool = NULL;
+    }
 }
 
 static void command_enable_srbchannel(pa_pdispatch *pd, uint32_t command, uint32_t tag, pa_tagstruct *t, void *userdata) {
@@ -2652,7 +2558,9 @@ static void command_enable_srbchannel(pa_pdispatch *pd, uint32_t command, uint32
 static void command_auth(pa_pdispatch *pd, uint32_t command, uint32_t tag, pa_tagstruct *t, void *userdata) {
     pa_native_connection *c = PA_NATIVE_CONNECTION(userdata);
     const void*cookie;
+    bool memfd_on_remote = false, do_memfd = false;
     pa_tagstruct *reply;
+    pa_mem_type_t shm_type;
     bool shm_on_remote = false, do_shm;
 
     pa_native_connection_assert_ref(c);
@@ -2674,9 +2582,17 @@ static void command_auth(pa_pdispatch *pd, uint32_t command, uint32_t tag, pa_ta
     /* Starting with protocol version 13 the MSB of the version tag
        reflects if shm is available for this pa_native_connection or
        not. */
-    if (c->version >= 13) {
-        shm_on_remote = !!(c->version & 0x80000000U);
-        c->version &= 0x7FFFFFFFU;
+    if ((c->version & PA_PROTOCOL_VERSION_MASK) >= 13) {
+        shm_on_remote = !!(c->version & PA_PROTOCOL_FLAG_SHM);
+
+        /* Starting with protocol version 31, the second MSB of the version
+         * tag reflects whether memfd is supported on the other PA end. */
+        if ((c->version & PA_PROTOCOL_VERSION_MASK) >= 31)
+            memfd_on_remote = !!(c->version & PA_PROTOCOL_FLAG_MEMFD);
+
+        /* Reserve the two most-significant _bytes_ of the version tag
+         * for flags. */
+        c->version &= PA_PROTOCOL_VERSION_MASK;
     }
 
     pa_log_debug("Protocol version: remote %u, local %u", c->version, PA_PROTOCOL_VERSION);
@@ -2737,7 +2653,7 @@ static void command_auth(pa_pdispatch *pd, uint32_t command, uint32_t tag, pa_ta
         }
     }
 
-    /* Enable shared memory support if possible */
+    /* Enable shared memory and memfd support if possible */
     do_shm =
         pa_mempool_is_shared(c->protocol->core->mempool) &&
         c->is_local;
@@ -2763,8 +2679,30 @@ static void command_auth(pa_pdispatch *pd, uint32_t command, uint32_t tag, pa_ta
     pa_log_debug("Negotiated SHM: %s", pa_yes_no(do_shm));
     pa_pstream_enable_shm(c->pstream, do_shm);
 
+    /* Do not declare memfd support for 9.0 client libraries (protocol v31).
+     *
+     * Although they support memfd transport, such 9.0 clients has an iochannel
+     * bug that would break memfd audio if they're run in 32-bit mode over a
+     * 64-bit kernel. Thus influence them to use the POSIX shared memory model
+     * instead. Check commit 451d1d676237c81 for further details. */
+    do_memfd =
+        c->version >= 32 && do_shm && pa_mempool_is_memfd_backed(c->protocol->core->mempool);
+
+    shm_type = PA_MEM_TYPE_PRIVATE;
+    if (do_shm) {
+        if (do_memfd && memfd_on_remote) {
+            pa_pstream_enable_memfd(c->pstream);
+            shm_type = PA_MEM_TYPE_SHARED_MEMFD;
+        } else
+            shm_type = PA_MEM_TYPE_SHARED_POSIX;
+
+        pa_log_debug("Memfd possible: %s", pa_yes_no(pa_memfd_is_locally_supported()));
+        pa_log_debug("Negotiated SHM type: %s", pa_mem_type_to_string(shm_type));
+    }
+
     reply = reply_new(tag);
-    pa_tagstruct_putu32(reply, PA_PROTOCOL_VERSION | (do_shm ? 0x80000000 : 0));
+    pa_tagstruct_putu32(reply, PA_PROTOCOL_VERSION | (do_shm ? 0x80000000 : 0) |
+                        (do_memfd ? 0x40000000 : 0));
 
 #ifdef HAVE_CREDS
 {
@@ -2781,7 +2719,29 @@ static void command_auth(pa_pdispatch *pd, uint32_t command, uint32_t tag, pa_ta
     pa_pstream_send_tagstruct(c->pstream, reply);
 #endif
 
-    setup_srbchannel(c);
+    /* The client enables memfd transport on its pstream only after
+     * inspecting our version flags to see if we support memfds too.
+     *
+     * Thus register any pools after sending the server's version
+     * flags and _never_ before it. */
+    if (shm_type == PA_MEM_TYPE_SHARED_MEMFD) {
+        const char *reason;
+
+        if (pa_pstream_register_memfd_mempool(c->pstream, c->protocol->core->mempool, &reason))
+            pa_log("Failed to register memfd mempool. Reason: %s", reason);
+    }
+
+    setup_srbchannel(c, shm_type);
+}
+
+static void command_register_memfd_shmid(pa_pdispatch *pd, uint32_t command, uint32_t tag, pa_tagstruct *t, void *userdata) {
+    pa_native_connection *c = PA_NATIVE_CONNECTION(userdata);
+
+    pa_native_connection_assert_ref(c);
+    pa_assert(t);
+
+    if (pa_common_command_register_memfd_shmid(c->pstream, pd, c->version, command, t))
+        protocol_error(c);
 }
 
 static void command_set_client_name(pa_pdispatch *pd, uint32_t command, uint32_t tag, pa_tagstruct *t, void *userdata) {
@@ -2940,8 +2900,8 @@ static void command_get_playback_latency(pa_pdispatch *pd, uint32_t command, uin
     pa_tagstruct_put_usec(reply, 0);
     pa_tagstruct_put_boolean(reply,
                              s->playing_for > 0 &&
-                             pa_sink_get_state(s->sink_input->sink) == PA_SINK_RUNNING &&
-                             pa_sink_input_get_state(s->sink_input) == PA_SINK_INPUT_RUNNING);
+                             s->sink_input->sink->state == PA_SINK_RUNNING &&
+                             s->sink_input->state == PA_SINK_INPUT_RUNNING);
     pa_tagstruct_put_timeval(reply, &tv);
     pa_tagstruct_put_timeval(reply, pa_gettimeofday(&now));
     pa_tagstruct_puts64(reply, s->write_index);
@@ -2983,10 +2943,10 @@ static void command_get_record_latency(pa_pdispatch *pd, uint32_t command, uint3
     pa_tagstruct_put_usec(reply, s->current_monitor_latency);
     pa_tagstruct_put_usec(reply,
                           s->current_source_latency +
-                          pa_bytes_to_usec(s->on_the_fly_snapshot, &s->source_output->source->sample_spec));
+                          pa_bytes_to_usec(s->on_the_fly_snapshot, &s->source_output->sample_spec));
     pa_tagstruct_put_boolean(reply,
-                             pa_source_get_state(s->source_output->source) == PA_SOURCE_RUNNING &&
-                             pa_source_output_get_state(s->source_output) == PA_SOURCE_OUTPUT_RUNNING);
+                             s->source_output->source->state == PA_SOURCE_RUNNING &&
+                             s->source_output->state == PA_SOURCE_OUTPUT_RUNNING);
     pa_tagstruct_put_timeval(reply, &tv);
     pa_tagstruct_put_timeval(reply, pa_gettimeofday(&now));
     pa_tagstruct_puts64(reply, pa_memblockq_get_write_index(s->memblockq));
@@ -3228,9 +3188,9 @@ static void sink_fill_tagstruct(pa_native_connection *c, pa_tagstruct *t, pa_sin
 
     if (c->version >= 15) {
         pa_tagstruct_put_volume(t, sink->base_volume);
-        if (PA_UNLIKELY(pa_sink_get_state(sink) == PA_SINK_INVALID_STATE))
+        if (PA_UNLIKELY(sink->state == PA_SINK_INVALID_STATE))
             pa_log_error("Internal sink state is invalid.");
-        pa_tagstruct_putu32(t, pa_sink_get_state(sink));
+        pa_tagstruct_putu32(t, sink->state);
         pa_tagstruct_putu32(t, sink->n_volume_steps);
         pa_tagstruct_putu32(t, sink->card ? sink->card->index : PA_INVALID_INDEX);
     }
@@ -3298,9 +3258,9 @@ static void source_fill_tagstruct(pa_native_connection *c, pa_tagstruct *t, pa_s
 
     if (c->version >= 15) {
         pa_tagstruct_put_volume(t, source->base_volume);
-        if (PA_UNLIKELY(pa_source_get_state(source) == PA_SOURCE_INVALID_STATE))
+        if (PA_UNLIKELY(source->state == PA_SOURCE_INVALID_STATE))
             pa_log_error("Internal source state is invalid.");
-        pa_tagstruct_putu32(t, pa_source_get_state(source));
+        pa_tagstruct_putu32(t, source->state);
         pa_tagstruct_putu32(t, source->n_volume_steps);
         pa_tagstruct_putu32(t, source->card ? source->card->index : PA_INVALID_INDEX);
     }
@@ -3453,7 +3413,7 @@ static void sink_input_fill_tagstruct(pa_native_connection *c, pa_tagstruct *t, 
     if (c->version >= 13)
         pa_tagstruct_put_proplist(t, s->proplist);
     if (c->version >= 19)
-        pa_tagstruct_put_boolean(t, (pa_sink_input_get_state(s) == PA_SINK_INPUT_CORKED));
+        pa_tagstruct_put_boolean(t, s->state == PA_SINK_INPUT_CORKED);
     if (c->version >= 20) {
         pa_tagstruct_put_boolean(t, has_volume);
         pa_tagstruct_put_boolean(t, s->volume_writable);
@@ -3493,7 +3453,7 @@ static void source_output_fill_tagstruct(pa_native_connection *c, pa_tagstruct *
     if (c->version >= 13)
         pa_tagstruct_put_proplist(t, s->proplist);
     if (c->version >= 19)
-        pa_tagstruct_put_boolean(t, (pa_source_output_get_state(s) == PA_SOURCE_OUTPUT_CORKED));
+        pa_tagstruct_put_boolean(t, s->state == PA_SOURCE_OUTPUT_CORKED);
     if (c->version >= 22) {
         pa_tagstruct_put_cvolume(t, &v);
         pa_tagstruct_put_boolean(t, s->muted);
@@ -3698,10 +3658,9 @@ static void command_get_info_list(pa_pdispatch *pd, uint32_t command, uint32_t t
 static void command_get_server_info(pa_pdispatch *pd, uint32_t command, uint32_t tag, pa_tagstruct *t, void *userdata) {
     pa_native_connection *c = PA_NATIVE_CONNECTION(userdata);
     pa_tagstruct *reply;
-    pa_sink *def_sink;
-    pa_source *def_source;
     pa_sample_spec fixed_ss;
     char *h, *u;
+    pa_core *core;
 
     pa_native_connection_assert_ref(c);
     pa_assert(t);
@@ -3725,18 +3684,18 @@ static void command_get_server_info(pa_pdispatch *pd, uint32_t command, uint32_t
     pa_tagstruct_puts(reply, h);
     pa_xfree(h);
 
-    fixup_sample_spec(c, &fixed_ss, &c->protocol->core->default_sample_spec);
+    core = c->protocol->core;
+
+    fixup_sample_spec(c, &fixed_ss, &core->default_sample_spec);
     pa_tagstruct_put_sample_spec(reply, &fixed_ss);
 
-    def_sink = pa_namereg_get_default_sink(c->protocol->core);
-    pa_tagstruct_puts(reply, def_sink ? def_sink->name : NULL);
-    def_source = pa_namereg_get_default_source(c->protocol->core);
-    pa_tagstruct_puts(reply, def_source ? def_source->name : NULL);
+    pa_tagstruct_puts(reply, core->default_sink ? core->default_sink->name : NULL);
+    pa_tagstruct_puts(reply, core->default_source ? core->default_source->name : NULL);
 
     pa_tagstruct_putu32(reply, c->protocol->core->cookie);
 
     if (c->version >= 15)
-        pa_tagstruct_put_channel_map(reply, &c->protocol->core->default_channel_map);
+        pa_tagstruct_put_channel_map(reply, &core->default_channel_map);
 
     pa_pstream_send_tagstruct(c->pstream, reply);
 }
@@ -4408,7 +4367,7 @@ static void command_set_default_sink_or_source(pa_pdispatch *pd, uint32_t comman
         source = pa_namereg_get(c->protocol->core, s, PA_NAMEREG_SOURCE);
         CHECK_VALIDITY(c->pstream, source, tag, PA_ERR_NOENTITY);
 
-        pa_namereg_set_default_source(c->protocol->core, source);
+        pa_core_set_configured_default_source(c->protocol->core, source->name);
     } else {
         pa_sink *sink;
         pa_assert(command == PA_COMMAND_SET_DEFAULT_SINK);
@@ -4416,7 +4375,7 @@ static void command_set_default_sink_or_source(pa_pdispatch *pd, uint32_t comman
         sink = pa_namereg_get(c->protocol->core, s, PA_NAMEREG_SINK);
         CHECK_VALIDITY(c->pstream, sink, tag, PA_ERR_NOENTITY);
 
-        pa_namereg_set_default_sink(c->protocol->core, sink);
+        pa_core_set_configured_default_sink(c->protocol->core, sink->name);
     }
 
     pa_pstream_send_simple_ack(c->pstream, tag);
@@ -4447,7 +4406,7 @@ static void command_set_stream_name(pa_pdispatch *pd, uint32_t command, uint32_t
         CHECK_VALIDITY(c->pstream, s, tag, PA_ERR_NOENTITY);
         CHECK_VALIDITY(c->pstream, playback_stream_isinstance(s), tag, PA_ERR_NOENTITY);
 
-        pa_sink_input_set_name(s->sink_input, name);
+        pa_sink_input_set_property(s->sink_input, PA_PROP_MEDIA_NAME, name);
 
     } else {
         record_stream *s;
@@ -4456,7 +4415,7 @@ static void command_set_stream_name(pa_pdispatch *pd, uint32_t command, uint32_t
         s = pa_idxset_get_by_index(c->record_streams, idx);
         CHECK_VALIDITY(c->pstream, s, tag, PA_ERR_NOENTITY);
 
-        pa_source_output_set_name(s->source_output, name);
+        pa_source_output_set_property(s->source_output, PA_PROP_MEDIA_NAME, name);
     }
 
     pa_pstream_send_simple_ack(c->pstream, tag);
@@ -4530,7 +4489,7 @@ static void command_load_module(pa_pdispatch *pd, uint32_t command, uint32_t tag
     CHECK_VALIDITY(c->pstream, name && *name && pa_utf8_valid(name) && !strchr(name, '/'), tag, PA_ERR_INVALID);
     CHECK_VALIDITY(c->pstream, !argument || pa_utf8_valid(argument), tag, PA_ERR_INVALID);
 
-    if (!(m = pa_module_load(c->protocol->core, name, argument))) {
+    if (pa_module_load(&m, c->protocol->core, name, argument) < 0) {
         pa_pstream_send_error(c->pstream, tag, PA_ERR_MODINITFAILED);
         return;
     }
@@ -4782,6 +4741,11 @@ static void command_set_card_profile(pa_pdispatch *pd, uint32_t command, uint32_
 
     CHECK_VALIDITY(c->pstream, profile, tag, PA_ERR_NOENTITY);
 
+    pa_log_info("Application \"%s\" requests card profile change. card = %s, profile = %s",
+                pa_strnull(pa_proplist_gets(c->client->proplist, PA_PROP_APPLICATION_NAME)),
+                card->name,
+                profile->name);
+
     if ((ret = pa_card_set_profile(card, profile, true)) < 0) {
         pa_pstream_send_error(c->pstream, tag, -ret);
         return;
@@ -4887,9 +4851,118 @@ static void command_set_port_latency_offset(pa_pdispatch *pd, uint32_t command, 
     pa_pstream_send_simple_ack(c->pstream, tag);
 }
 
+static const pa_pdispatch_cb_t command_table[PA_COMMAND_MAX] = {
+    [PA_COMMAND_ERROR] = NULL,
+    [PA_COMMAND_TIMEOUT] = NULL,
+    [PA_COMMAND_REPLY] = NULL,
+    [PA_COMMAND_CREATE_PLAYBACK_STREAM] = command_create_playback_stream,
+    [PA_COMMAND_DELETE_PLAYBACK_STREAM] = command_delete_stream,
+    [PA_COMMAND_DRAIN_PLAYBACK_STREAM] = command_drain_playback_stream,
+    [PA_COMMAND_CREATE_RECORD_STREAM] = command_create_record_stream,
+    [PA_COMMAND_DELETE_RECORD_STREAM] = command_delete_stream,
+    [PA_COMMAND_AUTH] = command_auth,
+    [PA_COMMAND_REQUEST] = NULL,
+    [PA_COMMAND_EXIT] = command_exit,
+    [PA_COMMAND_SET_CLIENT_NAME] = command_set_client_name,
+    [PA_COMMAND_LOOKUP_SINK] = command_lookup,
+    [PA_COMMAND_LOOKUP_SOURCE] = command_lookup,
+    [PA_COMMAND_STAT] = command_stat,
+    [PA_COMMAND_GET_PLAYBACK_LATENCY] = command_get_playback_latency,
+    [PA_COMMAND_GET_RECORD_LATENCY] = command_get_record_latency,
+    [PA_COMMAND_CREATE_UPLOAD_STREAM] = command_create_upload_stream,
+    [PA_COMMAND_DELETE_UPLOAD_STREAM] = command_delete_stream,
+    [PA_COMMAND_FINISH_UPLOAD_STREAM] = command_finish_upload_stream,
+    [PA_COMMAND_PLAY_SAMPLE] = command_play_sample,
+    [PA_COMMAND_REMOVE_SAMPLE] = command_remove_sample,
+    [PA_COMMAND_GET_SINK_INFO] = command_get_info,
+    [PA_COMMAND_GET_SOURCE_INFO] = command_get_info,
+    [PA_COMMAND_GET_CLIENT_INFO] = command_get_info,
+    [PA_COMMAND_GET_CARD_INFO] = command_get_info,
+    [PA_COMMAND_GET_MODULE_INFO] = command_get_info,
+    [PA_COMMAND_GET_SINK_INPUT_INFO] = command_get_info,
+    [PA_COMMAND_GET_SOURCE_OUTPUT_INFO] = command_get_info,
+    [PA_COMMAND_GET_SAMPLE_INFO] = command_get_info,
+    [PA_COMMAND_GET_SINK_INFO_LIST] = command_get_info_list,
+    [PA_COMMAND_GET_SOURCE_INFO_LIST] = command_get_info_list,
+    [PA_COMMAND_GET_MODULE_INFO_LIST] = command_get_info_list,
+    [PA_COMMAND_GET_CLIENT_INFO_LIST] = command_get_info_list,
+    [PA_COMMAND_GET_CARD_INFO_LIST] = command_get_info_list,
+    [PA_COMMAND_GET_SINK_INPUT_INFO_LIST] = command_get_info_list,
+    [PA_COMMAND_GET_SOURCE_OUTPUT_INFO_LIST] = command_get_info_list,
+    [PA_COMMAND_GET_SAMPLE_INFO_LIST] = command_get_info_list,
+    [PA_COMMAND_GET_SERVER_INFO] = command_get_server_info,
+    [PA_COMMAND_SUBSCRIBE] = command_subscribe,
+
+    [PA_COMMAND_SET_SINK_VOLUME] = command_set_volume,
+    [PA_COMMAND_SET_SINK_INPUT_VOLUME] = command_set_volume,
+    [PA_COMMAND_SET_SOURCE_VOLUME] = command_set_volume,
+    [PA_COMMAND_SET_SOURCE_OUTPUT_VOLUME] = command_set_volume,
+
+    [PA_COMMAND_SET_SINK_MUTE] = command_set_mute,
+    [PA_COMMAND_SET_SINK_INPUT_MUTE] = command_set_mute,
+    [PA_COMMAND_SET_SOURCE_MUTE] = command_set_mute,
+    [PA_COMMAND_SET_SOURCE_OUTPUT_MUTE] = command_set_mute,
+
+    [PA_COMMAND_SUSPEND_SINK] = command_suspend,
+    [PA_COMMAND_SUSPEND_SOURCE] = command_suspend,
+
+    [PA_COMMAND_CORK_PLAYBACK_STREAM] = command_cork_playback_stream,
+    [PA_COMMAND_FLUSH_PLAYBACK_STREAM] = command_trigger_or_flush_or_prebuf_playback_stream,
+    [PA_COMMAND_TRIGGER_PLAYBACK_STREAM] = command_trigger_or_flush_or_prebuf_playback_stream,
+    [PA_COMMAND_PREBUF_PLAYBACK_STREAM] = command_trigger_or_flush_or_prebuf_playback_stream,
+
+    [PA_COMMAND_CORK_RECORD_STREAM] = command_cork_record_stream,
+    [PA_COMMAND_FLUSH_RECORD_STREAM] = command_flush_record_stream,
+
+    [PA_COMMAND_SET_DEFAULT_SINK] = command_set_default_sink_or_source,
+    [PA_COMMAND_SET_DEFAULT_SOURCE] = command_set_default_sink_or_source,
+    [PA_COMMAND_SET_PLAYBACK_STREAM_NAME] = command_set_stream_name,
+    [PA_COMMAND_SET_RECORD_STREAM_NAME] = command_set_stream_name,
+    [PA_COMMAND_KILL_CLIENT] = command_kill,
+    [PA_COMMAND_KILL_SINK_INPUT] = command_kill,
+    [PA_COMMAND_KILL_SOURCE_OUTPUT] = command_kill,
+    [PA_COMMAND_LOAD_MODULE] = command_load_module,
+    [PA_COMMAND_UNLOAD_MODULE] = command_unload_module,
+
+    [PA_COMMAND_GET_AUTOLOAD_INFO___OBSOLETE] = NULL,
+    [PA_COMMAND_GET_AUTOLOAD_INFO_LIST___OBSOLETE] = NULL,
+    [PA_COMMAND_ADD_AUTOLOAD___OBSOLETE] = NULL,
+    [PA_COMMAND_REMOVE_AUTOLOAD___OBSOLETE] = NULL,
+
+    [PA_COMMAND_MOVE_SINK_INPUT] = command_move_stream,
+    [PA_COMMAND_MOVE_SOURCE_OUTPUT] = command_move_stream,
+
+    [PA_COMMAND_SET_PLAYBACK_STREAM_BUFFER_ATTR] = command_set_stream_buffer_attr,
+    [PA_COMMAND_SET_RECORD_STREAM_BUFFER_ATTR] = command_set_stream_buffer_attr,
+
+    [PA_COMMAND_UPDATE_PLAYBACK_STREAM_SAMPLE_RATE] = command_update_stream_sample_rate,
+    [PA_COMMAND_UPDATE_RECORD_STREAM_SAMPLE_RATE] = command_update_stream_sample_rate,
+
+    [PA_COMMAND_UPDATE_RECORD_STREAM_PROPLIST] = command_update_proplist,
+    [PA_COMMAND_UPDATE_PLAYBACK_STREAM_PROPLIST] = command_update_proplist,
+    [PA_COMMAND_UPDATE_CLIENT_PROPLIST] = command_update_proplist,
+
+    [PA_COMMAND_REMOVE_RECORD_STREAM_PROPLIST] = command_remove_proplist,
+    [PA_COMMAND_REMOVE_PLAYBACK_STREAM_PROPLIST] = command_remove_proplist,
+    [PA_COMMAND_REMOVE_CLIENT_PROPLIST] = command_remove_proplist,
+
+    [PA_COMMAND_SET_CARD_PROFILE] = command_set_card_profile,
+
+    [PA_COMMAND_SET_SINK_PORT] = command_set_sink_or_source_port,
+    [PA_COMMAND_SET_SOURCE_PORT] = command_set_sink_or_source_port,
+
+    [PA_COMMAND_SET_PORT_LATENCY_OFFSET] = command_set_port_latency_offset,
+
+    [PA_COMMAND_ENABLE_SRBCHANNEL] = command_enable_srbchannel,
+
+    [PA_COMMAND_REGISTER_MEMFD_SHMID] = command_register_memfd_shmid,
+
+    [PA_COMMAND_EXTENSION] = command_extension
+};
+
 /*** pstream callbacks ***/
 
-static void pstream_packet_callback(pa_pstream *p, pa_packet *packet, const pa_cmsg_ancil_data *ancil_data, void *userdata) {
+static void pstream_packet_callback(pa_pstream *p, pa_packet *packet, pa_cmsg_ancil_data *ancil_data, void *userdata) {
     pa_native_connection *c = PA_NATIVE_CONNECTION(userdata);
 
     pa_assert(p);
@@ -5124,6 +5197,8 @@ void pa_native_protocol_connect(pa_native_protocol *p, pa_iochannel *io, pa_nati
     c->client->kill = client_kill_cb;
     c->client->send_event = client_send_event_cb;
     c->client->userdata = c;
+
+    c->rw_mempool = NULL;
 
     c->pstream = pa_pstream_new(p->core->mainloop, io, p->core->mempool);
     pa_pstream_set_receive_packet_callback(c->pstream, pstream_packet_callback, c);

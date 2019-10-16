@@ -65,8 +65,6 @@
 #include <pulsecore/rtpoll.h>
 #include <pulsecore/poll.h>
 
-#include "module-esound-sink-symdef.h"
-
 PA_MODULE_AUTHOR("Lennart Poettering");
 PA_MODULE_DESCRIPTION("ESOUND Sink");
 PA_MODULE_VERSION(PACKAGE_VERSION);
@@ -143,39 +141,13 @@ static int sink_process_msg(pa_msgobject *o, int code, void *data, int64_t offse
 
     switch (code) {
 
-        case PA_SINK_MESSAGE_SET_STATE:
-
-            switch ((pa_sink_state_t) PA_PTR_TO_UINT(data)) {
-
-                case PA_SINK_SUSPENDED:
-                    pa_assert(PA_SINK_IS_OPENED(u->sink->thread_info.state));
-
-                    pa_smoother_pause(u->smoother, pa_rtclock_now());
-                    break;
-
-                case PA_SINK_IDLE:
-                case PA_SINK_RUNNING:
-
-                    if (u->sink->thread_info.state == PA_SINK_SUSPENDED)
-                        pa_smoother_resume(u->smoother, pa_rtclock_now(), true);
-
-                    break;
-
-                case PA_SINK_UNLINKED:
-                case PA_SINK_INIT:
-                case PA_SINK_INVALID_STATE:
-                    ;
-            }
-
-            break;
-
         case PA_SINK_MESSAGE_GET_LATENCY: {
             pa_usec_t w, r;
 
             r = pa_smoother_get(u->smoother, pa_rtclock_now());
             w = pa_bytes_to_usec((uint64_t) u->offset + u->memchunk.length, &u->sink->sample_spec);
 
-            *((pa_usec_t*) data) = w > r ? w - r : 0;
+            *((int64_t*) data) = (int64_t)w - r;
             return 0;
         }
 
@@ -194,6 +166,43 @@ static int sink_process_msg(pa_msgobject *o, int code, void *data, int64_t offse
     }
 
     return pa_sink_process_msg(o, code, data, offset, chunk);
+}
+
+/* Called from the IO thread. */
+static int sink_set_state_in_io_thread_cb(pa_sink *s, pa_sink_state_t new_state, pa_suspend_cause_t new_suspend_cause) {
+    struct userdata *u;
+
+    pa_assert(s);
+    pa_assert_se(u = s->userdata);
+
+    /* It may be that only the suspend cause is changing, in which case there's
+     * nothing to do. */
+    if (new_state == s->thread_info.state)
+        return 0;
+
+    switch (new_state) {
+
+        case PA_SINK_SUSPENDED:
+            pa_assert(PA_SINK_IS_OPENED(s->thread_info.state));
+
+            pa_smoother_pause(u->smoother, pa_rtclock_now());
+            break;
+
+        case PA_SINK_IDLE:
+        case PA_SINK_RUNNING:
+
+            if (s->thread_info.state == PA_SINK_SUSPENDED)
+                pa_smoother_resume(u->smoother, pa_rtclock_now(), true);
+
+            break;
+
+        case PA_SINK_UNLINKED:
+        case PA_SINK_INIT:
+        case PA_SINK_INVALID_STATE:
+            ;
+    }
+
+    return 0;
 }
 
 static void thread_func(void *userdata) {
@@ -564,7 +573,12 @@ int pa__init(pa_module*m) {
     u->offset = 0;
 
     u->rtpoll = pa_rtpoll_new();
-    pa_thread_mq_init(&u->thread_mq, m->core->mainloop, u->rtpoll);
+
+    if (pa_thread_mq_init(&u->thread_mq, m->core->mainloop, u->rtpoll) < 0) {
+        pa_log("pa_thread_mq_init() failed.");
+        goto fail;
+    }
+
     u->rtpoll_item = NULL;
 
     u->format =
@@ -608,6 +622,7 @@ int pa__init(pa_module*m) {
     }
 
     u->sink->parent.process_msg = sink_process_msg;
+    u->sink->set_state_in_io_thread = sink_set_state_in_io_thread_cb;
     u->sink->userdata = u;
 
     pa_sink_set_asyncmsgq(u->sink, u->thread_mq.inq);

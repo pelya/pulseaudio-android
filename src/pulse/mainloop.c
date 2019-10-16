@@ -802,7 +802,7 @@ int pa_mainloop_prepare(pa_mainloop *m, int timeout) {
             uint64_t u = (uint64_t) timeout * PA_USEC_PER_MSEC;
 
             if (u < m->prepared_timeout || m->prepared_timeout == PA_USEC_INVALID)
-                m->prepared_timeout = timeout;
+                m->prepared_timeout = u;
         }
     }
 
@@ -910,7 +910,7 @@ quit:
     return -2;
 }
 
-int pa_mainloop_get_retval(pa_mainloop *m) {
+int pa_mainloop_get_retval(const pa_mainloop *m) {
     pa_assert(m);
 
     return m->retval;
@@ -971,7 +971,7 @@ void pa_mainloop_set_poll_func(pa_mainloop *m, pa_poll_func poll_func, void *use
     m->poll_func_userdata = userdata;
 }
 
-bool pa_mainloop_is_our_api(pa_mainloop_api *m) {
+bool pa_mainloop_is_our_api(const pa_mainloop_api *m) {
     pa_assert(m);
 
     return m->io_new == mainloop_io_new;

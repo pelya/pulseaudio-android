@@ -227,7 +227,7 @@ ssize_t pa_iochannel_write(pa_iochannel*io, const void*data, size_t l) {
         return r; /* Fast path - we almost always successfully write everything */
 
     if (r < 0) {
-        if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
+        if (errno == EINTR || errno == EAGAIN)
             r = 0;
         else
             return r;
@@ -346,6 +346,8 @@ ssize_t pa_iochannel_write_with_creds(pa_iochannel*io, const void*data, size_t l
     return r;
 }
 
+/* For more details on FD passing, check the cmsg(3) manpage
+ * and IETF RFC #2292: "Advanced Sockets API for IPv6" */
 ssize_t pa_iochannel_write_with_fds(pa_iochannel*io, const void*data, size_t l, int nfd, const int *fds) {
     ssize_t r;
     int *msgdata;
@@ -380,7 +382,13 @@ ssize_t pa_iochannel_write_with_fds(pa_iochannel*io, const void*data, size_t l, 
     mh.msg_iov = &iov;
     mh.msg_iovlen = 1;
     mh.msg_control = &cmsg;
-    mh.msg_controllen = sizeof(cmsg);
+
+    /* If we followed the example on the cmsg man page, we'd use
+     * sizeof(cmsg.data) here, but if nfd < MAX_ANCIL_DATA_FDS, then the data
+     * buffer is larger than needed, and the kernel doesn't like it if we set
+     * msg_controllen to a larger than necessary value. The commit message for
+     * commit 451d1d6762 contains a longer explanation. */
+    mh.msg_controllen = CMSG_SPACE(sizeof(int) * nfd);
 
     if ((r = sendmsg(io->ofd, &mh, MSG_NOSIGNAL)) >= 0) {
         io->writable = io->hungup = false;
@@ -450,6 +458,7 @@ ssize_t pa_iochannel_read_with_ancil_data(pa_iochannel*io, void*data, size_t l, 
                 }
                 memcpy(ancil_data->fds, CMSG_DATA(cmh), nfd * sizeof(int));
                 ancil_data->nfd = nfd;
+                ancil_data->close_fds_on_cleanup = true;
             }
         }
 

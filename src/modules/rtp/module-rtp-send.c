@@ -46,8 +46,6 @@
 #include <pulsecore/socket-util.h>
 #include <pulsecore/arpa-inet.h>
 
-#include "module-rtp-send-symdef.h"
-
 #include "rtp.h"
 #include "sdp.h"
 #include "sap.h"
@@ -68,6 +66,7 @@ PA_MODULE_USAGE(
         "loop=<loopback to local host?> "
         "ttl=<ttl value> "
         "inhibit_auto_suspend=<always|never|only_with_non_monitor_sources>"
+        "stream_name=<name of the stream>"
 );
 
 #define DEFAULT_PORT 46000
@@ -92,6 +91,7 @@ static const char* const valid_modargs[] = {
     "loop",
     "ttl",
     "inhibit_auto_suspend",
+    "stream_name",
     NULL
 };
 
@@ -430,7 +430,7 @@ int pa__init(pa_module*m) {
     pa_proplist_setf(data.proplist, "rtp.ttl", "%lu", (unsigned long) ttl);
     data.driver = __FILE__;
     data.module = m;
-    pa_source_output_new_data_set_source(&data, s, false);
+    pa_source_output_new_data_set_source(&data, s, false, true);
     pa_source_output_new_data_set_sample_spec(&data, &ss);
     pa_source_output_new_data_set_channel_map(&data, &cm);
     data.flags |= get_dont_inhibit_auto_suspend_flag(s, inhibit_auto_suspend);
@@ -471,7 +471,9 @@ int pa__init(pa_module*m) {
     k = sizeof(sa_dst);
     pa_assert_se((r = getsockname(fd, (struct sockaddr*) &sa_dst, &k)) >= 0);
 
-    n = pa_sprintf_malloc("PulseAudio RTP Stream on %s", pa_get_fqdn(hn, sizeof(hn)));
+    n = pa_xstrdup(pa_modargs_get_value(ma, "stream_name", NULL));
+    if (n == NULL)
+        n = pa_sprintf_malloc("PulseAudio RTP Stream on %s", pa_get_fqdn(hn, sizeof(hn)));
 
     if (af == AF_INET) {
         p = pa_sdp_build(af,
@@ -515,11 +517,6 @@ fail:
 
     if (sap_fd >= 0)
         pa_close(sap_fd);
-
-    if (o) {
-        pa_source_output_unlink(o);
-        pa_source_output_unref(o);
-    }
 
     return -1;
 }

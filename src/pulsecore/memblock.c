@@ -100,6 +100,28 @@ struct pa_memimport_segment {
     bool writable;
 };
 
+/*
+ * If true, this segment's lifetime will not be limited by the
+ * number of active blocks (seg->n_blocks) using its shared memory.
+ * Rather, it will exist for the full lifetime of the memimport it
+ * is attached to.
+ *
+ * This is done to support memfd blocks transport.
+ *
+ * To transfer memfd-backed blocks without passing their fd every
+ * time, thus minimizing overhead and avoiding fd leaks, a command
+ * is sent with the memfd fd as ancil data very early on.
+ *
+ * This command has an ID that identifies the memfd region. Further
+ * block references are then exclusively done using this ID. On the
+ * receiving end, such logic is enabled by the memimport's segment
+ * hash and 'permanent' segments below.
+ */
+static bool segment_is_permanent(pa_memimport_segment *seg) {
+    pa_assert(seg);
+    return seg->memory.type == PA_MEM_TYPE_SHARED_MEMFD;
+}
+
 /* A collection of multiple segments */
 struct pa_memimport {
     pa_mutex *mutex;
@@ -142,10 +164,30 @@ struct pa_memexport {
 };
 
 struct pa_mempool {
+    /* Reference count the mempool
+     *
+     * Any block allocation from the pool itself, or even just imported from
+     * another process through SHM and attached to it (PA_MEMBLOCK_IMPORTED),
+     * shall increase the refcount.
+     *
+     * This is done for per-client mempools: global references to blocks in
+     * the pool, or just to attached ones, can still be lingering around when
+     * the client connection dies and all per-client objects are to be freed.
+     * That is, current PulseAudio design does not guarantee that the client
+     * mempool blocks are referenced only by client-specific objects.
+     *
+     * For further details, please check:
+     * https://lists.freedesktop.org/archives/pulseaudio-discuss/2016-February/025587.html
+     */
+    PA_REFCNT_DECLARE;
+
     pa_semaphore *semaphore;
     pa_mutex *mutex;
 
     pa_shm memory;
+
+    bool global;
+
     size_t block_size;
     unsigned n_blocks;
     bool is_remote_writable;
@@ -237,6 +279,7 @@ static pa_memblock *memblock_new_appended(pa_mempool *p, size_t length) {
     b = pa_xmalloc(PA_ALIGN(sizeof(pa_memblock)) + length);
     PA_REFCNT_INIT(b);
     b->pool = p;
+    pa_mempool_ref(b->pool);
     b->type = PA_MEMBLOCK_APPENDED;
     b->read_only = b->is_silence = false;
     pa_atomic_ptr_store(&b->data, (uint8_t*) b + PA_ALIGN(sizeof(pa_memblock)));
@@ -367,6 +410,7 @@ pa_memblock *pa_memblock_new_pool(pa_mempool *p, size_t length) {
 
     PA_REFCNT_INIT(b);
     b->pool = p;
+    pa_mempool_ref(b->pool);
     b->read_only = b->is_silence = false;
     b->length = length;
     pa_atomic_store(&b->n_acquired, 0);
@@ -390,6 +434,7 @@ pa_memblock *pa_memblock_new_fixed(pa_mempool *p, void *d, size_t length, bool r
 
     PA_REFCNT_INIT(b);
     b->pool = p;
+    pa_mempool_ref(b->pool);
     b->type = PA_MEMBLOCK_FIXED;
     b->read_only = read_only;
     b->is_silence = false;
@@ -423,6 +468,7 @@ pa_memblock *pa_memblock_new_user(
 
     PA_REFCNT_INIT(b);
     b->pool = p;
+    pa_mempool_ref(b->pool);
     b->type = PA_MEMBLOCK_USER;
     b->read_only = read_only;
     b->is_silence = false;
@@ -451,7 +497,7 @@ bool pa_memblock_is_read_only(pa_memblock *b) {
     pa_assert(b);
     pa_assert(PA_REFCNT_VALUE(b) > 0);
 
-    return b->read_only && PA_REFCNT_VALUE(b) == 1;
+    return b->read_only || PA_REFCNT_VALUE(b) > 1;
 }
 
 /* No lock necessary */
@@ -518,10 +564,13 @@ size_t pa_memblock_get_length(pa_memblock *b) {
     return b->length;
 }
 
+/* Note! Always unref the returned pool after use */
 pa_mempool* pa_memblock_get_pool(pa_memblock *b) {
     pa_assert(b);
     pa_assert(PA_REFCNT_VALUE(b) > 0);
+    pa_assert(b->pool);
 
+    pa_mempool_ref(b->pool);
     return b->pool;
 }
 
@@ -535,10 +584,13 @@ pa_memblock* pa_memblock_ref(pa_memblock*b) {
 }
 
 static void memblock_free(pa_memblock *b) {
-    pa_assert(b);
+    pa_mempool *pool;
 
+    pa_assert(b);
+    pa_assert(b->pool);
     pa_assert(pa_atomic_load(&b->n_acquired) == 0);
 
+    pool = b->pool;
     stat_remove(b);
 
     switch (b->type) {
@@ -620,6 +672,8 @@ static void memblock_free(pa_memblock *b) {
         default:
             pa_assert_not_reached();
     }
+
+    pa_mempool_unref(pool);
 }
 
 /* No lock necessary */
@@ -744,15 +798,44 @@ static void memblock_replace_import(pa_memblock *b) {
     pa_mutex_unlock(import->mutex);
 }
 
-pa_mempool* pa_mempool_new(bool shared, size_t size) {
+/*@per_client: This is a security measure. By default this should
+ * be set to true where the created mempool is never shared with more
+ * than one client in the system. Set this to false if a global
+ * mempool, shared with all existing and future clients, is required.
+ *
+ * NOTE-1: Do not create any further global mempools! They allow data
+ * leaks between clients and thus conflict with the xdg-app containers
+ * model. They also complicate the handling of memfd-based pools.
+ *
+ * NOTE-2: Almost all mempools are now created on a per client basis.
+ * The only exception is the pa_core's mempool which is still shared
+ * between all clients of the system.
+ *
+ * Beside security issues, special marking for global mempools is
+ * required for memfd communication. To avoid fd leaks, memfd pools
+ * are registered with the connection pstream to create an ID<->memfd
+ * mapping on both PA endpoints. Such memory regions are then always
+ * referenced by their IDs and never by their fds and thus their fds
+ * can be quickly closed later.
+ *
+ * Unfortunately this scheme cannot work with global pools since the
+ * ID registration mechanism needs to happen for each newly connected
+ * client, and thus the need for a more special handling. That is,
+ * for the pool's fd to be always open :-(
+ *
+ * TODO-1: Transform the global core mempool to a per-client one
+ * TODO-2: Remove global mempools support */
+pa_mempool *pa_mempool_new(pa_mem_type_t type, size_t size, bool per_client) {
     pa_mempool *p;
     char t1[PA_BYTES_SNPRINT_MAX], t2[PA_BYTES_SNPRINT_MAX];
+    const size_t page_size = pa_page_size();
 
     p = pa_xnew0(pa_mempool, 1);
+    PA_REFCNT_INIT(p);
 
     p->block_size = PA_PAGE_ALIGN(PA_MEMPOOL_SLOT_SIZE);
-    if (p->block_size < PA_PAGE_SIZE)
-        p->block_size = PA_PAGE_SIZE;
+    if (p->block_size < page_size)
+        p->block_size = page_size;
 
     if (size <= 0)
         p->n_blocks = PA_MEMPOOL_SLOTS_MAX;
@@ -763,17 +846,19 @@ pa_mempool* pa_mempool_new(bool shared, size_t size) {
             p->n_blocks = 2;
     }
 
-    if (pa_shm_create_rw(&p->memory, p->n_blocks * p->block_size, shared, 0700) < 0) {
+    if (pa_shm_create_rw(&p->memory, type, p->n_blocks * p->block_size, 0700) < 0) {
         pa_xfree(p);
         return NULL;
     }
 
     pa_log_debug("Using %s memory pool with %u slots of size %s each, total size is %s, maximum usable slot size is %lu",
-                 p->memory.shared ? "shared" : "private",
+                 pa_mem_type_to_string(type),
                  p->n_blocks,
                  pa_bytes_snprint(t1, sizeof(t1), (unsigned) p->block_size),
                  pa_bytes_snprint(t2, sizeof(t2), (unsigned) (p->n_blocks * p->block_size)),
                  (unsigned long) pa_mempool_block_size_max(p));
+
+    p->global = !per_client;
 
     pa_atomic_store(&p->n_init, 0);
 
@@ -788,7 +873,7 @@ pa_mempool* pa_mempool_new(bool shared, size_t size) {
     return p;
 }
 
-void pa_mempool_free(pa_mempool *p) {
+static void mempool_free(pa_mempool *p) {
     pa_assert(p);
 
     pa_mutex_lock(p->mutex);
@@ -893,10 +978,24 @@ void pa_mempool_vacuum(pa_mempool *p) {
 }
 
 /* No lock necessary */
+bool pa_mempool_is_shared(pa_mempool *p) {
+    pa_assert(p);
+
+    return pa_mem_type_is_shared(p->memory.type);
+}
+
+/* No lock necessary */
+bool pa_mempool_is_memfd_backed(const pa_mempool *p) {
+    pa_assert(p);
+
+    return (p->memory.type == PA_MEM_TYPE_SHARED_MEMFD);
+}
+
+/* No lock necessary */
 int pa_mempool_get_shm_id(pa_mempool *p, uint32_t *id) {
     pa_assert(p);
 
-    if (!p->memory.shared)
+    if (!pa_mempool_is_shared(p))
         return -1;
 
     *id = p->memory.id;
@@ -904,11 +1003,84 @@ int pa_mempool_get_shm_id(pa_mempool *p, uint32_t *id) {
     return 0;
 }
 
-/* No lock necessary */
-bool pa_mempool_is_shared(pa_mempool *p) {
+pa_mempool* pa_mempool_ref(pa_mempool *p) {
+    pa_assert(p);
+    pa_assert(PA_REFCNT_VALUE(p) > 0);
+
+    PA_REFCNT_INC(p);
+    return p;
+}
+
+void pa_mempool_unref(pa_mempool *p) {
+    pa_assert(p);
+    pa_assert(PA_REFCNT_VALUE(p) > 0);
+
+    if (PA_REFCNT_DEC(p) <= 0)
+        mempool_free(p);
+}
+
+/* No lock necessary
+ * Check pa_mempool_new() for per-client vs. global mempools */
+bool pa_mempool_is_global(pa_mempool *p) {
     pa_assert(p);
 
-    return p->memory.shared;
+    return p->global;
+}
+
+/* No lock necessary
+ * Check pa_mempool_new() for per-client vs. global mempools */
+bool pa_mempool_is_per_client(pa_mempool *p) {
+    return !pa_mempool_is_global(p);
+}
+
+/* Self-locked
+ *
+ * This is only for per-client mempools!
+ *
+ * After this method's return, the caller owns the file descriptor
+ * and is responsible for closing it in the appropriate time. This
+ * should only be called once during during a mempool's lifetime.
+ *
+ * Check pa_shm->fd and pa_mempool_new() for further context. */
+int pa_mempool_take_memfd_fd(pa_mempool *p) {
+    int memfd_fd;
+
+    pa_assert(p);
+    pa_assert(pa_mempool_is_shared(p));
+    pa_assert(pa_mempool_is_memfd_backed(p));
+    pa_assert(pa_mempool_is_per_client(p));
+
+    pa_mutex_lock(p->mutex);
+
+    memfd_fd = p->memory.fd;
+    p->memory.fd = -1;
+
+    pa_mutex_unlock(p->mutex);
+
+    pa_assert(memfd_fd != -1);
+    return memfd_fd;
+}
+
+/* No lock necessary
+ *
+ * This is only for global mempools!
+ *
+ * Global mempools have their memfd descriptor always open. DO NOT
+ * close the returned descriptor by your own.
+ *
+ * Check pa_mempool_new() for further context. */
+int pa_mempool_get_memfd_fd(pa_mempool *p) {
+    int memfd_fd;
+
+    pa_assert(p);
+    pa_assert(pa_mempool_is_shared(p));
+    pa_assert(pa_mempool_is_memfd_backed(p));
+    pa_assert(pa_mempool_is_global(p));
+
+    memfd_fd = p->memory.fd;
+    pa_assert(memfd_fd != -1);
+
+    return memfd_fd;
 }
 
 /* For receiving blocks from other nodes */
@@ -921,6 +1093,7 @@ pa_memimport* pa_memimport_new(pa_mempool *p, pa_memimport_release_cb_t cb, void
     i = pa_xnew(pa_memimport, 1);
     i->mutex = pa_mutex_new(true, true);
     i->pool = p;
+    pa_mempool_ref(i->pool);
     i->segments = pa_hashmap_new(NULL, NULL);
     i->blocks = pa_hashmap_new(NULL, NULL);
     i->release_cb = cb;
@@ -935,16 +1108,19 @@ pa_memimport* pa_memimport_new(pa_mempool *p, pa_memimport_release_cb_t cb, void
 
 static void memexport_revoke_blocks(pa_memexport *e, pa_memimport *i);
 
-/* Should be called locked */
-static pa_memimport_segment* segment_attach(pa_memimport *i, uint32_t shm_id, bool writable) {
+/* Should be called locked
+ * Caller owns passed @memfd_fd and must close it down when appropriate. */
+static pa_memimport_segment* segment_attach(pa_memimport *i, pa_mem_type_t type, uint32_t shm_id,
+                                            int memfd_fd, bool writable) {
     pa_memimport_segment* seg;
+    pa_assert(pa_mem_type_is_shared(type));
 
     if (pa_hashmap_size(i->segments) >= PA_MEMIMPORT_SEGMENTS_MAX)
         return NULL;
 
     seg = pa_xnew0(pa_memimport_segment, 1);
 
-    if (pa_shm_attach(&seg->memory, shm_id, writable) < 0) {
+    if (pa_shm_attach(&seg->memory, type, shm_id, memfd_fd, writable) < 0) {
         pa_xfree(seg);
         return NULL;
     }
@@ -960,6 +1136,7 @@ static pa_memimport_segment* segment_attach(pa_memimport *i, uint32_t shm_id, bo
 /* Should be called locked */
 static void segment_detach(pa_memimport_segment *seg) {
     pa_assert(seg);
+    pa_assert(seg->n_blocks == (segment_is_permanent(seg) ? 1u : 0u));
 
     pa_hashmap_remove(seg->import->segments, PA_UINT32_TO_PTR(seg->memory.id));
     pa_shm_free(&seg->memory);
@@ -974,6 +1151,8 @@ static void segment_detach(pa_memimport_segment *seg) {
 void pa_memimport_free(pa_memimport *i) {
     pa_memexport *e;
     pa_memblock *b;
+    pa_memimport_segment *seg;
+    void *state = NULL;
 
     pa_assert(i);
 
@@ -982,6 +1161,15 @@ void pa_memimport_free(pa_memimport *i) {
     while ((b = pa_hashmap_first(i->blocks)))
         memblock_replace_import(b);
 
+    /* Permanent segments exist for the lifetime of the memimport. Now
+     * that we're freeing the memimport itself, clear them all up.
+     *
+     * Careful! segment_detach() internally removes itself from the
+     * memimport's hash; the same hash we're now using for iteration. */
+    PA_HASHMAP_FOREACH(seg, i->segments, state) {
+        if (segment_is_permanent(seg))
+            segment_detach(seg);
+    }
     pa_assert(pa_hashmap_size(i->segments) == 0);
 
     pa_mutex_unlock(i->mutex);
@@ -996,6 +1184,7 @@ void pa_memimport_free(pa_memimport *i) {
 
     pa_mutex_unlock(i->pool->mutex);
 
+    pa_mempool_unref(i->pool);
     pa_hashmap_free(i->blocks);
     pa_hashmap_free(i->segments);
 
@@ -1004,13 +1193,47 @@ void pa_memimport_free(pa_memimport *i) {
     pa_xfree(i);
 }
 
+/* Create a new memimport's memfd segment entry, with passed SHM ID
+ * as key and the newly-created segment (with its mmap()-ed memfd
+ * memory region) as its value.
+ *
+ * Note! check comments at 'pa_shm->fd', 'segment_is_permanent()',
+ * and 'pa_pstream_register_memfd_mempool()' for further details.
+ *
+ * Caller owns passed @memfd_fd and must close it down when appropriate. */
+int pa_memimport_attach_memfd(pa_memimport *i, uint32_t shm_id, int memfd_fd, bool writable) {
+    pa_memimport_segment *seg;
+    int ret = -1;
+
+    pa_assert(i);
+    pa_assert(memfd_fd != -1);
+
+    pa_mutex_lock(i->mutex);
+
+    if (!(seg = segment_attach(i, PA_MEM_TYPE_SHARED_MEMFD, shm_id, memfd_fd, writable)))
+        goto finish;
+
+    /* n_blocks acts as a segment reference count. To avoid the segment
+     * being deleted when receiving silent memchunks, etc., mark our
+     * permanent presence by incrementing that refcount. */
+    seg->n_blocks++;
+
+    pa_assert(segment_is_permanent(seg));
+    ret = 0;
+
+finish:
+    pa_mutex_unlock(i->mutex);
+    return ret;
+}
+
 /* Self-locked */
-pa_memblock* pa_memimport_get(pa_memimport *i, uint32_t block_id, uint32_t shm_id,
+pa_memblock* pa_memimport_get(pa_memimport *i, pa_mem_type_t type, uint32_t block_id, uint32_t shm_id,
                               size_t offset, size_t size, bool writable) {
     pa_memblock *b = NULL;
     pa_memimport_segment *seg;
 
     pa_assert(i);
+    pa_assert(pa_mem_type_is_shared(type));
 
     pa_mutex_lock(i->mutex);
 
@@ -1022,12 +1245,20 @@ pa_memblock* pa_memimport_get(pa_memimport *i, uint32_t block_id, uint32_t shm_i
     if (pa_hashmap_size(i->blocks) >= PA_MEMIMPORT_SLOTS_MAX)
         goto finish;
 
-    if (!(seg = pa_hashmap_get(i->segments, PA_UINT32_TO_PTR(shm_id))))
-        if (!(seg = segment_attach(i, shm_id, writable)))
+    if (!(seg = pa_hashmap_get(i->segments, PA_UINT32_TO_PTR(shm_id)))) {
+        if (type == PA_MEM_TYPE_SHARED_MEMFD) {
+            pa_log("Bailing out! No cached memimport segment for memfd ID %u", shm_id);
+            pa_log("Did the other PA endpoint forget registering its memfd pool?");
             goto finish;
+        }
 
-    if (writable != seg->writable) {
-        pa_log("Cannot open segment - writable status changed!");
+        pa_assert(type == PA_MEM_TYPE_SHARED_POSIX);
+        if (!(seg = segment_attach(i, type, shm_id, -1, writable)))
+            goto finish;
+    }
+
+    if (writable && !seg->writable) {
+        pa_log("Cannot import cached segment in write mode - previously mapped as read-only");
         goto finish;
     }
 
@@ -1039,6 +1270,7 @@ pa_memblock* pa_memimport_get(pa_memimport *i, uint32_t block_id, uint32_t shm_i
 
     PA_REFCNT_INIT(b);
     b->pool = i->pool;
+    pa_mempool_ref(b->pool);
     b->type = PA_MEMBLOCK_IMPORTED;
     b->read_only = !writable;
     b->is_silence = false;
@@ -1090,12 +1322,13 @@ pa_memexport* pa_memexport_new(pa_mempool *p, pa_memexport_revoke_cb_t cb, void 
     pa_assert(p);
     pa_assert(cb);
 
-    if (!p->memory.shared)
+    if (!pa_mempool_is_shared(p))
         return NULL;
 
     e = pa_xnew(pa_memexport, 1);
     e->mutex = pa_mutex_new(true, true);
     e->pool = p;
+    pa_mempool_ref(e->pool);
     PA_LLIST_HEAD_INIT(struct memexport_slot, e->free_slots);
     PA_LLIST_HEAD_INIT(struct memexport_slot, e->used_slots);
     e->n_init = 0;
@@ -1123,6 +1356,7 @@ void pa_memexport_free(pa_memexport *e) {
     PA_LLIST_REMOVE(pa_memexport, e->pool->exports, e);
     pa_mutex_unlock(e->pool->mutex);
 
+    pa_mempool_unref(e->pool);
     pa_mutex_free(e->mutex);
     pa_xfree(e);
 }
@@ -1217,13 +1451,15 @@ static pa_memblock *memblock_shared_copy(pa_mempool *p, pa_memblock *b) {
 }
 
 /* Self-locked */
-int pa_memexport_put(pa_memexport *e, pa_memblock *b, uint32_t *block_id, uint32_t *shm_id, size_t *offset, size_t * size) {
-    pa_shm *memory;
+int pa_memexport_put(pa_memexport *e, pa_memblock *b, pa_mem_type_t *type, uint32_t *block_id,
+                     uint32_t *shm_id, size_t *offset, size_t * size) {
+    pa_shm  *memory;
     struct memexport_slot *slot;
     void *data;
 
     pa_assert(e);
     pa_assert(b);
+    pa_assert(type);
     pa_assert(block_id);
     pa_assert(shm_id);
     pa_assert(offset);
@@ -1261,12 +1497,14 @@ int pa_memexport_put(pa_memexport *e, pa_memblock *b, uint32_t *block_id, uint32
     } else {
         pa_assert(b->type == PA_MEMBLOCK_POOL || b->type == PA_MEMBLOCK_POOL_EXTERNAL);
         pa_assert(b->pool);
+        pa_assert(pa_mempool_is_shared(b->pool));
         memory = &b->pool->memory;
     }
 
     pa_assert(data >= memory->ptr);
     pa_assert((uint8_t*) data + b->length <= (uint8_t*) memory->ptr + memory->size);
 
+    *type = memory->type;
     *shm_id = memory->id;
     *offset = (size_t) ((uint8_t*) data - (uint8_t*) memory->ptr);
     *size = b->length;

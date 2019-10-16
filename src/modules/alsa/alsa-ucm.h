@@ -23,7 +23,7 @@
 ***/
 
 #ifdef HAVE_ALSA_UCM
-#include <use-case.h>
+#include <alsa/use-case.h>
 #else
 typedef void snd_use_case_mgr_t;
 #endif
@@ -196,7 +196,6 @@ struct pa_alsa_ucm_config {
 
     PA_LLIST_HEAD(pa_alsa_ucm_verb, verbs);
     PA_LLIST_HEAD(pa_alsa_jack, jacks);
-    pa_dynarray *ports; /* struct ucm_port */
 };
 
 struct pa_alsa_ucm_mapping_context {

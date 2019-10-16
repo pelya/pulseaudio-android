@@ -62,12 +62,6 @@
 #include <pulsecore/x11prop.h>
 #endif
 
-#ifdef TUNNEL_SINK
-#include "module-tunnel-sink-symdef.h"
-#else
-#include "module-tunnel-source-symdef.h"
-#endif
-
 #define ENV_DEFAULT_SINK "PULSE_SINK"
 #define ENV_DEFAULT_SOURCE "PULSE_SOURCE"
 #define ENV_DEFAULT_SERVER "PULSE_SERVER"
@@ -513,12 +507,13 @@ static int sink_process_msg(pa_msgobject *o, int code, void *data, int64_t offse
         }
 
         case PA_SINK_MESSAGE_GET_LATENCY: {
-            pa_usec_t yl, yr, *usec = data;
+            pa_usec_t yl, yr;
+            int64_t *usec = data;
 
             yl = pa_bytes_to_usec((uint64_t) u->counter, &u->sink->sample_spec);
             yr = pa_smoother_get(u->smoother, pa_rtclock_now());
 
-            *usec = yl > yr ? yl - yr : 0;
+            *usec = (int64_t)yl - yr;
             return 0;
         }
 
@@ -573,10 +568,15 @@ static int sink_process_msg(pa_msgobject *o, int code, void *data, int64_t offse
 }
 
 /* Called from main context */
-static int sink_set_state(pa_sink *s, pa_sink_state_t state) {
+static int sink_set_state_in_main_thread_cb(pa_sink *s, pa_sink_state_t state, pa_suspend_cause_t suspend_cause) {
     struct userdata *u;
     pa_sink_assert_ref(s);
     u = s->userdata;
+
+    /* It may be that only the suspend cause is changing, in which
+     * case there's nothing to do. */
+    if (state == s->state)
+        return 0;
 
     switch ((pa_sink_state_t) state) {
 
@@ -618,12 +618,13 @@ static int source_process_msg(pa_msgobject *o, int code, void *data, int64_t off
         }
 
         case PA_SOURCE_MESSAGE_GET_LATENCY: {
-            pa_usec_t yr, yl, *usec = data;
+            pa_usec_t yr, yl;
+            int64_t *usec = data;
 
             yl = pa_bytes_to_usec((uint64_t) u->counter, &PA_SOURCE(o)->sample_spec);
             yr = pa_smoother_get(u->smoother, pa_rtclock_now());
 
-            *usec = yr > yl ? yr - yl : 0;
+            *usec = (int64_t)yr - yl;
             return 0;
         }
 
@@ -669,10 +670,15 @@ static int source_process_msg(pa_msgobject *o, int code, void *data, int64_t off
 }
 
 /* Called from main context */
-static int source_set_state(pa_source *s, pa_source_state_t state) {
+static int source_set_state_in_main_thread_cb(pa_source *s, pa_source_state_t state, pa_suspend_cause_t suspend_cause) {
     struct userdata *u;
     pa_source_assert_ref(s);
     u = s->userdata;
+
+    /* It may be that only the suspend cause is changing, in which
+     * case there's nothing to do. */
+    if (state == s->state)
+        return 0;
 
     switch ((pa_source_state_t) state) {
 
@@ -1663,7 +1669,7 @@ static void setup_complete_callback(pa_pdispatch *pd, uint32_t command, uint32_t
     pa_tagstruct_putu32(reply, PA_INVALID_INDEX);
     pa_tagstruct_puts(reply, u->sink_name);
     pa_tagstruct_putu32(reply, u->maxlength);
-    pa_tagstruct_put_boolean(reply, !PA_SINK_IS_OPENED(pa_sink_get_state(u->sink)));
+    pa_tagstruct_put_boolean(reply, !PA_SINK_IS_OPENED(u->sink->state));
     pa_tagstruct_putu32(reply, u->tlength);
     pa_tagstruct_putu32(reply, u->prebuf);
     pa_tagstruct_putu32(reply, u->minreq);
@@ -1682,7 +1688,7 @@ static void setup_complete_callback(pa_pdispatch *pd, uint32_t command, uint32_t
     pa_tagstruct_putu32(reply, PA_INVALID_INDEX);
     pa_tagstruct_puts(reply, u->source_name);
     pa_tagstruct_putu32(reply, u->maxlength);
-    pa_tagstruct_put_boolean(reply, !PA_SOURCE_IS_OPENED(pa_source_get_state(u->source)));
+    pa_tagstruct_put_boolean(reply, !PA_SOURCE_IS_OPENED(u->source->state));
     pa_tagstruct_putu32(reply, u->fragsize);
 #endif
 
@@ -1778,7 +1784,7 @@ static void pstream_die_callback(pa_pstream *p, void *userdata) {
 }
 
 /* Called from main context */
-static void pstream_packet_callback(pa_pstream *p, pa_packet *packet, const pa_cmsg_ancil_data *ancil_data, void *userdata) {
+static void pstream_packet_callback(pa_pstream *p, pa_packet *packet, pa_cmsg_ancil_data *ancil_data, void *userdata) {
     struct userdata *u = userdata;
 
     pa_assert(p);
@@ -1968,7 +1974,11 @@ int pa__init(pa_module*m) {
     u->counter = u->counter_delta = 0;
 
     u->rtpoll = pa_rtpoll_new();
-    pa_thread_mq_init(&u->thread_mq, m->core->mainloop, u->rtpoll);
+
+    if (pa_thread_mq_init(&u->thread_mq, m->core->mainloop, u->rtpoll) < 0) {
+        pa_log("pa_thread_mq_init() failed.");
+        goto fail;
+    }
 
     if (pa_modargs_get_value_boolean(ma, "auto", &automatic) < 0) {
         pa_log("Failed to parse argument \"auto\".");
@@ -2146,7 +2156,7 @@ int pa__init(pa_module*m) {
 
     u->sink->parent.process_msg = sink_process_msg;
     u->sink->userdata = u;
-    u->sink->set_state = sink_set_state;
+    u->sink->set_state_in_main_thread = sink_set_state_in_main_thread_cb;
     pa_sink_set_set_volume_callback(u->sink, sink_set_volume);
     pa_sink_set_set_mute_callback(u->sink, sink_set_mute);
 
@@ -2189,7 +2199,7 @@ int pa__init(pa_module*m) {
     }
 
     u->source->parent.process_msg = source_process_msg;
-    u->source->set_state = source_set_state;
+    u->source->set_state_in_main_thread = source_set_state_in_main_thread_cb;
     u->source->userdata = u;
 
 /*     pa_source_set_latency_range(u->source, MIN_NETWORK_LATENCY_USEC, 0); */
@@ -2199,8 +2209,6 @@ int pa__init(pa_module*m) {
 
     u->mcalign = pa_mcalign_new(pa_frame_size(&u->source->sample_spec));
 #endif
-
-    pa_xfree(dn);
 
     u->time_event = NULL;
 
@@ -2221,6 +2229,8 @@ int pa__init(pa_module*m) {
 #else
     pa_source_put(u->source);
 #endif
+
+    pa_xfree(dn);
 
     if (server)
         pa_xfree(server);

@@ -34,6 +34,9 @@ endif
 if HAVE_DBUS
 dbuspolicydir=$(sysconfdir)/dbus-1/system.d
 endif
+if HAVE_GSETTINGS
+gsettingsdataconvertdir=$(datadir)/GConf/gsettings
+endif
 
 ###################################
 #     Compiler/linker flags       #
@@ -46,10 +49,12 @@ AM_CPPFLAGS = \
 	-DPA_ALSA_PATHS_DIR=\"$(alsapathsdir)\" \
 	-DPA_ALSA_PROFILE_SETS_DIR=\"$(alsaprofilesetsdir)\" \
 	-DPA_SRCDIR=\"$(abs_srcdir)\" \
-	-DPA_BUILDDIR=\"$(abs_builddir)\"
-AM_CFLAGS = \
+	-DPA_BUILDDIR=\"$(abs_builddir)\" \
+	-DPULSE_LOCALEDIR=\"$(localedir)\"
+AM_CFLAGS = -std=gnu11 \
 	$(PTHREAD_CFLAGS)
-AM_CXXFLAGS = $(AM_CFLAGS)
+AM_CXXFLAGS = -std=c++11 \
+	$(PTHREAD_CFLAGS)
 SERVER_CFLAGS = -D__INCLUDED_FROM_PULSE_AUDIO
 
 AM_LIBADD = $(PTHREAD_LIBS) $(INTLLIBS)
@@ -89,6 +94,7 @@ MODULE_LIBADD = $(AM_LIBADD) libpulsecore-@PA_MAJORMINOR@.la libpulsecommon-@PA_
 EXTRA_DIST = \
 		pulse/client.conf.in \
 		pulse/version.h.in \
+		pulsecore/filter/LICENSE.WEBKIT \
 		daemon/daemon.conf.in \
 		daemon/default.pa.in \
 		daemon/system.pa.in \
@@ -99,11 +105,13 @@ EXTRA_DIST = \
 		daemon/systemd/user/pulseaudio.socket \
 		utils/padsp.in \
 		utils/qpaeq \
-		modules/module-defs.h.m4 \
+		utils/pa-info \
 		daemon/pulseaudio.desktop.in \
 		map-file \
 		daemon/pulseaudio-system.conf \
-		modules/echo-cancel/adrian-license.txt
+		modules/echo-cancel/adrian-license.txt \
+		modules/gsettings/org.freedesktop.pulseaudio.gschema.xml \
+		modules/gsettings/pulseaudio.convert
 
 pulseconf_DATA = \
 		default.pa \
@@ -120,7 +128,9 @@ if HAVE_X11
 xdgautostart_in_files = \
 		daemon/pulseaudio.desktop.in
 xdgautostart_DATA = $(xdgautostart_in_files:.desktop.in=.desktop)
-@INTLTOOL_DESKTOP_RULE@
+$(xdgautostart_DATA): $(xdgautostart_in_files)
+	$(AM_V_GEN) $(MSGFMT) --desktop --template $< -d $(top_srcdir)/po -o $@
+
 endif
 
 
@@ -167,9 +177,9 @@ PREOPEN_LIBS = $(modlibexec_LTLIBRARIES)
 endif
 
 if FORCE_PREOPEN
-pulseaudio_LDFLAGS = $(AM_LDFLAGS) $(BINLDFLAGS) $(IMMEDIATE_LDFLAGS) -dlpreopen force $(foreach f,$(PREOPEN_LIBS),-dlpreopen $(f))
+pulseaudio_LDFLAGS = $(AM_LDFLAGS) $(BINLDFLAGS) $(IMMEDIATE_LDFLAGS) -ffast-math -dlpreopen force $(foreach f,$(PREOPEN_LIBS),-dlpreopen $(f))
 else
-pulseaudio_LDFLAGS = $(AM_LDFLAGS) $(BINLDFLAGS) $(IMMEDIATE_LDFLAGS) -dlopen force $(foreach f,$(PREOPEN_LIBS),-dlopen $(f))
+pulseaudio_LDFLAGS = $(AM_LDFLAGS) $(BINLDFLAGS) $(IMMEDIATE_LDFLAGS) -ffast-math -dlopen force $(foreach f,$(PREOPEN_LIBS),-dlopen $(f))
 endif
 
 if HAVE_SYSTEMD_DAEMON
@@ -181,7 +191,12 @@ endif
 #       Utility programs          #
 ###################################
 
-bin_SCRIPTS = esdcompat
+bin_SCRIPTS = \
+	utils/pa-info
+
+if HAVE_ESOUND
+bin_SCRIPTS += esdcompat
+endif
 
 bin_PROGRAMS += \
 		pacat \
@@ -239,6 +254,7 @@ endif
 noinst_LTLIBRARIES =
 
 TESTS_default = \
+		core-util-test \
 		mainloop-test \
 		strlist-test \
 		close-test \
@@ -247,6 +263,7 @@ TESTS_default = \
 		thread-mainloop-test \
 		utf8-test \
 		format-test \
+		json-test \
 		get-binary-name-test \
 		hook-list-test \
 		memblock-test \
@@ -279,14 +296,19 @@ TESTS_norun = \
 		sig2str-test \
 		stripnul \
 		echo-cancel-test \
-		lo-latency-test
+		lo-latency-test \
+		atomic-test
 
 # These tests need a running pulseaudio daemon
 TESTS_daemon = \
-		connect-stress \
 		extended-test \
-		interpol-test \
+		passthrough-test \
 		sync-playback
+
+# These tests need a running daemon and take a while to complete
+TESTS_daemon_long = \
+		connect-stress \
+		interpol-test
 
 if !OS_IS_WIN32
 TESTS_default += \
@@ -313,11 +335,12 @@ endif
 if HAVE_GLIB20
 TESTS_default += \
 		mainloop-test-glib
-endif
 
 if HAVE_GTK30
+# gtk-test depends on both glib and gtk
 TESTS_norun += \
 		gtk-test
+endif
 endif
 
 if HAVE_ALSA
@@ -332,13 +355,16 @@ TESTS_ENVIRONMENT=MAKE_CHECK=1
 TESTS = $(TESTS_default)
 
 if BUILD_TESTS_DEFAULT
-noinst_PROGRAMS = $(TESTS_default) $(TESTS_norun) $(TESTS_daemon)
+noinst_PROGRAMS = $(TESTS_default) $(TESTS_norun) $(TESTS_daemon) $(TESTS_daemon_long)
 else
 check_PROGRAMS = $(TESTS_default) $(TESTS_norun)
 endif
 
 check-daemon: $(TESTS_daemon)
 	PATH=$(builddir):${PATH} $(top_srcdir)/src/tests/test-daemon.sh $(TESTS_daemon)
+
+check-daemon-long: $(TESTS_daemon_long)
+	PATH=$(builddir):${PATH} $(top_srcdir)/src/tests/test-daemon.sh $(TESTS_daemon_long)
 
 else
 TESTS_ENVIRONMENT=
@@ -351,7 +377,14 @@ check-daemon:
 	@echo "Pass option \"--enable-tests\" to configure and install \"check\" library properly!"
 	false
 
+check-daemon-long: check-daemon
+
 endif
+
+core_util_test_SOURCES = tests/core-util-test.c
+core_util_test_CFLAGS = $(AM_CFLAGS) $(LIBCHECK_CFLAGS)
+core_util_test_LDADD = $(AM_LDADD) libpulse.la libpulsecommon-@PA_MAJORMINOR@.la
+core_util_test_LDFLAGS = $(AM_LDFLAGS) $(BINLDFLAGS) $(LIBCHECK_LIBS)
 
 mainloop_test_SOURCES = tests/mainloop-test.c
 mainloop_test_CFLAGS = $(AM_CFLAGS) $(LIBCHECK_CFLAGS)
@@ -373,10 +406,20 @@ format_test_CFLAGS = $(AM_CFLAGS) $(LIBCHECK_CFLAGS)
 format_test_LDADD = $(AM_LDADD) libpulsecore-@PA_MAJORMINOR@.la libpulse.la libpulsecommon-@PA_MAJORMINOR@.la
 format_test_LDFLAGS = $(AM_LDFLAGS) $(BINLDFLAGS) $(LIBCHECK_LIBS)
 
+json_test_SOURCES = tests/json-test.c
+json_test_CFLAGS = $(AM_CFLAGS) $(LIBCHECK_CFLAGS)
+json_test_LDADD = $(AM_LDADD) libpulse.la libpulsecommon-@PA_MAJORMINOR@.la
+json_test_LDFLAGS = $(AM_LDFLAGS) $(BINLDFLAGS) $(LIBCHECK_LIBS)
+
 srbchannel_test_SOURCES = tests/srbchannel-test.c
 srbchannel_test_CFLAGS = $(AM_CFLAGS) $(LIBCHECK_CFLAGS)
 srbchannel_test_LDADD = $(AM_LDADD) libpulse.la libpulsecommon-@PA_MAJORMINOR@.la
 srbchannel_test_LDFLAGS = $(AM_LDFLAGS) $(BINLDFLAGS) $(LIBCHECK_LIBS)
+
+atomic_test_SOURCES = tests/atomic-test.c
+atomic_test_CFLAGS = $(AM_CFLAGS) $(LIBCHECK_CFLAGS)
+atomic_test_LDADD = $(AM_LDADD) libpulsecommon-@PA_MAJORMINOR@.la libpulse.la
+atomic_test_LDFLAGS = $(AM_LDFLAGS) $(BINLDFLAGS) $(LIBCHECK_LIBS)
 
 get_binary_name_test_SOURCES = tests/get-binary-name-test.c
 get_binary_name_test_CFLAGS = $(AM_CFLAGS) $(LIBCHECK_CFLAGS)
@@ -452,6 +495,11 @@ extended_test_SOURCES = tests/extended-test.c
 extended_test_LDADD = $(AM_LDADD) libpulse.la
 extended_test_CFLAGS = $(AM_CFLAGS) $(LIBCHECK_CFLAGS)
 extended_test_LDFLAGS = $(AM_LDFLAGS) $(BINLDFLAGS) $(LIBCHECK_LIBS)
+
+passthrough_test_SOURCES = tests/passthrough-test.c
+passthrough_test_LDADD = $(AM_LDADD) libpulse.la libpulsecommon-@PA_MAJORMINOR@.la
+passthrough_test_CFLAGS = $(AM_CFLAGS) $(LIBCHECK_CFLAGS)
+passthrough_test_LDFLAGS = $(AM_LDFLAGS) $(BINLDFLAGS) $(LIBCHECK_LIBS)
 
 strlist_test_SOURCES = tests/strlist-test.c
 strlist_test_CFLAGS = $(AM_CFLAGS) $(LIBCHECK_CFLAGS)
@@ -631,7 +679,8 @@ lo_latency_test_LDFLAGS = $(AM_LDFLAGS) $(BINLDFLAGS) $(LIBCHECK_LIBS)
 #         Common library          #
 ###################################
 
-pkglib_LTLIBRARIES = \
+commonlibdir = $(pkglibdir)
+commonlib_LTLIBRARIES = \
 		libpulsecommon-@PA_MAJORMINOR@.la
 
 # We duplicate files from pulse/ in this to allow as-needed linking. If we did
@@ -643,6 +692,7 @@ libpulsecommon_@PA_MAJORMINOR@_la_SOURCES = \
 		pulse/client-conf.c pulse/client-conf.h \
 		pulse/fork-detect.c pulse/fork-detect.h \
 		pulse/format.c pulse/format.h \
+		pulse/json.c pulse/json.h \
 		pulse/xmalloc.c pulse/xmalloc.h \
 		pulse/proplist.c pulse/proplist.h \
 		pulse/utf8.c pulse/utf8.h \
@@ -681,7 +731,7 @@ libpulsecommon_@PA_MAJORMINOR@_la_SOURCES = \
 		pulsecore/memblock.c pulsecore/memblock.h \
 		pulsecore/memblockq.c pulsecore/memblockq.h \
 		pulsecore/memchunk.c pulsecore/memchunk.h \
-		pulsecore/native-common.h \
+		pulsecore/native-common.c pulsecore/native-common.h \
 		pulsecore/once.c pulsecore/once.h \
 		pulsecore/packet.c pulsecore/packet.h \
 		pulsecore/parseaddr.c pulsecore/parseaddr.h \
@@ -698,6 +748,7 @@ libpulsecommon_@PA_MAJORMINOR@_la_SOURCES = \
 		pulsecore/refcnt.h \
 		pulsecore/srbchannel.c pulsecore/srbchannel.h \
 		pulsecore/sample-util.c pulsecore/sample-util.h \
+		pulsecore/mem.h \
 		pulsecore/shm.c pulsecore/shm.h \
 		pulsecore/bitset.c pulsecore/bitset.h \
 		pulsecore/socket-client.c pulsecore/socket-client.h \
@@ -705,8 +756,6 @@ libpulsecommon_@PA_MAJORMINOR@_la_SOURCES = \
 		pulsecore/socket-util.c pulsecore/socket-util.h \
 		pulsecore/strbuf.c pulsecore/strbuf.h \
 		pulsecore/strlist.c pulsecore/strlist.h \
-		pulsecore/svolume_c.c pulsecore/svolume_arm.c \
-		pulsecore/svolume_mmx.c pulsecore/svolume_sse.c \
 		pulsecore/tagstruct.c pulsecore/tagstruct.h \
 		pulsecore/time-smoother.c pulsecore/time-smoother.h \
 		pulsecore/tokenizer.c pulsecore/tokenizer.h \
@@ -722,9 +771,14 @@ else
 libpulsecommon_@PA_MAJORMINOR@_la_SOURCES += pulsecore/poll-posix.c pulsecore/poll.h
 endif
 
-libpulsecommon_@PA_MAJORMINOR@_la_CFLAGS = $(AM_CFLAGS) $(LIBJSON_CFLAGS) $(LIBSNDFILE_CFLAGS)
+libpulsecommon_@PA_MAJORMINOR@_la_CFLAGS = $(AM_CFLAGS) $(LIBSNDFILE_CFLAGS)
 libpulsecommon_@PA_MAJORMINOR@_la_LDFLAGS = $(AM_LDFLAGS) $(AM_LIBLDFLAGS) -avoid-version
-libpulsecommon_@PA_MAJORMINOR@_la_LIBADD = $(AM_LIBADD) $(LIBJSON_LIBS)  $(LIBWRAP_LIBS) $(WINSOCK_LIBS) $(LTLIBICONV) $(LIBSNDFILE_LIBS)
+libpulsecommon_@PA_MAJORMINOR@_la_LIBADD = $(AM_LIBADD) $(LIBWRAP_LIBS) $(WINSOCK_LIBS) $(LTLIBICONV) $(LIBSNDFILE_LIBS)
+
+if HAVE_MEMFD
+libpulsecommon_@PA_MAJORMINOR@_la_SOURCES += \
+		pulsecore/memfd-wrappers.h
+endif
 
 if HAVE_X11
 libpulsecommon_@PA_MAJORMINOR@_la_SOURCES += \
@@ -747,7 +801,7 @@ endif
 libpulsecommon_@PA_MAJORMINOR@_la_CFLAGS += $(GLIB20_CFLAGS) $(GTK30_CFLAGS)
 
 ## Please note that libpulsecommon implicitly also depends on<
-## libpulse! i.e. we have a cyclic dependancy here. Which is intended
+## libpulse! i.e. we have a cyclic dependency here. Which is intended
 ## since libpulse only includes stable, official APIs, while
 ## libpulsecommon only includes unofficial APIs.
 
@@ -762,8 +816,6 @@ libpulsecommon_@PA_MAJORMINOR@_la_SOURCES += \
 		pulsecore/mutex-posix.c pulsecore/mutex.h \
 		pulsecore/thread-posix.c pulsecore/thread.h \
 		pulsecore/semaphore-osx.c pulsecore/semaphore.h
-libpulsecommon_@PA_MAJORMINOR@_la_CFLAGS += "-I/Developer/Headers/FlatCarbon/"
-#libpulsecommon_@PA_MAJORMINOR@_la_LDFLAGS += "-framework CoreServices"
 else !OS_IS_DARWIN
 libpulsecommon_@PA_MAJORMINOR@_la_SOURCES += \
 		pulsecore/mutex-posix.c pulsecore/mutex.h \
@@ -871,8 +923,8 @@ libpulse_la_SOURCES = \
 		pulse/volume.c pulse/volume.h \
 		pulse/xmalloc.c pulse/xmalloc.h
 
-libpulse_la_CFLAGS = $(AM_CFLAGS) $(LIBJSON_CFLAGS)
-libpulse_la_LIBADD = $(AM_LIBADD) $(WINSOCK_LIBS) $(LTLIBICONV) $(LIBJSON_LIBS) libpulsecommon-@PA_MAJORMINOR@.la
+libpulse_la_CFLAGS = $(AM_CFLAGS)
+libpulse_la_LIBADD = $(AM_LIBADD) $(WINSOCK_LIBS) $(LTLIBICONV) libpulsecommon-@PA_MAJORMINOR@.la
 libpulse_la_LDFLAGS = $(AM_LDFLAGS) $(AM_LIBLDFLAGS) $(VERSIONING_LDFLAGS) -version-info $(LIBPULSE_VERSION_INFO)
 
 if HAVE_DBUS
@@ -900,7 +952,7 @@ padsplib_LTLIBRARIES = libpulsedsp.la
 bin_SCRIPTS += padsp
 
 edit = @SED@ \
-       -e "s|@pkglibdir[@]|$(pkglibdir)|g"
+       -e 's|@PULSEDSP_LOCATION[@]|$(PULSEDSP_LOCATION)|g'
 
 padsp: utils/padsp.in
 	$(edit) $< > $@
@@ -918,7 +970,7 @@ libpulsedsp_la_LDFLAGS = $(AM_LDFLAGS) $(AM_LIBLDFLAGS) -avoid-version -disable-
 #      Daemon core library        #
 ###################################
 
-lib_LTLIBRARIES += libpulsecore-@PA_MAJORMINOR@.la
+pkglib_LTLIBRARIES = libpulsecore-@PA_MAJORMINOR@.la
 
 # Pure core stuff
 libpulsecore_@PA_MAJORMINOR@_la_SOURCES = \
@@ -931,10 +983,12 @@ libpulsecore_@PA_MAJORMINOR@_la_SOURCES = \
 		pulsecore/cli-command.c pulsecore/cli-command.h \
 		pulsecore/cli-text.c pulsecore/cli-text.h \
 		pulsecore/client.c pulsecore/client.h \
+		pulsecore/typedefs.h \
 		pulsecore/card.c pulsecore/card.h \
 		pulsecore/core-scache.c pulsecore/core-scache.h \
 		pulsecore/core-subscribe.c pulsecore/core-subscribe.h \
 		pulsecore/core.c pulsecore/core.h \
+		pulsecore/message-handler.c pulsecore/message-handler.h \
 		pulsecore/hook-list.c pulsecore/hook-list.h \
 		pulsecore/ltdl-helper.c pulsecore/ltdl-helper.h \
 		pulsecore/modargs.c pulsecore/modargs.h \
@@ -952,6 +1006,8 @@ libpulsecore_@PA_MAJORMINOR@_la_SOURCES = \
 		pulsecore/resampler/trivial.c \
 		pulsecore/rtpoll.c pulsecore/rtpoll.h \
 		pulsecore/stream-util.c pulsecore/stream-util.h \
+		pulsecore/svolume_c.c pulsecore/svolume_arm.c \
+		pulsecore/svolume_mmx.c pulsecore/svolume_sse.c \
 		pulsecore/mix.c pulsecore/mix.h \
 		pulsecore/cpu.c pulsecore/cpu.h \
 		pulsecore/cpu-arm.c pulsecore/cpu-arm.h \
@@ -1130,8 +1186,12 @@ librtp_la_LDFLAGS = $(AM_LDFLAGS) $(AM_LIBLDFLAGS) -avoid-version
 librtp_la_LIBADD = $(AM_LIBADD) libpulsecore-@PA_MAJORMINOR@.la libpulsecommon-@PA_MAJORMINOR@.la libpulse.la
 
 libraop_la_SOURCES = \
-        modules/raop/raop_client.c modules/raop/raop_client.h \
-        modules/raop/base64.c modules/raop/base64.h
+        modules/raop/raop-util.c modules/raop/raop-util.h \
+        modules/raop/raop-crypto.c modules/raop/raop-crypto.h \
+        modules/raop/raop-packet-buffer.h modules/raop/raop-packet-buffer.c \
+        modules/raop/raop-client.c modules/raop/raop-client.h \
+        modules/raop/raop-sink.c modules/raop/raop-sink.h
+
 libraop_la_CFLAGS = $(AM_CFLAGS) $(OPENSSL_CFLAGS) -I$(top_srcdir)/src/modules/rtp
 libraop_la_LDFLAGS = $(AM_LDFLAGS) $(AM_LIBLDFLAGS) -avoid-version
 libraop_la_LIBADD = $(AM_LIBADD) $(OPENSSL_LIBS) libpulsecore-@PA_MAJORMINOR@.la librtp.la libpulsecommon-@PA_MAJORMINOR@.la libpulse.la
@@ -1167,6 +1227,7 @@ modlibexec_LTLIBRARIES += \
 		module-card-restore.la \
 		module-default-device-restore.la \
 		module-always-sink.la \
+		module-always-source.la \
 		module-rescue-streams.la \
 		module-intended-roles.la \
 		module-suspend-on-idle.la \
@@ -1195,7 +1256,8 @@ modlibexec_LTLIBRARIES += \
 		module-switch-on-port-available.la \
 		module-filter-apply.la \
 		module-filter-heuristics.la \
-		module-role-ducking.la
+		module-role-ducking.la \
+		module-allow-passthrough.la
 
 if HAVE_ESOUND
 modlibexec_LTLIBRARIES += \
@@ -1283,11 +1345,15 @@ dist_alsaprofilesets_DATA = \
 		modules/alsa/mixer/profile-sets/native-instruments-traktorkontrol-s4.conf \
 		modules/alsa/mixer/profile-sets/native-instruments-korecontroller.conf \
 		modules/alsa/mixer/profile-sets/kinect-audio.conf \
-		modules/alsa/mixer/profile-sets/sb-omni-surround-5.1.conf
+		modules/alsa/mixer/profile-sets/sb-omni-surround-5.1.conf \
+		modules/alsa/mixer/profile-sets/steelseries-arctis-5-usb-audio.conf \
+		modules/alsa/mixer/profile-sets/steelseries-arctis-7-usb-audio.conf \
+		modules/alsa/mixer/profile-sets/dell-dock-tb16-usb-audio.conf \
+		modules/alsa/mixer/profile-sets/cmedia-high-speed-true-hdaudio.conf
 
 if HAVE_UDEV
 dist_udevrules_DATA = \
-		modules/alsa/mixer/profile-sets/90-pulseaudio.rules
+		modules/alsa/90-pulseaudio.rules
 endif
 
 dist_alsapaths_DATA = \
@@ -1316,6 +1382,7 @@ dist_alsapaths_DATA = \
 		modules/alsa/mixer/paths/analog-output-headphones-2.conf \
 		modules/alsa/mixer/paths/analog-output-lineout.conf \
 		modules/alsa/mixer/paths/analog-output-mono.conf \
+		modules/alsa/mixer/paths/iec958-stereo-input.conf \
 		modules/alsa/mixer/paths/iec958-stereo-output.conf \
 		modules/alsa/mixer/paths/hdmi-output-0.conf \
 		modules/alsa/mixer/paths/hdmi-output-1.conf \
@@ -1324,7 +1391,12 @@ dist_alsapaths_DATA = \
 		modules/alsa/mixer/paths/hdmi-output-4.conf \
 		modules/alsa/mixer/paths/hdmi-output-5.conf \
 		modules/alsa/mixer/paths/hdmi-output-6.conf \
-		modules/alsa/mixer/paths/hdmi-output-7.conf
+		modules/alsa/mixer/paths/hdmi-output-7.conf \
+		modules/alsa/mixer/paths/steelseries-arctis-5-output-chat.conf \
+		modules/alsa/mixer/paths/steelseries-arctis-5-output-game.conf \
+		modules/alsa/mixer/paths/steelseries-arctis-7-input.conf \
+		modules/alsa/mixer/paths/steelseries-arctis-7-output-mono.conf \
+		modules/alsa/mixer/paths/steelseries-arctis-7-output-stereo.conf
 
 endif
 
@@ -1349,12 +1421,6 @@ modlibexec_LTLIBRARIES += \
 		module-lirc.la
 endif
 
-if HAVE_XEN
-modlibexec_LTLIBRARIES += \
-		module-xenpv-sink.la
-endif
-
-
 if HAVE_EVDEV
 modlibexec_LTLIBRARIES += \
 		module-mmkbd-evdev.la
@@ -1378,6 +1444,17 @@ modlibexec_LTLIBRARIES += \
 
 pulselibexec_PROGRAMS += \
 		gconf-helper
+endif
+
+if HAVE_GSETTINGS
+modlibexec_LTLIBRARIES += \
+		module-gsettings.la
+
+pulselibexec_PROGRAMS += \
+		gsettings-helper
+
+gsettingsdataconvert_DATA = \
+		modules/gsettings/pulseaudio.convert
 endif
 
 if HAVE_WAVEOUT
@@ -1417,13 +1494,6 @@ modlibexec_LTLIBRARIES += \
 		module-bluetooth-policy.la
 endif
 
-if HAVE_BLUEZ_4
-modlibexec_LTLIBRARIES += \
-		libbluez4-util.la \
-		module-bluez4-discover.la \
-		module-bluez4-device.la
-endif
-
 if HAVE_BLUEZ_5
 modlibexec_LTLIBRARIES += \
 		libbluez5-util.la \
@@ -1453,128 +1523,15 @@ bin_SCRIPTS += utils/qpaeq
 endif
 endif
 
-# These are generated by an M4 script
-SYMDEF_FILES = \
-		module-cli-symdef.h \
-		module-cli-protocol-tcp-symdef.h \
-		module-cli-protocol-unix-symdef.h \
-		module-pipe-sink-symdef.h \
-		module-pipe-source-symdef.h \
-		module-simple-protocol-tcp-symdef.h \
-		module-simple-protocol-unix-symdef.h \
-		module-native-protocol-tcp-symdef.h \
-		module-native-protocol-unix-symdef.h \
-		module-native-protocol-fd-symdef.h \
-		module-sine-symdef.h \
-		module-combine-symdef.h \
-		module-combine-sink-symdef.h \
-		module-remap-sink-symdef.h \
-		module-remap-source-symdef.h \
-		module-ladspa-sink-symdef.h \
-		module-equalizer-sink-symdef.h \
-		module-match-symdef.h \
-		module-tunnel-sink-new-symdef.h \
-		module-tunnel-source-new-symdef.h \
-		module-tunnel-sink-symdef.h \
-		module-tunnel-source-symdef.h \
-		module-null-sink-symdef.h \
-		module-null-source-symdef.h \
-		module-sine-source-symdef.h \
-		module-zeroconf-publish-symdef.h \
-		module-zeroconf-discover-symdef.h \
-		module-bonjour-publish-symdef.h \
-		module-lirc-symdef.h \
-		module-xenpv-sink-symdef.h \
-		module-mmkbd-evdev-symdef.h \
-		module-http-protocol-tcp-symdef.h \
-		module-http-protocol-unix-symdef.h \
-		module-rygel-media-server-symdef.h \
-		module-x11-bell-symdef.h \
-		module-x11-publish-symdef.h \
-		module-x11-xsmp-symdef.h \
-		module-x11-cork-request-symdef.h \
-		module-oss-symdef.h \
-		module-alsa-sink-symdef.h \
-		module-alsa-source-symdef.h \
-		module-alsa-card-symdef.h \
-		module-coreaudio-detect-symdef.h \
-		module-coreaudio-device-symdef.h \
-		module-solaris-symdef.h \
-		module-waveout-symdef.h \
-		module-opensles-symdef.h \
-		module-detect-symdef.h \
-		module-rtp-send-symdef.h \
-		module-rtp-recv-symdef.h \
-		module-jackdbus-detect-symdef.h \
-		module-jack-sink-symdef.h \
-		module-jack-source-symdef.h \
-		module-volume-restore-symdef.h \
-		module-device-manager-symdef.h \
-		module-device-restore-symdef.h \
-		module-stream-restore-symdef.h \
-		module-card-restore-symdef.h \
-		module-default-device-restore-symdef.h \
-		module-always-sink-symdef.h \
-		module-rescue-streams-symdef.h \
-		module-intended-roles-symdef.h \
-		module-suspend-on-idle-symdef.h \
-		module-echo-cancel-symdef.h \
-		module-hal-detect-symdef.h \
-		module-udev-detect-symdef.h \
-		module-systemd-login-symdef.h \
-		module-bluetooth-policy-symdef.h \
-		module-bluetooth-discover-symdef.h \
-		module-bluez4-discover-symdef.h \
-		module-bluez4-device-symdef.h \
-		module-bluez5-discover-symdef.h \
-		module-bluez5-device-symdef.h \
-		module-raop-sink-symdef.h \
-		module-raop-discover-symdef.h \
-		module-gconf-symdef.h \
-		module-position-event-sounds-symdef.h \
-		module-role-ducking-symdef.h \
-		module-augment-properties-symdef.h \
-		module-role-cork-symdef.h \
-		module-console-kit-symdef.h \
-		module-dbus-protocol-symdef.h \
-		module-loopback-symdef.h \
-		module-virtual-sink-symdef.h \
-		module-virtual-source-symdef.h \
-		module-virtual-surround-sink-symdef.h \
-		module-switch-on-connect-symdef.h \
-		module-switch-on-port-available-symdef.h \
-		module-filter-apply-symdef.h \
-		module-filter-heuristics-symdef.h
-
-if HAVE_ESOUND
-SYMDEF_FILES += \
-		module-esound-protocol-tcp-symdef.h \
-		module-esound-protocol-unix-symdef.h \
-		module-esound-compat-spawnfd-symdef.h \
-		module-esound-compat-spawnpid-symdef.h \
-		module-esound-sink-symdef.h
-endif
-
-EXTRA_DIST += $(SYMDEF_FILES)
-BUILT_SOURCES += $(SYMDEF_FILES) builddirs
-
-$(SYMDEF_FILES): modules/module-defs.h.m4
-	$(AM_V_at)$(MKDIR_P) modules
-	$(AM_V_GEN)$(M4) -Dfname="$@" $< > $@
-
-.PHONY: builddirs
-builddirs:
-	$(AM_V_at)$(MKDIR_P) daemon modules
-
 # Simple protocol
 
 module_simple_protocol_tcp_la_SOURCES = modules/module-protocol-stub.c
-module_simple_protocol_tcp_la_CFLAGS = -DUSE_TCP_SOCKETS -DUSE_PROTOCOL_SIMPLE $(AM_CFLAGS)
+module_simple_protocol_tcp_la_CFLAGS = -DUSE_TCP_SOCKETS -DUSE_PROTOCOL_SIMPLE $(AM_CFLAGS) -DPA_MODULE_NAME=module_simple_protocol_tcp
 module_simple_protocol_tcp_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_simple_protocol_tcp_la_LIBADD = $(MODULE_LIBADD) libprotocol-simple.la
 
 module_simple_protocol_unix_la_SOURCES = modules/module-protocol-stub.c
-module_simple_protocol_unix_la_CFLAGS = -DUSE_UNIX_SOCKETS -DUSE_PROTOCOL_SIMPLE $(AM_CFLAGS)
+module_simple_protocol_unix_la_CFLAGS = -DUSE_UNIX_SOCKETS -DUSE_PROTOCOL_SIMPLE $(AM_CFLAGS) -DPA_MODULE_NAME=module_simple_protocol_unix
 module_simple_protocol_unix_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_simple_protocol_unix_la_LIBADD = $(MODULE_LIBADD) libprotocol-simple.la
 
@@ -1583,26 +1540,27 @@ module_simple_protocol_unix_la_LIBADD = $(MODULE_LIBADD) libprotocol-simple.la
 module_cli_la_SOURCES = modules/module-cli.c
 module_cli_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_cli_la_LIBADD = $(MODULE_LIBADD) libcli.la
+module_cli_la_CFLAGS = $(AM_CFLAGS) -DPA_MODULE_NAME=module_cli
 
 module_cli_protocol_tcp_la_SOURCES = modules/module-protocol-stub.c
-module_cli_protocol_tcp_la_CFLAGS = -DUSE_TCP_SOCKETS -DUSE_PROTOCOL_CLI $(AM_CFLAGS)
+module_cli_protocol_tcp_la_CFLAGS = -DUSE_TCP_SOCKETS -DUSE_PROTOCOL_CLI $(AM_CFLAGS) -DPA_MODULE_NAME=module_cli_protocol_tcp
 module_cli_protocol_tcp_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_cli_protocol_tcp_la_LIBADD = $(MODULE_LIBADD) libprotocol-cli.la
 
 module_cli_protocol_unix_la_SOURCES = modules/module-protocol-stub.c
-module_cli_protocol_unix_la_CFLAGS = -DUSE_UNIX_SOCKETS -DUSE_PROTOCOL_CLI $(AM_CFLAGS)
+module_cli_protocol_unix_la_CFLAGS = -DUSE_UNIX_SOCKETS -DUSE_PROTOCOL_CLI $(AM_CFLAGS) -DPA_MODULE_NAME=module_cli_protocol_unix
 module_cli_protocol_unix_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_cli_protocol_unix_la_LIBADD = $(MODULE_LIBADD) libprotocol-cli.la
 
 # HTTP protocol
 
 module_http_protocol_tcp_la_SOURCES = modules/module-protocol-stub.c
-module_http_protocol_tcp_la_CFLAGS = -DUSE_TCP_SOCKETS -DUSE_PROTOCOL_HTTP $(AM_CFLAGS)
+module_http_protocol_tcp_la_CFLAGS = -DUSE_TCP_SOCKETS -DUSE_PROTOCOL_HTTP $(AM_CFLAGS) -DPA_MODULE_NAME=module_http_protocol_tcp
 module_http_protocol_tcp_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_http_protocol_tcp_la_LIBADD = $(MODULE_LIBADD) libprotocol-http.la
 
 module_http_protocol_unix_la_SOURCES = modules/module-protocol-stub.c
-module_http_protocol_unix_la_CFLAGS = -DUSE_UNIX_SOCKETS -DUSE_PROTOCOL_HTTP $(AM_CFLAGS)
+module_http_protocol_unix_la_CFLAGS = -DUSE_UNIX_SOCKETS -DUSE_PROTOCOL_HTTP $(AM_CFLAGS) -DPA_MODULE_NAME=module_http_protocol_unix
 module_http_protocol_unix_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_http_protocol_unix_la_LIBADD = $(MODULE_LIBADD) libprotocol-http.la
 
@@ -1620,24 +1578,24 @@ module_dbus_protocol_la_SOURCES = \
 		modules/dbus/iface-sample.c modules/dbus/iface-sample.h \
 		modules/dbus/iface-stream.c modules/dbus/iface-stream.h \
 		modules/dbus/module-dbus-protocol.c
-module_dbus_protocol_la_CFLAGS = $(AM_CFLAGS) $(DBUS_CFLAGS)
+module_dbus_protocol_la_CFLAGS = $(AM_CFLAGS) $(DBUS_CFLAGS) -DPA_MODULE_NAME=module_dbus_protocol
 module_dbus_protocol_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_dbus_protocol_la_LIBADD = $(MODULE_LIBADD) $(DBUS_LIBS)
 
 # Native protocol
 
 module_native_protocol_tcp_la_SOURCES = modules/module-protocol-stub.c
-module_native_protocol_tcp_la_CFLAGS = -DUSE_TCP_SOCKETS -DUSE_PROTOCOL_NATIVE $(AM_CFLAGS)
+module_native_protocol_tcp_la_CFLAGS = -DUSE_TCP_SOCKETS -DUSE_PROTOCOL_NATIVE $(AM_CFLAGS) -DPA_MODULE_NAME=module_native_protocol_tcp
 module_native_protocol_tcp_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_native_protocol_tcp_la_LIBADD = $(MODULE_LIBADD) libprotocol-native.la
 
 module_native_protocol_unix_la_SOURCES = modules/module-protocol-stub.c
-module_native_protocol_unix_la_CFLAGS = -DUSE_UNIX_SOCKETS -DUSE_PROTOCOL_NATIVE $(AM_CFLAGS)
+module_native_protocol_unix_la_CFLAGS = -DUSE_UNIX_SOCKETS -DUSE_PROTOCOL_NATIVE $(AM_CFLAGS) -DPA_MODULE_NAME=module_native_protocol_unix
 module_native_protocol_unix_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_native_protocol_unix_la_LIBADD = $(MODULE_LIBADD) libprotocol-native.la
 
 module_native_protocol_fd_la_SOURCES = modules/module-native-protocol-fd.c
-module_native_protocol_fd_la_CFLAGS = $(AM_CFLAGS)
+module_native_protocol_fd_la_CFLAGS = $(AM_CFLAGS) -DPA_MODULE_NAME=module_native_protocol_fd
 module_native_protocol_fd_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_native_protocol_fd_la_LIBADD = $(MODULE_LIBADD) libprotocol-native.la
 
@@ -1645,24 +1603,27 @@ module_native_protocol_fd_la_LIBADD = $(MODULE_LIBADD) libprotocol-native.la
 
 if HAVE_ESOUND
 module_esound_protocol_tcp_la_SOURCES = modules/module-protocol-stub.c
-module_esound_protocol_tcp_la_CFLAGS = -DUSE_TCP_SOCKETS -DUSE_PROTOCOL_ESOUND $(AM_CFLAGS)
+module_esound_protocol_tcp_la_CFLAGS = -DUSE_TCP_SOCKETS -DUSE_PROTOCOL_ESOUND $(AM_CFLAGS) -DPA_MODULE_NAME=module_esound_protocol_tcp
 module_esound_protocol_tcp_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_esound_protocol_tcp_la_LIBADD = $(MODULE_LIBADD) libprotocol-esound.la
 
 module_esound_protocol_unix_la_SOURCES = modules/module-protocol-stub.c
-module_esound_protocol_unix_la_CFLAGS = -DUSE_UNIX_SOCKETS -DUSE_PROTOCOL_ESOUND $(AM_CFLAGS)
+module_esound_protocol_unix_la_CFLAGS = -DUSE_UNIX_SOCKETS -DUSE_PROTOCOL_ESOUND $(AM_CFLAGS) -DPA_MODULE_NAME=module_esound_protocol_unix
 module_esound_protocol_unix_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_esound_protocol_unix_la_LIBADD = $(MODULE_LIBADD) libprotocol-esound.la
 
 module_esound_compat_spawnfd_la_SOURCES = modules/module-esound-compat-spawnfd.c
+module_esound_compat_spawnfd_la_CFLAGS = $(AM_CFLAGS) -DPA_MODULE_NAME=module_esound_compat_spawnfd
 module_esound_compat_spawnfd_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_esound_compat_spawnfd_la_LIBADD = $(MODULE_LIBADD)
 
 module_esound_compat_spawnpid_la_SOURCES = modules/module-esound-compat-spawnpid.c
+module_esound_compat_spawnpid_la_CFLAGS = $(AM_CFLAGS) -DPA_MODULE_NAME=module_esound_compat_spawnpid
 module_esound_compat_spawnpid_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_esound_compat_spawnpid_la_LIBADD = $(MODULE_LIBADD)
 
 module_esound_sink_la_SOURCES = modules/module-esound-sink.c
+module_esound_sink_la_CFLAGS = $(AM_CFLAGS) -DPA_MODULE_NAME=module_esound_sink
 module_esound_sink_la_LDFLAGS = $(MODULE_LDFLAGS) $(WINSOCK_LIBS)
 module_esound_sink_la_LIBADD = $(MODULE_LIBADD)
 endif
@@ -1672,65 +1633,79 @@ endif
 module_pipe_sink_la_SOURCES = modules/module-pipe-sink.c
 module_pipe_sink_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_pipe_sink_la_LIBADD = $(MODULE_LIBADD)
+module_pipe_sink_la_CFLAGS = $(AM_CFLAGS) -DPA_MODULE_NAME=module_pipe_sink
 
 module_pipe_source_la_SOURCES = modules/module-pipe-source.c
 module_pipe_source_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_pipe_source_la_LIBADD = $(MODULE_LIBADD)
+module_pipe_source_la_CFLAGS = $(AM_CFLAGS) -DPA_MODULE_NAME=module_pipe_source
 
 # Fake sources/sinks
 
 module_sine_la_SOURCES = modules/module-sine.c
 module_sine_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_sine_la_LIBADD = $(MODULE_LIBADD)
+module_sine_la_CFLAGS = $(AM_CFLAGS) -DPA_MODULE_NAME=module_sine
 
 module_null_sink_la_SOURCES = modules/module-null-sink.c
 module_null_sink_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_null_sink_la_LIBADD = $(MODULE_LIBADD)
+module_null_sink_la_CFLAGS = $(AM_CFLAGS) -DPA_MODULE_NAME=module_null_sink
 
 module_null_source_la_SOURCES = modules/module-null-source.c
 module_null_source_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_null_source_la_LIBADD = $(MODULE_LIBADD)
+module_null_source_la_CFLAGS = $(AM_CFLAGS) -DPA_MODULE_NAME=module_null_source
 
 module_sine_source_la_SOURCES = modules/module-sine-source.c
 module_sine_source_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_sine_source_la_LIBADD = $(MODULE_LIBADD)
+module_sine_source_la_CFLAGS = $(AM_CFLAGS) -DPA_MODULE_NAME=module_sine_source
 
 # Couplings
 
 module_combine_la_SOURCES = modules/module-combine.c
 module_combine_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_combine_la_LIBADD = $(MODULE_LIBADD)
+module_combine_la_CFLAGS = $(AM_CFLAGS) -DPA_MODULE_NAME=module_combine
 
 module_combine_sink_la_SOURCES = modules/module-combine-sink.c
 module_combine_sink_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_combine_sink_la_LIBADD = $(MODULE_LIBADD)
+module_combine_sink_la_CFLAGS = $(AM_CFLAGS) -DPA_MODULE_NAME=module_combine_sink
 
 module_switch_on_connect_la_SOURCES = modules/module-switch-on-connect.c
 module_switch_on_connect_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_switch_on_connect_la_LIBADD = $(MODULE_LIBADD)
+module_switch_on_connect_la_CFLAGS = $(AM_CFLAGS) -DPA_MODULE_NAME=module_switch_on_connect
 
 module_switch_on_port_available_la_SOURCES = modules/module-switch-on-port-available.c
 module_switch_on_port_available_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_switch_on_port_available_la_LIBADD = $(MODULE_LIBADD)
+module_switch_on_port_available_la_CFLAGS = $(AM_CFLAGS) -DPA_MODULE_NAME=module_switch_on_port_available
 
 module_filter_apply_la_SOURCES = modules/module-filter-apply.c
 module_filter_apply_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_filter_apply_la_LIBADD = $(MODULE_LIBADD)
+module_filter_apply_la_CFLAGS = $(AM_CFLAGS) -DPA_MODULE_NAME=module_filter_apply
 
 module_filter_heuristics_la_SOURCES = modules/module-filter-heuristics.c
 module_filter_heuristics_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_filter_heuristics_la_LIBADD = $(MODULE_LIBADD)
+module_filter_heuristics_la_CFLAGS = $(AM_CFLAGS) -DPA_MODULE_NAME=module_filter_heuristics
 
 module_remap_sink_la_SOURCES = modules/module-remap-sink.c
 module_remap_sink_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_remap_sink_la_LIBADD = $(MODULE_LIBADD)
+module_remap_sink_la_CFLAGS = $(AM_CFLAGS) -DPA_MODULE_NAME=module_remap_sink
 
 module_remap_source_la_SOURCES = modules/module-remap-source.c
 module_remap_source_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_remap_source_la_LIBADD = $(MODULE_LIBADD)
+module_remap_source_la_CFLAGS = $(AM_CFLAGS) -DPA_MODULE_NAME=module_remap_source
 
 module_ladspa_sink_la_SOURCES = modules/module-ladspa-sink.c modules/ladspa.h
-module_ladspa_sink_la_CFLAGS = -DLADSPA_PATH=\"$(libdir)/ladspa:/usr/local/lib/ladspa:/usr/lib/ladspa:/usr/local/lib64/ladspa:/usr/lib64/ladspa\" $(AM_CFLAGS) $(SERVER_CFLAGS)
+module_ladspa_sink_la_CFLAGS = -DLADSPA_PATH="$(libdir)/ladspa:/usr/local/lib/ladspa:/usr/lib/ladspa:/usr/local/lib64/ladspa:/usr/lib64/ladspa" $(AM_CFLAGS) $(SERVER_CFLAGS) -DPA_MODULE_NAME=module_ladspa_sink
 module_ladspa_sink_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_ladspa_sink_la_LIBADD = $(MODULE_LIBADD) $(LIBLTDL)
 
@@ -1740,69 +1715,74 @@ module_ladspa_sink_la_LIBADD += $(DBUS_LIBS)
 endif
 
 module_equalizer_sink_la_SOURCES = modules/module-equalizer-sink.c
-module_equalizer_sink_la_CFLAGS = $(AM_CFLAGS) $(SERVER_CFLAGS) $(DBUS_CFLAGS) $(FFTW_CFLAGS)
+module_equalizer_sink_la_CFLAGS = $(AM_CFLAGS) $(SERVER_CFLAGS) $(DBUS_CFLAGS) $(FFTW_CFLAGS) -DPA_MODULE_NAME=module_equalizer_sink
 module_equalizer_sink_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_equalizer_sink_la_LIBADD = $(MODULE_LIBADD) $(DBUS_LIBS) $(FFTW_LIBS)
 
 module_match_la_SOURCES = modules/module-match.c
 module_match_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_match_la_LIBADD = $(MODULE_LIBADD)
+module_match_la_CFLAGS = $(AM_CFLAGS) -DPA_MODULE_NAME=module_match
 
 module_tunnel_sink_new_la_SOURCES = modules/module-tunnel-sink-new.c
 module_tunnel_sink_new_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_tunnel_sink_new_la_LIBADD = $(MODULE_LIBADD)
+module_tunnel_sink_new_la_CFLAGS = $(AM_CFLAGS) -DPA_MODULE_NAME=module_tunnel_sink_new
 
 module_tunnel_source_new_la_SOURCES = modules/module-tunnel-source-new.c
 module_tunnel_source_new_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_tunnel_source_new_la_LIBADD = $(MODULE_LIBADD)
+module_tunnel_source_new_la_CFLAGS = $(AM_CFLAGS) -DPA_MODULE_NAME=module_tunnel_source_new
 
 module_tunnel_sink_la_SOURCES = modules/module-tunnel.c
-module_tunnel_sink_la_CFLAGS = -DTUNNEL_SINK=1 $(AM_CFLAGS) $(X11_CFLAGS)
+module_tunnel_sink_la_CFLAGS = -DTUNNEL_SINK=1 $(AM_CFLAGS) $(X11_CFLAGS) -DPA_MODULE_NAME=module_tunnel_sink
 module_tunnel_sink_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_tunnel_sink_la_LIBADD = $(MODULE_LIBADD) $(X11_LIBS)
 
 module_tunnel_source_la_SOURCES = modules/module-tunnel.c
 module_tunnel_source_la_LDFLAGS = $(MODULE_LDFLAGS) $(X11_CFLAGS)
 module_tunnel_source_la_LIBADD = $(MODULE_LIBADD) $(X11_LIBS)
+module_tunnel_source_la_CFLAGS = $(AM_CFLAGS) -DPA_MODULE_NAME=module_tunnel_source
 
 module_loopback_la_SOURCES = modules/module-loopback.c
 module_loopback_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_loopback_la_LIBADD = $(MODULE_LIBADD)
+module_loopback_la_CFLAGS = $(AM_CFLAGS) -DPA_MODULE_NAME=module_loopback
 
 module_virtual_sink_la_SOURCES = modules/module-virtual-sink.c
-module_virtual_sink_la_CFLAGS = $(AM_CFLAGS) $(SERVER_CFLAGS)
+module_virtual_sink_la_CFLAGS = $(AM_CFLAGS) $(SERVER_CFLAGS) -DPA_MODULE_NAME=module_virtual_sink
 module_virtual_sink_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_virtual_sink_la_LIBADD = $(MODULE_LIBADD)
 
 module_virtual_source_la_SOURCES = modules/module-virtual-source.c
-module_virtual_source_la_CFLAGS = $(AM_CFLAGS) $(SERVER_CFLAGS)
+module_virtual_source_la_CFLAGS = $(AM_CFLAGS) $(SERVER_CFLAGS) -DPA_MODULE_NAME=module_virtual_source
 module_virtual_source_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_virtual_source_la_LIBADD = $(MODULE_LIBADD)
 
 module_virtual_surround_sink_la_SOURCES = modules/module-virtual-surround-sink.c
-module_virtual_surround_sink_la_CFLAGS = $(AM_CFLAGS) $(SERVER_CFLAGS)
+module_virtual_surround_sink_la_CFLAGS = $(AM_CFLAGS) $(SERVER_CFLAGS) -DPA_MODULE_NAME=module_virtual_surround_sink
 module_virtual_surround_sink_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_virtual_surround_sink_la_LIBADD = $(MODULE_LIBADD)
 
 # X11
 
 module_x11_bell_la_SOURCES = modules/x11/module-x11-bell.c
-module_x11_bell_la_CFLAGS = $(AM_CFLAGS) $(X11_CFLAGS)
+module_x11_bell_la_CFLAGS = $(AM_CFLAGS) $(X11_CFLAGS) -DPA_MODULE_NAME=module_x11_bell
 module_x11_bell_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_x11_bell_la_LIBADD = $(MODULE_LIBADD) $(X11_LIBS)
 
 module_x11_publish_la_SOURCES = modules/x11/module-x11-publish.c
-module_x11_publish_la_CFLAGS = $(AM_CFLAGS) $(X11_CFLAGS)
+module_x11_publish_la_CFLAGS = $(AM_CFLAGS) $(X11_CFLAGS) -DPA_MODULE_NAME=module_x11_publish
 module_x11_publish_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_x11_publish_la_LIBADD = $(MODULE_LIBADD) libprotocol-native.la $(X11_LIBS)
 
 module_x11_xsmp_la_SOURCES = modules/x11/module-x11-xsmp.c
-module_x11_xsmp_la_CFLAGS = $(AM_CFLAGS) $(X11_CFLAGS)
+module_x11_xsmp_la_CFLAGS = $(AM_CFLAGS) $(X11_CFLAGS) -DPA_MODULE_NAME=module_x11_xsmp
 module_x11_xsmp_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_x11_xsmp_la_LIBADD = $(MODULE_LIBADD) $(X11_LIBS)
 
 module_x11_cork_request_la_SOURCES = modules/x11/module-x11-cork-request.c
-module_x11_cork_request_la_CFLAGS = $(AM_CFLAGS) $(X11_CFLAGS)
+module_x11_cork_request_la_CFLAGS = $(AM_CFLAGS) $(X11_CFLAGS) -DPA_MODULE_NAME=module_x11_cork_request
 module_x11_cork_request_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_x11_cork_request_la_LIBADD = $(MODULE_LIBADD) $(X11_LIBS)
 
@@ -1815,6 +1795,7 @@ liboss_util_la_LIBADD = $(MODULE_LIBADD)
 module_oss_la_SOURCES = modules/oss/module-oss.c
 module_oss_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_oss_la_LIBADD = $(MODULE_LIBADD) liboss-util.la
+module_oss_la_CFLAGS = $(AM_CFLAGS) -DPA_MODULE_NAME=module_oss
 
 # COREAUDIO
 
@@ -1823,12 +1804,14 @@ module_coreaudio_detect_la_LDFLAGS = $(MODULE_LDFLAGS) \
 		-Wl,-framework -Wl,Cocoa -framework CoreAudio \
 		-Wl,-framework -Wl,AudioUnit -framework AudioUnit
 module_coreaudio_detect_la_LIBADD = $(MODULE_LIBADD)
+module_coreaudio_detect_la_CFLAGS = $(AM_CFLAGS) -DPA_MODULE_NAME=module_coreaudio_detect
 
 module_coreaudio_device_la_SOURCES = modules/macosx/module-coreaudio-device.c
 module_coreaudio_device_la_LDFLAGS = $(MODULE_LDFLAGS) \
 		-Wl,-framework -Wl,Cocoa -framework CoreAudio \
 		-Wl,-framework -Wl,AudioUnit -framework AudioUnit
 module_coreaudio_device_la_LIBADD = $(MODULE_LIBADD)
+module_coreaudio_device_la_CFLAGS = $(AM_CFLAGS) -DPA_MODULE_NAME=module_coreaudio_device
 
 # ALSA
 
@@ -1858,35 +1841,36 @@ endif
 module_alsa_sink_la_SOURCES = modules/alsa/module-alsa-sink.c
 module_alsa_sink_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_alsa_sink_la_LIBADD = $(MODULE_LIBADD) $(ASOUNDLIB_LIBS) libalsa-util.la
-module_alsa_sink_la_CFLAGS = $(AM_CFLAGS) $(ASOUNDLIB_CFLAGS)
+module_alsa_sink_la_CFLAGS = $(AM_CFLAGS) $(ASOUNDLIB_CFLAGS) -DPA_MODULE_NAME=module_alsa_sink
 
 module_alsa_source_la_SOURCES = modules/alsa/module-alsa-source.c
 module_alsa_source_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_alsa_source_la_LIBADD = $(MODULE_LIBADD) $(ASOUNDLIB_LIBS) libalsa-util.la
-module_alsa_source_la_CFLAGS = $(AM_CFLAGS) $(ASOUNDLIB_CFLAGS)
+module_alsa_source_la_CFLAGS = $(AM_CFLAGS) $(ASOUNDLIB_CFLAGS) -DPA_MODULE_NAME=module_alsa_source
 
 module_alsa_card_la_SOURCES = modules/alsa/module-alsa-card.c
 module_alsa_card_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_alsa_card_la_LIBADD = $(MODULE_LIBADD) $(ASOUNDLIB_LIBS) libalsa-util.la
-module_alsa_card_la_CFLAGS = $(AM_CFLAGS) $(ASOUNDLIB_CFLAGS)
+module_alsa_card_la_CFLAGS = $(AM_CFLAGS) $(ASOUNDLIB_CFLAGS) -DPA_MODULE_NAME=module_alsa_card
 
 # Solaris
 
 module_solaris_la_SOURCES = modules/module-solaris.c
 module_solaris_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_solaris_la_LIBADD = $(MODULE_LIBADD)
+module_solaris_la_CFLAGS = $(AM_CFLAGS) -DPA_MODULE_NAME=module_solaris
 
 # Avahi
 
 module_zeroconf_publish_la_SOURCES = modules/module-zeroconf-publish.c
 module_zeroconf_publish_la_LDFLAGS = $(MODULE_LDFLAGS)
-module_zeroconf_publish_la_LIBADD = $(MODULE_LIBADD) $(AVAHI_LIBS) libavahi-wrap.la libprotocol-native.la
-module_zeroconf_publish_la_CFLAGS = $(AM_CFLAGS) $(AVAHI_CFLAGS)
+module_zeroconf_publish_la_LIBADD = $(MODULE_LIBADD) $(AVAHI_LIBS) $(DBUS_LIBS) libavahi-wrap.la libprotocol-native.la
+module_zeroconf_publish_la_CFLAGS = $(AM_CFLAGS) $(AVAHI_CFLAGS) $(DBUS_CFLAGS) -DPA_MODULE_NAME=module_zeroconf_publish
 
 module_zeroconf_discover_la_SOURCES = modules/module-zeroconf-discover.c
 module_zeroconf_discover_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_zeroconf_discover_la_LIBADD = $(MODULE_LIBADD) $(AVAHI_LIBS) libavahi-wrap.la
-module_zeroconf_discover_la_CFLAGS = $(AM_CFLAGS) $(AVAHI_CFLAGS)
+module_zeroconf_discover_la_CFLAGS = $(AM_CFLAGS) $(AVAHI_CFLAGS) -DPA_MODULE_NAME=module_zeroconf_discover
 
 # Bonjour
 
@@ -1894,21 +1878,14 @@ module_bonjour_publish_la_SOURCES = modules/macosx/module-bonjour-publish.c
 module_bonjour_publish_la_LDFLAGS = $(MODULE_LDFLAGS) \
 			-Wl,-framework -Wl,CoreFoundation -framework CoreFoundation
 module_bonjour_publish_la_LIBADD = $(MODULE_LIBADD) libprotocol-native.la
+module_bonjour_publish_la_CFLAGS = $(AM_CFLAGS) -DPA_MODULE_NAME=module_bonjour_publish
 
 # LIRC
 
 module_lirc_la_SOURCES = modules/module-lirc.c
 module_lirc_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_lirc_la_LIBADD = $(MODULE_LIBADD) $(LIRC_LIBS)
-module_lirc_la_CFLAGS = $(AM_CFLAGS) $(LIRC_CFLAGS)
-
-
-# Xen PV driver
-
-module_xenpv_sink_la_SOURCES = modules/xen/module-xenpv-sink.c modules/xen/gntalloc.h modules/xen/gntdev.h
-module_xenpv_sink_la_LDFLAGS = $(MODULE_LDFLAGS)
-module_xenpv_sink_la_LIBADD = $(MODULE_LIBADD) $(XEN_LIBS)
-module_xenpv_sink_la_CFLAGS = $(AM_CFLAGS) $(XEN_CFLAGS) -I$(top_srcdir)/src/modules/xen
+module_lirc_la_CFLAGS = $(AM_CFLAGS) $(LIRC_CFLAGS) -DPA_MODULE_NAME=module_lirc
 
 
 # Linux evdev
@@ -1916,13 +1893,13 @@ module_xenpv_sink_la_CFLAGS = $(AM_CFLAGS) $(XEN_CFLAGS) -I$(top_srcdir)/src/mod
 module_mmkbd_evdev_la_SOURCES = modules/module-mmkbd-evdev.c
 module_mmkbd_evdev_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_mmkbd_evdev_la_LIBADD = $(MODULE_LIBADD)
-module_mmkbd_evdev_la_CFLAGS = $(AM_CFLAGS)
+module_mmkbd_evdev_la_CFLAGS = $(AM_CFLAGS) -DPA_MODULE_NAME=module_mmkbd_evdev
 
 # Windows waveout
 module_waveout_la_SOURCES = modules/module-waveout.c
 module_waveout_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_waveout_la_LIBADD = $(MODULE_LIBADD) -lwinmm
-module_waveout_la_CFLAGS = $(AM_CFLAGS)
+module_waveout_la_CFLAGS = $(AM_CFLAGS) -DPA_MODULE_NAME=module_waveout
 
 # Android OpenSLES output
 module_opensles_la_SOURCES = modules/module-opensles.c
@@ -1934,50 +1911,52 @@ module_opensles_la_CFLAGS = $(AM_CFLAGS) $(OPENSLES_CFLAGS)
 module_detect_la_SOURCES = modules/module-detect.c
 module_detect_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_detect_la_LIBADD = $(MODULE_LIBADD)
-module_detect_la_CFLAGS = $(AM_CFLAGS)
+module_detect_la_CFLAGS = $(AM_CFLAGS) -DPA_MODULE_NAME=module_detect
 
 # Volume restore module
 module_volume_restore_la_SOURCES = modules/module-volume-restore.c
 module_volume_restore_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_volume_restore_la_LIBADD = $(MODULE_LIBADD)
-module_volume_restore_la_CFLAGS = $(AM_CFLAGS)
+module_volume_restore_la_CFLAGS = $(AM_CFLAGS) -DPA_MODULE_NAME=module_volume_restore
 
 # Position event sounds in space
 module_position_event_sounds_la_SOURCES = modules/module-position-event-sounds.c
 module_position_event_sounds_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_position_event_sounds_la_LIBADD = $(MODULE_LIBADD)
-module_position_event_sounds_la_CFLAGS = $(AM_CFLAGS)
+module_position_event_sounds_la_CFLAGS = $(AM_CFLAGS) -DPA_MODULE_NAME=module_position_event_sounds
 
 # Ducking effect based on stream roles
-module_role_ducking_la_SOURCES = modules/module-role-ducking.c
+module_role_ducking_la_SOURCES = modules/module-role-ducking.c \
+                                 modules/stream-interaction.c modules/stream-interaction.h
 module_role_ducking_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_role_ducking_la_LIBADD = $(MODULE_LIBADD)
-module_role_ducking_la_CFLAGS = $(AM_CFLAGS)
+module_role_ducking_la_CFLAGS = $(AM_CFLAGS) -DPA_MODULE_NAME=module_role_ducking
 
 # Augment properties from XDG .desktop files
 module_augment_properties_la_SOURCES = modules/module-augment-properties.c
 module_augment_properties_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_augment_properties_la_LIBADD = $(MODULE_LIBADD)
 #module_augment_properties_la_CFLAGS = $(AM_CFLAGS) -DDESKTOPFILEDIR=\"$(datadir)/applications\"
-module_augment_properties_la_CFLAGS = $(AM_CFLAGS) -DDESKTOPFILEDIR=\"/usr/share/applications\"
+module_augment_properties_la_CFLAGS = $(AM_CFLAGS) -DDESKTOPFILEDIR=\"/usr/share/applications\" -DPA_MODULE_NAME=module_augment_properties
 
 # Cork certain streams while others are active (e.g. cork music when phone streams appear)
-module_role_cork_la_SOURCES = modules/module-role-cork.c
+module_role_cork_la_SOURCES = modules/module-role-cork.c \
+                              modules/stream-interaction.c modules/stream-interaction.h
 module_role_cork_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_role_cork_la_LIBADD = $(MODULE_LIBADD)
-module_role_cork_la_CFLAGS = $(AM_CFLAGS)
+module_role_cork_la_CFLAGS = $(AM_CFLAGS) -DPA_MODULE_NAME=module_role_cork
 
 # Device description restore module
 module_device_manager_la_SOURCES = modules/module-device-manager.c
 module_device_manager_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_device_manager_la_LIBADD = $(MODULE_LIBADD) libprotocol-native.la
-module_device_manager_la_CFLAGS = $(AM_CFLAGS)
+module_device_manager_la_CFLAGS = $(AM_CFLAGS) -DPA_MODULE_NAME=module_device_manager
 
 # Device volume/muted restore module
 module_device_restore_la_SOURCES = modules/module-device-restore.c
 module_device_restore_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_device_restore_la_LIBADD = $(MODULE_LIBADD) libprotocol-native.la
-module_device_restore_la_CFLAGS = $(AM_CFLAGS)
+module_device_restore_la_CFLAGS = $(AM_CFLAGS) -DPA_MODULE_NAME=module_device_restore
 
 if HAVE_DBUS
 module_device_restore_la_LIBADD += $(DBUS_LIBS)
@@ -1988,7 +1967,7 @@ endif
 module_stream_restore_la_SOURCES = modules/module-stream-restore.c
 module_stream_restore_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_stream_restore_la_LIBADD = $(MODULE_LIBADD) libprotocol-native.la
-module_stream_restore_la_CFLAGS = $(AM_CFLAGS)
+module_stream_restore_la_CFLAGS = $(AM_CFLAGS) -DPA_MODULE_NAME=module_stream_restore
 
 if HAVE_DBUS
 module_stream_restore_la_LIBADD += $(DBUS_LIBS)
@@ -1999,37 +1978,43 @@ endif
 module_card_restore_la_SOURCES = modules/module-card-restore.c
 module_card_restore_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_card_restore_la_LIBADD = $(MODULE_LIBADD)
-module_card_restore_la_CFLAGS = $(AM_CFLAGS)
+module_card_restore_la_CFLAGS = $(AM_CFLAGS) -DPA_MODULE_NAME=module_card_restore
 
 # Default sink/source restore module
 module_default_device_restore_la_SOURCES = modules/module-default-device-restore.c
 module_default_device_restore_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_default_device_restore_la_LIBADD = $(MODULE_LIBADD)
-module_default_device_restore_la_CFLAGS = $(AM_CFLAGS)
+module_default_device_restore_la_CFLAGS = $(AM_CFLAGS) -DPA_MODULE_NAME=module_default_device_restore
 
 # Always Sink module
 module_always_sink_la_SOURCES = modules/module-always-sink.c
 module_always_sink_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_always_sink_la_LIBADD = $(MODULE_LIBADD)
-module_always_sink_la_CFLAGS = $(AM_CFLAGS)
+module_always_sink_la_CFLAGS = $(AM_CFLAGS) -DPA_MODULE_NAME=module_always_sink
+
+# Always Source module
+module_always_source_la_SOURCES = modules/module-always-source.c
+module_always_source_la_LDFLAGS = $(MODULE_LDFLAGS)
+module_always_source_la_LIBADD = $(MODULE_LIBADD)
+module_always_source_la_CFLAGS = $(AM_CFLAGS) -DPA_MODULE_NAME=module_always_source
 
 # Rescue streams module
 module_rescue_streams_la_SOURCES = modules/module-rescue-streams.c
 module_rescue_streams_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_rescue_streams_la_LIBADD = $(MODULE_LIBADD)
-module_rescue_streams_la_CFLAGS = $(AM_CFLAGS)
+module_rescue_streams_la_CFLAGS = $(AM_CFLAGS) -DPA_MODULE_NAME=module_rescue_streams
 
 # Automatically move streams to devices that are intended for their roles
 module_intended_roles_la_SOURCES = modules/module-intended-roles.c
 module_intended_roles_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_intended_roles_la_LIBADD = $(MODULE_LIBADD)
-module_intended_roles_la_CFLAGS = $(AM_CFLAGS)
+module_intended_roles_la_CFLAGS = $(AM_CFLAGS) -DPA_MODULE_NAME=module_intended_roles
 
 # Suspend-on-idle module
 module_suspend_on_idle_la_SOURCES = modules/module-suspend-on-idle.c
 module_suspend_on_idle_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_suspend_on_idle_la_LIBADD = $(MODULE_LIBADD)
-module_suspend_on_idle_la_CFLAGS = $(AM_CFLAGS)
+module_suspend_on_idle_la_CFLAGS = $(AM_CFLAGS) -DPA_MODULE_NAME=module_suspend_on_idle
 
 # echo-cancel module
 module_echo_cancel_la_SOURCES = \
@@ -2038,7 +2023,7 @@ module_echo_cancel_la_SOURCES = \
 		modules/echo-cancel/echo-cancel.h
 module_echo_cancel_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_echo_cancel_la_LIBADD = $(MODULE_LIBADD)
-module_echo_cancel_la_CFLAGS = $(AM_CFLAGS) $(SERVER_CFLAGS)
+module_echo_cancel_la_CFLAGS = $(AM_CFLAGS) $(SERVER_CFLAGS) -DPA_MODULE_NAME=module_echo_cancel
 if HAVE_ADRIAN_EC
 module_echo_cancel_la_SOURCES += \
 		modules/echo-cancel/adrian-aec.c modules/echo-cancel/adrian-aec.h \
@@ -2076,97 +2061,103 @@ endif
 module_rtp_send_la_SOURCES = modules/rtp/module-rtp-send.c
 module_rtp_send_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_rtp_send_la_LIBADD = $(MODULE_LIBADD) librtp.la
-module_rtp_send_la_CFLAGS = $(AM_CFLAGS)
+module_rtp_send_la_CFLAGS = $(AM_CFLAGS) -DPA_MODULE_NAME=module_rtp_send
 
 module_rtp_recv_la_SOURCES = modules/rtp/module-rtp-recv.c
 module_rtp_recv_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_rtp_recv_la_LIBADD = $(MODULE_LIBADD) librtp.la
-module_rtp_recv_la_CFLAGS = $(AM_CFLAGS)
+module_rtp_recv_la_CFLAGS = $(AM_CFLAGS) -DPA_MODULE_NAME=module_rtp_recv
 
 # JACK
 
 module_jackdbus_detect_la_SOURCES = modules/jack/module-jackdbus-detect.c
 module_jackdbus_detect_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_jackdbus_detect_la_LIBADD = $(MODULE_LIBADD) $(DBUS_LIBS) $(JACK_LIBS)
-module_jackdbus_detect_la_CFLAGS = $(AM_CFLAGS) $(DBUS_CFLAGS) $(JACK_CFLAGS)
+module_jackdbus_detect_la_CFLAGS = $(AM_CFLAGS) $(DBUS_CFLAGS) $(JACK_CFLAGS) -DPA_MODULE_NAME=module_jackdbus_detect
 
 module_jack_sink_la_SOURCES = modules/jack/module-jack-sink.c
 module_jack_sink_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_jack_sink_la_LIBADD = $(MODULE_LIBADD) $(JACK_LIBS)
-module_jack_sink_la_CFLAGS = $(AM_CFLAGS) $(JACK_CFLAGS)
+module_jack_sink_la_CFLAGS = $(AM_CFLAGS) $(JACK_CFLAGS) -DPA_MODULE_NAME=module_jack_sink
 
 module_jack_source_la_SOURCES = modules/jack/module-jack-source.c
 module_jack_source_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_jack_source_la_LIBADD = $(MODULE_LIBADD) $(JACK_LIBS)
-module_jack_source_la_CFLAGS = $(AM_CFLAGS) $(JACK_CFLAGS)
+module_jack_source_la_CFLAGS = $(AM_CFLAGS) $(JACK_CFLAGS) -DPA_MODULE_NAME=module_jack_source
 
 module_hal_detect_la_SOURCES = modules/module-hal-detect-compat.c
 module_hal_detect_la_LIBADD = $(MODULE_LIBADD)
-module_hal_detect_la_CFLAGS = $(AM_CFLAGS)
+module_hal_detect_la_CFLAGS = $(AM_CFLAGS) -DPA_MODULE_NAME=module_hal_detect
 module_hal_detect_la_LDFLAGS = $(MODULE_LDFLAGS)
 
 module_udev_detect_la_SOURCES = modules/module-udev-detect.c
 module_udev_detect_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_udev_detect_la_LIBADD = $(MODULE_LIBADD) $(UDEV_LIBS)
-module_udev_detect_la_CFLAGS = $(AM_CFLAGS) $(UDEV_CFLAGS)
+module_udev_detect_la_CFLAGS = $(AM_CFLAGS) $(UDEV_CFLAGS) -DPA_MODULE_NAME=module_udev_detect
 
 module_console_kit_la_SOURCES = modules/module-console-kit.c
 module_console_kit_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_console_kit_la_LIBADD = $(MODULE_LIBADD) $(DBUS_LIBS)
-module_console_kit_la_CFLAGS = $(AM_CFLAGS) $(DBUS_CFLAGS)
+module_console_kit_la_CFLAGS = $(AM_CFLAGS) $(DBUS_CFLAGS) -DPA_MODULE_NAME=module_console_kit
 
 module_systemd_login_la_SOURCES = modules/module-systemd-login.c
 module_systemd_login_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_systemd_login_la_LIBADD = $(MODULE_LIBADD) $(SYSTEMD_LIBS) $(SYSTEMDLOGIN_LIBS)
-module_systemd_login_la_CFLAGS = $(AM_CFLAGS) $(SYSTEMD_CFLAGS) $(SYSTEMDLOGIN_CFLAGS)
+module_systemd_login_la_CFLAGS = $(AM_CFLAGS) $(SYSTEMD_CFLAGS) $(SYSTEMDLOGIN_CFLAGS) -DPA_MODULE_NAME=module_systemd_login
 
 # GConf support
-module_gconf_la_SOURCES = modules/gconf/module-gconf.c
+module_gconf_la_SOURCES = \
+		 modules/stdin-util.c modules/stdin-util.h \
+		 modules/gconf/module-gconf.c
+
 module_gconf_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_gconf_la_LIBADD = $(MODULE_LIBADD)
-module_gconf_la_CFLAGS = $(AM_CFLAGS) -DPA_GCONF_HELPER=\"$(pulselibexecdir)/gconf-helper\"
+module_gconf_la_CFLAGS = $(AM_CFLAGS) -DPA_GCONF_HELPER=\"$(pulselibexecdir)/gconf-helper\" -DPA_MODULE_NAME=module_gconf
 
 gconf_helper_SOURCES = modules/gconf/gconf-helper.c
 gconf_helper_LDADD = $(AM_LDADD) libpulsecore-@PA_MAJORMINOR@.la libpulsecommon-@PA_MAJORMINOR@.la libpulse.la $(GCONF_LIBS)
 gconf_helper_CFLAGS = $(AM_CFLAGS) $(GCONF_CFLAGS)
 gconf_helper_LDFLAGS = $(AM_LDFLAGS) $(BINLDFLAGS)
 
+# GSettings support
+module_gsettings_la_SOURCES = \
+		modules/stdin-util.c modules/stdin-util.h \
+		modules/gsettings/module-gsettings.c
+module_gsettings_la_LDFLAGS = $(MODULE_LDFLAGS)
+module_gsettings_la_LIBADD = $(MODULE_LIBADD)
+module_gsettings_la_CFLAGS = $(AM_CFLAGS) -DPA_GSETTINGS_HELPER=\"$(pulselibexecdir)/gsettings-helper\" -DPA_MODULE_NAME=module_gsettings
+
+gsettings_helper_SOURCES = modules/gsettings/gsettings-helper.c
+gsettings_helper_LDADD = $(AM_LDADD) libpulsecore-@PA_MAJORMINOR@.la libpulsecommon-@PA_MAJORMINOR@.la libpulse.la $(GSETTINGS_LIBS)
+gsettings_helper_CFLAGS = $(AM_CFLAGS) $(GSETTINGS_CFLAGS)
+gsettings_helper_LDFLAGS = $(AM_LDFLAGS) $(BINLDFLAGS)
+
+if HAVE_GSETTINGS
+gsettings_SCHEMAS = modules/gsettings/org.freedesktop.pulseaudio.gschema.xml
+@GSETTINGS_RULES@
+endif
+
 # Bluetooth policy
 module_bluetooth_policy_la_SOURCES = modules/bluetooth/module-bluetooth-policy.c
 module_bluetooth_policy_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_bluetooth_policy_la_LIBADD = $(MODULE_LIBADD)
-module_bluetooth_policy_la_CFLAGS = $(AM_CFLAGS) $(DBUS_CFLAGS)
+module_bluetooth_policy_la_CFLAGS = $(AM_CFLAGS) $(DBUS_CFLAGS) -DPA_MODULE_NAME=module_bluetooth_policy
 
 # Bluetooth discover
 module_bluetooth_discover_la_SOURCES = modules/bluetooth/module-bluetooth-discover.c
 module_bluetooth_discover_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_bluetooth_discover_la_LIBADD = $(MODULE_LIBADD)
-module_bluetooth_discover_la_CFLAGS = $(AM_CFLAGS)
-
-# Bluetooth BlueZ 4 sink / source
-module_bluez4_discover_la_SOURCES = modules/bluetooth/module-bluez4-discover.c
-module_bluez4_discover_la_LDFLAGS = $(MODULE_LDFLAGS)
-module_bluez4_discover_la_LIBADD = $(MODULE_LIBADD) $(DBUS_LIBS) libbluez4-util.la
-module_bluez4_discover_la_CFLAGS = $(AM_CFLAGS) $(DBUS_CFLAGS)
-
-libbluez4_util_la_SOURCES = \
-		modules/bluetooth/a2dp-codecs.h \
-		modules/bluetooth/bluez4-util.c \
-		modules/bluetooth/bluez4-util.h
-libbluez4_util_la_LDFLAGS = -avoid-version
-libbluez4_util_la_LIBADD = $(MODULE_LIBADD) $(DBUS_LIBS)
-libbluez4_util_la_CFLAGS = $(AM_CFLAGS) $(DBUS_CFLAGS)
-
-module_bluez4_device_la_SOURCES = modules/bluetooth/module-bluez4-device.c modules/bluetooth/rtp.h
-module_bluez4_device_la_LDFLAGS = $(MODULE_LDFLAGS)
-module_bluez4_device_la_LIBADD = $(MODULE_LIBADD) $(DBUS_LIBS) $(SBC_LIBS) libbluez4-util.la
-module_bluez4_device_la_CFLAGS = $(AM_CFLAGS) $(DBUS_CFLAGS) $(SBC_CFLAGS)
+module_bluetooth_discover_la_CFLAGS = $(AM_CFLAGS) -DPA_MODULE_NAME=module_bluetooth_discover
 
 # Bluetooth BlueZ 5 sink / source
 libbluez5_util_la_SOURCES = \
 		modules/bluetooth/bluez5-util.c \
 		modules/bluetooth/bluez5-util.h \
-		modules/bluetooth/a2dp-codecs.h
+		modules/bluetooth/a2dp-codec-api.h \
+		modules/bluetooth/a2dp-codec-util.c \
+		modules/bluetooth/a2dp-codec-util.h \
+		modules/bluetooth/a2dp-codecs.h \
+		modules/bluetooth/rtp.h
 if HAVE_BLUEZ_5_OFONO_HEADSET
 libbluez5_util_la_SOURCES += \
 		modules/bluetooth/backend-ofono.c
@@ -2179,33 +2170,44 @@ endif
 libbluez5_util_la_LDFLAGS = -avoid-version
 libbluez5_util_la_LIBADD = $(MODULE_LIBADD) $(DBUS_LIBS)
 libbluez5_util_la_CFLAGS = $(AM_CFLAGS) $(DBUS_CFLAGS)
+libbluez5_util_la_CPPFLAGS = $(AM_CPPFLAGS)
+
+libbluez5_util_la_SOURCES += modules/bluetooth/a2dp-codec-sbc.c
+libbluez5_util_la_LIBADD += $(SBC_LIBS)
+libbluez5_util_la_CFLAGS += $(SBC_CFLAGS)
 
 module_bluez5_discover_la_SOURCES = modules/bluetooth/module-bluez5-discover.c
 module_bluez5_discover_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_bluez5_discover_la_LIBADD = $(MODULE_LIBADD) $(DBUS_LIBS) libbluez5-util.la
-module_bluez5_discover_la_CFLAGS = $(AM_CFLAGS) $(DBUS_CFLAGS)
+module_bluez5_discover_la_CFLAGS = $(AM_CFLAGS) $(DBUS_CFLAGS) -DPA_MODULE_NAME=module_bluez5_discover
 
 module_bluez5_device_la_SOURCES = modules/bluetooth/module-bluez5-device.c
 module_bluez5_device_la_LDFLAGS = $(MODULE_LDFLAGS)
-module_bluez5_device_la_LIBADD = $(MODULE_LIBADD) $(SBC_LIBS) libbluez5-util.la
-module_bluez5_device_la_CFLAGS = $(AM_CFLAGS) $(SBC_CFLAGS)
+module_bluez5_device_la_LIBADD = $(MODULE_LIBADD) libbluez5-util.la
+module_bluez5_device_la_CFLAGS = $(AM_CFLAGS) -DPA_MODULE_NAME=module_bluez5_device
 
 # Apple Airtunes/RAOP
 module_raop_sink_la_SOURCES = modules/raop/module-raop-sink.c
 module_raop_sink_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_raop_sink_la_LIBADD = $(MODULE_LIBADD) librtp.la libraop.la
-module_raop_sink_la_CFLAGS = $(AM_CFLAGS) -I$(top_srcdir)/src/modules/rtp
+module_raop_sink_la_CFLAGS = $(AM_CFLAGS) -I$(top_srcdir)/src/modules/rtp -DPA_MODULE_NAME=module_raop_sink
 
 module_raop_discover_la_SOURCES = modules/raop/module-raop-discover.c
 module_raop_discover_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_raop_discover_la_LIBADD = $(MODULE_LIBADD) $(AVAHI_LIBS) libavahi-wrap.la
-module_raop_discover_la_CFLAGS = $(AM_CFLAGS) $(AVAHI_CFLAGS)
+module_raop_discover_la_CFLAGS = $(AM_CFLAGS) $(AVAHI_CFLAGS) -DPA_MODULE_NAME=module_raop_discover
 
 # Rygel
 module_rygel_media_server_la_SOURCES = modules/module-rygel-media-server.c
 module_rygel_media_server_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_rygel_media_server_la_LIBADD = $(MODULE_LIBADD) $(DBUS_LIBS) libprotocol-http.la
-module_rygel_media_server_la_CFLAGS = $(AM_CFLAGS) $(DBUS_CFLAGS)
+module_rygel_media_server_la_CFLAGS = $(AM_CFLAGS) $(DBUS_CFLAGS) -DPA_MODULE_NAME=module_rygel_media_server
+
+# Allow passthrough module
+module_allow_passthrough_la_SOURCES = modules/module-allow-passthrough.c
+module_allow_passthrough_la_LDFLAGS = $(MODULE_LDFLAGS)
+module_allow_passthrough_la_LIBADD = $(MODULE_LIBADD)
+module_allow_passthrough_la_CFLAGS = $(AM_CFLAGS) -DPA_MODULE_NAME=module_allow_passthrough
 
 ###################################
 #        Some minor stuff         #
@@ -2273,7 +2275,10 @@ update-all: update-ffmpeg update-map-file
 # Isn't libtool/autotools fun!
 
 installlibLTLIBRARIES = install-libLTLIBRARIES
-$(installlibLTLIBRARIES): install-pkglibLTLIBRARIES
+$(installlibLTLIBRARIES): install-commonlibLTLIBRARIES
+
+installpkglibLTLIBRARIES = install-pkglibLTLIBRARIES
+$(installpkglibLTLIBRARIES): install-libLTLIBRARIES
 
 installmodlibexecLTLIBRARIES = install-modlibexecLTLIBRARIES
 $(installmodlibexecLTLIBRARIES): install-pkglibLTLIBRARIES install-libLTLIBRARIES

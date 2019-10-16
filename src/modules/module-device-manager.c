@@ -49,8 +49,6 @@
 #include <pulsecore/database.h>
 #include <pulsecore/tagstruct.h>
 
-#include "module-device-manager-symdef.h"
-
 PA_MODULE_AUTHOR("Colin Guthrie");
 PA_MODULE_DESCRIPTION("Keep track of devices (and their descriptions) both past and present and prioritise by role");
 PA_MODULE_VERSION(PACKAGE_VERSION);
@@ -292,8 +290,10 @@ static struct entry* entry_read(struct userdata *u, const char *name) {
 
     pa_zero(data);
 
-    if (!pa_database_get(u->database, &key, &data))
-        goto fail;
+    if (!pa_database_get(u->database, &key, &data)) {
+        pa_log_debug("Database contains no data for key: %s", name);
+        return NULL;
+    }
 
     t = pa_tagstruct_new_fixed(data.data, data.size);
     e = entry_new();
@@ -647,24 +647,31 @@ static void update_highest_priority_device_indexes(struct userdata *u, const cha
 }
 
 static void route_sink_input(struct userdata *u, pa_sink_input *si) {
+    const char *auto_filtered_prop;
     const char *role;
     uint32_t role_index, device_index;
+    bool auto_filtered = false;
     pa_sink *sink;
 
     pa_assert(u);
     pa_assert(u->do_routing);
 
-    if (si->save_sink)
+    /* Don't override user or application routing requests. */
+    if (si->save_sink || si->sink_requested_by_application)
         return;
 
     /* Skip this if it is already in the process of being moved anyway */
     if (!si->sink)
         return;
 
+    auto_filtered_prop = pa_proplist_gets(si->proplist, "module-device-manager.auto_filtered");
+    if (auto_filtered_prop)
+        auto_filtered = (pa_parse_boolean(auto_filtered_prop) == 1);
+
     /* It might happen that a stream and a sink are set up at the
     same time, in which case we want to make sure we don't
     interfere with that */
-    if (!PA_SINK_INPUT_IS_LINKED(pa_sink_input_get_state(si)))
+    if (!PA_SINK_INPUT_IS_LINKED(si->state))
         return;
 
     if (!(role = pa_proplist_gets(si->proplist, PA_PROP_MEDIA_ROLE)))
@@ -681,6 +688,13 @@ static void route_sink_input(struct userdata *u, pa_sink_input *si) {
 
     if (!(sink = pa_idxset_get_by_index(u->core->sinks, device_index)))
         return;
+
+    if (auto_filtered) {
+        /* For streams for which a filter has been loaded by another module, we
+         * do not try to execute moves within the same filter hierarchy */
+        if (pa_sink_get_master(si->sink) == pa_sink_get_master(sink))
+            return;
+    }
 
     if (si->sink != sink)
         pa_sink_input_move_to(si, sink, false);
@@ -705,14 +719,17 @@ static pa_hook_result_t route_sink_inputs(struct userdata *u, pa_sink *ignore_si
 }
 
 static void route_source_output(struct userdata *u, pa_source_output *so) {
+    const char *auto_filtered_prop;
     const char *role;
     uint32_t role_index, device_index;
+    bool auto_filtered = false;
     pa_source *source;
 
     pa_assert(u);
     pa_assert(u->do_routing);
 
-    if (so->save_source)
+    /* Don't override user or application routing requests. */
+    if (so->save_source || so->source_requested_by_application)
         return;
 
     if (so->direct_on_input)
@@ -722,10 +739,14 @@ static void route_source_output(struct userdata *u, pa_source_output *so) {
     if (!so->source)
         return;
 
+    auto_filtered_prop = pa_proplist_gets(so->proplist, "module-device-manager.auto_filtered");
+    if (auto_filtered_prop)
+        auto_filtered = (pa_parse_boolean(auto_filtered_prop) == 1);
+
     /* It might happen that a stream and a source are set up at the
     same time, in which case we want to make sure we don't
     interfere with that */
-    if (!PA_SOURCE_OUTPUT_IS_LINKED(pa_source_output_get_state(so)))
+    if (!PA_SOURCE_OUTPUT_IS_LINKED(so->state))
         return;
 
     if (!(role = pa_proplist_gets(so->proplist, PA_PROP_MEDIA_ROLE)))
@@ -742,6 +763,13 @@ static void route_source_output(struct userdata *u, pa_source_output *so) {
 
     if (!(source = pa_idxset_get_by_index(u->core->sources, device_index)))
         return;
+
+    if (auto_filtered) {
+        /* For streams for which a filter has been loaded by another module, we
+         * do not try to execute moves within the same filter hierarchy */
+        if (pa_source_get_master(so->source) == pa_source_get_master(source))
+            return;
+    }
 
     if (so->source != source)
         pa_source_output_move_to(so, source, false);
@@ -968,7 +996,7 @@ static pa_hook_result_t sink_input_new_hook_callback(pa_core *c, pa_sink_input_n
                 pa_sink *sink;
 
                 if ((sink = pa_idxset_get_by_index(u->core->sinks, device_index))) {
-                    if (!pa_sink_input_new_data_set_sink(new_data, sink, false))
+                    if (!pa_sink_input_new_data_set_sink(new_data, sink, false, false))
                         pa_log_debug("Not restoring device for stream because no supported format was found");
                 }
             }
@@ -1008,7 +1036,7 @@ static pa_hook_result_t source_output_new_hook_callback(pa_core *c, pa_source_ou
                 pa_source *source;
 
                 if ((source = pa_idxset_get_by_index(u->core->sources, device_index)))
-                    if (!pa_source_output_new_data_set_source(new_data, source, false))
+                    if (!pa_source_output_new_data_set_source(new_data, source, false, false))
                         pa_log_debug("Not restoring device for stream because no supported format was found");
             }
         }

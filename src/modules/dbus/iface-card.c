@@ -324,7 +324,9 @@ static void handle_get_active_profile(DBusConnection *conn, DBusMessage *msg, vo
 static void handle_set_active_profile(DBusConnection *conn, DBusMessage *msg, DBusMessageIter *iter, void *userdata) {
     pa_dbusiface_card *c = userdata;
     const char *new_active_path;
-    pa_dbusiface_card_profile *new_active;
+    pa_dbusiface_card_profile *profile;
+    void *state;
+    pa_dbusiface_card_profile *new_active = NULL;
     int r;
 
     pa_assert(conn);
@@ -334,7 +336,14 @@ static void handle_set_active_profile(DBusConnection *conn, DBusMessage *msg, DB
 
     dbus_message_iter_get_basic(iter, &new_active_path);
 
-    if (!(new_active = pa_hashmap_get(c->profiles, new_active_path))) {
+    PA_HASHMAP_FOREACH(profile, c->profiles, state) {
+        if (pa_streq(pa_dbusiface_card_profile_get_path(profile), new_active_path)) {
+            new_active = profile;
+            break;
+        }
+    }
+
+    if (!new_active) {
         pa_dbus_send_error(conn, msg, PA_DBUS_ERROR_NOT_FOUND, "%s: No such profile.", new_active_path);
         return;
     }
@@ -457,27 +466,27 @@ static void check_card_proplist(pa_dbusiface_card *c) {
 }
 
 static pa_hook_result_t card_profile_changed_cb(void *hook_data, void *call_data, void *slot_data) {
-    pa_dbusiface_card *c = slot_data;
-    pa_card_profile *profile = call_data;
+    pa_dbusiface_card *dbus_card = slot_data;
+    pa_card *core_card = call_data;
     const char *object_path;
     DBusMessage *signal_msg;
 
-    if (profile->card != c->card)
+    if (dbus_card->card != core_card)
         return PA_HOOK_OK;
 
-    c->active_profile = c->card->active_profile;
+    dbus_card->active_profile = dbus_card->card->active_profile;
 
-    object_path = pa_dbusiface_card_profile_get_path(pa_hashmap_get(c->profiles, c->active_profile->name));
+    object_path = pa_dbusiface_card_profile_get_path(pa_hashmap_get(dbus_card->profiles, dbus_card->active_profile->name));
 
-    pa_assert_se(signal_msg = dbus_message_new_signal(c->path,
+    pa_assert_se(signal_msg = dbus_message_new_signal(dbus_card->path,
                                                       PA_DBUSIFACE_CARD_INTERFACE,
                                                       signals[SIGNAL_ACTIVE_PROFILE_UPDATED].name));
     pa_assert_se(dbus_message_append_args(signal_msg, DBUS_TYPE_OBJECT_PATH, &object_path, DBUS_TYPE_INVALID));
 
-    pa_dbus_protocol_send_signal(c->dbus_protocol, signal_msg);
+    pa_dbus_protocol_send_signal(dbus_card->dbus_protocol, signal_msg);
     dbus_message_unref(signal_msg);
 
-    check_card_proplist(c);
+    check_card_proplist(dbus_card);
 
     return PA_HOOK_OK;
 }

@@ -23,8 +23,7 @@
 
 #include <inttypes.h>
 
-typedef struct pa_sink_input pa_sink_input;
-
+#include <pulsecore/typedefs.h>
 #include <pulse/sample.h>
 #include <pulse/format.h>
 #include <pulsecore/memblockq.h>
@@ -36,7 +35,6 @@ typedef struct pa_sink_input pa_sink_input;
 
 typedef enum pa_sink_input_state {
     PA_SINK_INPUT_INIT,         /*< The stream is not active yet, because pa_sink_input_put() has not been called yet */
-    PA_SINK_INPUT_DRAINED,      /*< The stream stopped playing because there was no data to play */
     PA_SINK_INPUT_RUNNING,      /*< The stream is alive and kicking */
     PA_SINK_INPUT_CORKED,       /*< The stream was corked on user request */
     PA_SINK_INPUT_UNLINKED      /*< The stream is dead */
@@ -44,7 +42,7 @@ typedef enum pa_sink_input_state {
 } pa_sink_input_state_t;
 
 static inline bool PA_SINK_INPUT_IS_LINKED(pa_sink_input_state_t x) {
-    return x == PA_SINK_INPUT_DRAINED || x == PA_SINK_INPUT_RUNNING || x == PA_SINK_INPUT_CORKED;
+    return x == PA_SINK_INPUT_RUNNING || x == PA_SINK_INPUT_CORKED;
 }
 
 typedef enum pa_sink_input_flags {
@@ -68,9 +66,6 @@ struct pa_sink_input {
     uint32_t index;
     pa_core *core;
 
-    /* Please note that this state should only be read with
-     * pa_sink_input_get_state(). That function will transparently
-     * merge the thread_info.drained value in. */
     pa_sink_input_state_t state;
     pa_sink_input_flags_t flags;
 
@@ -81,6 +76,14 @@ struct pa_sink_input {
     pa_client *client;                  /* may be NULL */
 
     pa_sink *sink;                      /* NULL while we are being moved */
+
+    /* This is set to true when creating the sink input if the sink was
+     * requested by the application that created the sink input. This is
+     * sometimes useful for determining whether the sink input should be
+     * moved by some automatic policy. If the sink input is moved away from the
+     * sink that the application requested, this flag is reset to false. */
+    bool sink_requested_by_application;
+
     pa_sink *origin_sink;               /* only set by filter sinks */
 
     /* A sink input may be connected to multiple source outputs
@@ -176,8 +179,9 @@ struct pa_sink_input {
     void (*detach) (pa_sink_input *i);           /* may be NULL */
 
     /* If non-NULL called whenever the sink this input is attached
-     * to suspends or resumes. Called from main context */
-    void (*suspend) (pa_sink_input *i, bool b);   /* may be NULL */
+     * to suspends or resumes or if the suspend cause changes.
+     * Called from main context */
+    void (*suspend) (pa_sink_input *i, pa_sink_state_t old_state, pa_suspend_cause_t old_suspend_cause);   /* may be NULL */
 
     /* If non-NULL called whenever the sink this input is attached
      * to suspends or resumes. Called from IO context */
@@ -224,7 +228,6 @@ struct pa_sink_input {
 
     struct {
         pa_sink_input_state_t state;
-        pa_atomic_t drained;
 
         pa_cvolume soft_volume;
         bool muted:1;
@@ -285,6 +288,7 @@ typedef struct pa_sink_input_new_data {
     pa_client *client;
 
     pa_sink *sink;
+    bool sink_requested_by_application;
     pa_sink *origin_sink;
 
     pa_resample_method_t resample_method;
@@ -322,7 +326,7 @@ void pa_sink_input_new_data_set_volume(pa_sink_input_new_data *data, const pa_cv
 void pa_sink_input_new_data_add_volume_factor(pa_sink_input_new_data *data, const char *key, const pa_cvolume *volume_factor);
 void pa_sink_input_new_data_add_volume_factor_sink(pa_sink_input_new_data *data, const char *key, const pa_cvolume *volume_factor);
 void pa_sink_input_new_data_set_muted(pa_sink_input_new_data *data, bool mute);
-bool pa_sink_input_new_data_set_sink(pa_sink_input_new_data *data, pa_sink *s, bool save);
+bool pa_sink_input_new_data_set_sink(pa_sink_input_new_data *data, pa_sink *s, bool save, bool requested_by_application);
 bool pa_sink_input_new_data_set_formats(pa_sink_input_new_data *data, pa_idxset *formats);
 void pa_sink_input_new_data_done(pa_sink_input_new_data *data);
 
@@ -335,8 +339,6 @@ int pa_sink_input_new(
 
 void pa_sink_input_put(pa_sink_input *i);
 void pa_sink_input_unlink(pa_sink_input* i);
-
-void pa_sink_input_set_name(pa_sink_input *i, const char *name);
 
 pa_usec_t pa_sink_input_set_requested_latency(pa_sink_input *i, pa_usec_t usec);
 
@@ -352,7 +354,7 @@ void pa_sink_input_request_rewind(pa_sink_input *i, size_t nbytes, bool rewrite,
 void pa_sink_input_cork(pa_sink_input *i, bool b);
 
 int pa_sink_input_set_rate(pa_sink_input *i, uint32_t rate);
-int pa_sink_input_update_rate(pa_sink_input *i);
+int pa_sink_input_update_resampler(pa_sink_input *i);
 
 /* This returns the sink's fields converted into out sample type */
 size_t pa_sink_input_get_max_rewind(pa_sink_input *i);
@@ -374,6 +376,8 @@ pa_cvolume *pa_sink_input_get_volume(pa_sink_input *i, pa_cvolume *volume, bool 
 
 void pa_sink_input_set_mute(pa_sink_input *i, bool mute, bool save);
 
+void pa_sink_input_set_property(pa_sink_input *i, const char *key, const char *value);
+void pa_sink_input_set_property_arbitrary(pa_sink_input *i, const char *key, const uint8_t *value, size_t nbytes);
 void pa_sink_input_update_proplist(pa_sink_input *i, pa_update_mode_t mode, pa_proplist *p);
 
 pa_resample_method_t pa_sink_input_get_resample_method(pa_sink_input *i);
@@ -390,8 +394,6 @@ bool pa_sink_input_may_move_to(pa_sink_input *i, pa_sink *dest); /* may this sin
 int pa_sink_input_start_move(pa_sink_input *i);
 int pa_sink_input_finish_move(pa_sink_input *i, pa_sink *dest, bool save);
 void pa_sink_input_fail_move(pa_sink_input *i);
-
-pa_sink_input_state_t pa_sink_input_get_state(pa_sink_input *i);
 
 pa_usec_t pa_sink_input_get_requested_latency(pa_sink_input *i);
 
@@ -413,6 +415,31 @@ bool pa_sink_input_safe_to_remove(pa_sink_input *i);
 bool pa_sink_input_process_underrun(pa_sink_input *i);
 
 pa_memchunk* pa_sink_input_get_silence(pa_sink_input *i, pa_memchunk *ret);
+
+/* Calls the attach() callback if it's set. The input must be in detached
+ * state. */
+void pa_sink_input_attach(pa_sink_input *i);
+
+/* Calls the detach() callback if it's set and the input is attached. The input
+ * is allowed to be already detached, in which case this does nothing.
+ *
+ * The reason why this can be called for already-detached inputs is that when
+ * a filter sink's input is detached, it has to detach also all inputs
+ * connected to the filter sink. In case the filter sink's input was detached
+ * because the filter sink is being removed, those other inputs will be moved
+ * to another sink or removed, and moving and removing involve detaching the
+ * inputs, but the inputs at that point are already detached.
+ *
+ * XXX: Moving or removing an input also involves sending messages to the
+ * input's sink. If the input's sink is a detached filter sink, shouldn't
+ * sending messages to it be prohibited? The messages are processed in the
+ * root sink's IO thread, and when the filter sink is detached, it would seem
+ * logical to prohibit any interaction with the IO thread that isn't any more
+ * associated with the filter sink. Currently sending messages to detached
+ * filter sinks mostly works, because the filter sinks don't update their
+ * asyncmsgq pointer when detaching, so messages still find their way to the
+ * old IO thread. */
+void pa_sink_input_detach(pa_sink_input *i);
 
 /* Called from the main thread, from sink.c only. The normal way to set the
  * sink input volume is to call pa_sink_input_set_volume(), but the flat volume

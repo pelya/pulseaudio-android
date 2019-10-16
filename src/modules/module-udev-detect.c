@@ -36,8 +36,6 @@
 #include <pulsecore/ratelimit.h>
 #include <pulsecore/strbuf.h>
 
-#include "module-udev-detect-symdef.h"
-
 PA_MODULE_AUTHOR("Lennart Poettering");
 PA_MODULE_DESCRIPTION("Detect available audio hardware and load matching drivers");
 PA_MODULE_VERSION(PACKAGE_VERSION);
@@ -48,7 +46,8 @@ PA_MODULE_USAGE(
         "fixed_latency_range=<disable latency range changes on underrun?> "
         "ignore_dB=<ignore dB information from the device?> "
         "deferred_volume=<syncronize sw and hw volume changes in IO-thread?> "
-        "use_ucm=<use ALSA UCM for card configuration?>");
+        "use_ucm=<use ALSA UCM for card configuration?> "
+        "avoid_resampling=<use stream original sample rate if possible?>");
 
 struct device {
     char *path;
@@ -69,6 +68,7 @@ struct userdata {
     bool ignore_dB:1;
     bool deferred_volume:1;
     bool use_ucm:1;
+    bool avoid_resampling:1;
 
     uint32_t tsched_buffer_size;
 
@@ -87,6 +87,7 @@ static const char* const valid_modargs[] = {
     "ignore_dB",
     "deferred_volume",
     "use_ucm",
+    "avoid_resampling",
     NULL
 };
 
@@ -177,10 +178,8 @@ static bool is_card_busy(const char *id) {
     char *card_path = NULL, *pcm_path = NULL, *sub_status = NULL;
     DIR *card_dir = NULL, *pcm_dir = NULL;
     FILE *status_file = NULL;
-    size_t len;
-    struct dirent *space = NULL, *de;
+    struct dirent *de;
     bool busy = false;
-    int r;
 
     pa_assert(id);
 
@@ -194,14 +193,11 @@ static bool is_card_busy(const char *id) {
         goto fail;
     }
 
-    len = offsetof(struct dirent, d_name) + fpathconf(dirfd(card_dir), _PC_NAME_MAX) + 1;
-    space = pa_xmalloc(len);
-
     for (;;) {
-        de = NULL;
-
-        if ((r = readdir_r(card_dir, space, &de)) != 0) {
-            pa_log_warn("readdir_r() failed: %s", pa_cstrerror(r));
+        errno = 0;
+        de = readdir(card_dir);
+        if (!de && errno) {
+            pa_log_warn("readdir() failed: %s", pa_cstrerror(errno));
             goto fail;
         }
 
@@ -228,8 +224,10 @@ static bool is_card_busy(const char *id) {
         for (;;) {
             char line[32];
 
-            if ((r = readdir_r(pcm_dir, space, &de)) != 0) {
-                pa_log_warn("readdir_r() failed: %s", pa_cstrerror(r));
+            errno = 0;
+            de = readdir(pcm_dir);
+            if (!de && errno) {
+                pa_log_warn("readdir() failed: %s", pa_cstrerror(errno));
                 goto fail;
             }
 
@@ -267,7 +265,6 @@ fail:
     pa_xfree(card_path);
     pa_xfree(pcm_path);
     pa_xfree(sub_status);
-    pa_xfree(space);
 
     if (card_dir)
         closedir(card_dir);
@@ -336,7 +333,7 @@ static void verify_access(struct userdata *u, struct device *d) {
 
                 if (pa_ratelimit_test(&d->ratelimit, PA_LOG_DEBUG)) {
                     pa_log_debug("Loading module-alsa-card with arguments '%s'", d->args);
-                    m = pa_module_load(u->core, "module-alsa-card", d->args);
+                    pa_module_load(&m, u->core, "module-alsa-card", d->args);
 
                     if (m) {
                         d->module = m->index;
@@ -407,6 +404,7 @@ static void card_changed(struct userdata *u, struct udev_device *dev) {
                      "ignore_dB=%s "
                      "deferred_volume=%s "
                      "use_ucm=%s "
+                     "avoid_resampling=%s "
                      "card_properties=\"module-udev-detect.discovered=1\"",
                      path_get_card_id(path),
                      n,
@@ -415,7 +413,8 @@ static void card_changed(struct userdata *u, struct udev_device *dev) {
                      pa_yes_no(u->fixed_latency_range),
                      pa_yes_no(u->ignore_dB),
                      pa_yes_no(u->deferred_volume),
-                     pa_yes_no(u->use_ucm));
+                     pa_yes_no(u->use_ucm),
+                     pa_yes_no(u->avoid_resampling));
     pa_xfree(n);
 
     if (u->tsched_buffer_size_valid)
@@ -688,6 +687,7 @@ int pa__init(pa_module *m) {
     int fd;
     bool use_tsched = true, fixed_latency_range = false, ignore_dB = false, deferred_volume = m->core->deferred_volume;
     bool use_ucm = true;
+    bool avoid_resampling;
 
     pa_assert(m);
 
@@ -739,6 +739,13 @@ int pa__init(pa_module *m) {
         goto fail;
     }
     u->use_ucm = use_ucm;
+
+    avoid_resampling = m->core->avoid_resampling;
+    if (pa_modargs_get_value_boolean(ma, "avoid_resampling", &avoid_resampling) < 0) {
+        pa_log("Failed to parse avoid_resampling= argument.");
+        goto fail;
+    }
+    u->avoid_resampling = avoid_resampling;
 
     if (!(u->udev = udev_new())) {
         pa_log("Failed to initialize udev library.");

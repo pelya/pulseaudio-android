@@ -35,9 +35,10 @@
 #include <pulsecore/modargs.h>
 #include <pulsecore/proplist-util.h>
 
-#include "module-filter-apply-symdef.h"
-
-#define PA_PROP_FILTER_APPLY_MOVING "filter.apply.moving"
+#define PA_PROP_FILTER_APPLY_PARAMETERS PA_PROP_FILTER_APPLY".%s.parameters"
+#define PA_PROP_FILTER_APPLY_MOVING     "filter.apply.moving"
+#define PA_PROP_FILTER_APPLY_SET_BY_MFA "filter.apply.set_by_mfa"
+#define PA_PROP_MDM_AUTO_FILTERED       "module-device-manager.auto_filtered"
 
 PA_MODULE_AUTHOR("Colin Guthrie");
 PA_MODULE_DESCRIPTION("Load filter sinks automatically when needed");
@@ -55,6 +56,7 @@ static const char* const valid_modargs[] = {
 
 struct filter {
     char *name;
+    char *parameters;
     uint32_t module_index;
     pa_sink *sink;
     pa_sink *sink_master;
@@ -65,6 +67,10 @@ struct filter {
 struct userdata {
     pa_core *core;
     pa_hashmap *filters;
+    /* Keep track of streams we're managing PA_PROP_MDM_AUTO_FILTERED on, we're
+     * only maintaining membership, so key and value are just the
+     * pa_sink_input/pa_source_output. */
+    pa_hashmap *mdm_ignored_inputs, *mdm_ignored_outputs;
     bool autoclean;
     pa_time_event *housekeeping_time_event;
 };
@@ -92,13 +98,14 @@ static int filter_compare(const void *a, const void *b) {
     return 0;
 }
 
-static struct filter *filter_new(const char *name, pa_sink *sink, pa_source *source) {
+static struct filter *filter_new(const char *name, const char *parameters, pa_sink *sink, pa_source *source) {
     struct filter *f;
 
     pa_assert(sink || source);
 
     f = pa_xnew(struct filter, 1);
     f->name = pa_xstrdup(name);
+    f->parameters = pa_xstrdup(parameters);
     f->sink_master = sink;
     f->source_master = source;
     f->module_index = PA_INVALID_INDEX;
@@ -109,13 +116,14 @@ static struct filter *filter_new(const char *name, pa_sink *sink, pa_source *sou
 }
 
 static void filter_free(struct filter *f) {
-    pa_assert(f);
-
-    pa_xfree(f->name);
-    pa_xfree(f);
+    if (f) {
+        pa_xfree(f->name);
+        pa_xfree(f->parameters);
+        pa_xfree(f);
+    }
 }
 
-static const char* should_filter(pa_object *o, bool is_sink_input) {
+static const char* get_filter_name(pa_object *o, bool is_sink_input) {
     const char *apply;
     pa_proplist *pl;
 
@@ -124,12 +132,90 @@ static const char* should_filter(pa_object *o, bool is_sink_input) {
     else
         pl = PA_SOURCE_OUTPUT(o)->proplist;
 
-    /* If the stream doesn't what any filter, then let it be. */
+    /* If the stream doesn't want any filter, then let it be. */
     if ((apply = pa_proplist_gets(pl, PA_PROP_FILTER_APPLY)) && !pa_streq(apply, "")) {
         const char* suppress = pa_proplist_gets(pl, PA_PROP_FILTER_SUPPRESS);
 
         if (!suppress || !pa_streq(suppress, apply))
             return apply;
+    }
+
+    return NULL;
+}
+
+static const char* get_filter_parameters(pa_object *o, const char *want, bool is_sink_input) {
+    const char *parameters;
+    char *prop_parameters;
+    pa_proplist *pl;
+
+    if (is_sink_input)
+        pl = PA_SINK_INPUT(o)->proplist;
+    else
+        pl = PA_SOURCE_OUTPUT(o)->proplist;
+
+    prop_parameters = pa_sprintf_malloc(PA_PROP_FILTER_APPLY_PARAMETERS, want);
+    parameters = pa_proplist_gets(pl, prop_parameters);
+    pa_xfree(prop_parameters);
+
+    return parameters;
+}
+
+/* This function is used to set or unset the filter related stream properties. This is necessary
+ * if a stream does not have filter.apply set and is manually moved to a filter sink or source.
+ * In this case, the properties must be temporarily set and removed when the stream is moved away
+ * from the filter. */
+static void set_filter_properties(pa_proplist *pl, struct filter *filter, bool set_properties) {
+    char *prop_parameters;
+
+    if (set_properties) {
+        pa_assert(filter);
+
+        pa_proplist_sets(pl, PA_PROP_FILTER_APPLY, filter->name);
+
+        if (filter->parameters) {
+            prop_parameters = pa_sprintf_malloc(PA_PROP_FILTER_APPLY_PARAMETERS, filter->name);
+            pa_proplist_sets(pl, prop_parameters, filter->parameters);
+            pa_xfree(prop_parameters);
+        }
+
+        pa_proplist_sets(pl, PA_PROP_FILTER_APPLY_SET_BY_MFA, "1");
+
+    } else {
+        const char *old_filter_name = NULL;
+
+        if (filter)
+            old_filter_name = filter->name;
+        else
+            old_filter_name = pa_proplist_gets(pl, PA_PROP_FILTER_APPLY);
+
+        /* If the filter name cannot be determined, properties cannot be removed. */
+        if (!old_filter_name)
+            return;
+
+        prop_parameters = pa_sprintf_malloc(PA_PROP_FILTER_APPLY_PARAMETERS, old_filter_name);
+        pa_proplist_unset(pl, prop_parameters);
+        pa_xfree(prop_parameters);
+
+        pa_proplist_unset(pl, PA_PROP_FILTER_APPLY);
+        pa_proplist_unset(pl, PA_PROP_FILTER_APPLY_SET_BY_MFA);
+    }
+}
+
+static struct filter* get_filter_for_object(struct userdata *u, pa_object *o, bool is_sink_input) {
+    pa_sink *sink = NULL;
+    pa_source *source = NULL;
+    struct filter *filter = NULL;
+    void *state;
+
+    if (is_sink_input)
+        sink = PA_SINK_INPUT(o)->sink;
+    else
+        source = PA_SOURCE_OUTPUT(o)->source;
+
+    PA_HASHMAP_FOREACH(filter, u->filters, state) {
+        if ((is_sink_input && sink == filter->sink) || (!is_sink_input && source == filter->source)) {
+            return filter;
+        }
     }
 
     return NULL;
@@ -173,6 +259,12 @@ static bool find_paired_master(struct userdata *u, struct filter *filter, pa_obj
 
                 if (pa_streq(g, group)) {
                     if (pa_streq(module_name, so->source->module->name)) {
+                        /* Make sure we are not routing to the monitor source
+                         * of the same filter */
+                        if (so->source->monitor_of) {
+                            pa_xfree(g);
+                            continue;
+                        }
                         /* Make sure we're not routing to another instance of
                          * the same filter. */
                         filter->source_master = so->source->output_from_master->source;
@@ -270,14 +362,20 @@ static void trigger_housekeeping(struct userdata *u) {
     u->housekeeping_time_event = pa_core_rttime_new(u->core, pa_rtclock_now() + HOUSEKEEPING_INTERVAL, housekeeping_time_callback, u);
 }
 
-static int do_move(pa_object *obj, pa_object *parent, bool restore, bool is_input) {
-    if (is_input)
-        return pa_sink_input_move_to(PA_SINK_INPUT(obj), PA_SINK(parent), restore);
-    else
-        return pa_source_output_move_to(PA_SOURCE_OUTPUT(obj), PA_SOURCE(parent), restore);
+static int do_move(struct userdata *u, pa_object *obj, pa_object *parent, bool is_input) {
+    /* Keep track of objects that we've marked for module-device-manager to ignore */
+    pa_hashmap_put(is_input ? u->mdm_ignored_inputs : u->mdm_ignored_outputs, obj, obj);
+
+    if (is_input) {
+        pa_sink_input_set_property(PA_SINK_INPUT(obj), PA_PROP_MDM_AUTO_FILTERED, "1");
+        return pa_sink_input_move_to(PA_SINK_INPUT(obj), PA_SINK(parent), false);
+    } else {
+        pa_source_output_set_property(PA_SOURCE_OUTPUT(obj), PA_PROP_MDM_AUTO_FILTERED, "1");
+        return pa_source_output_move_to(PA_SOURCE_OUTPUT(obj), PA_SOURCE(parent), false);
+    }
 }
 
-static void move_object_for_filter(pa_object *o, struct filter* filter, bool restore, bool is_sink_input) {
+static void move_object_for_filter(struct userdata *u, pa_object *o, struct filter *filter, bool restore, bool is_sink_input) {
     pa_object *parent;
     pa_proplist *pl;
     const char *name;
@@ -301,7 +399,7 @@ static void move_object_for_filter(pa_object *o, struct filter* filter, bool res
 
     pa_proplist_sets(pl, PA_PROP_FILTER_APPLY_MOVING, "1");
 
-    if (do_move(o, parent, false, is_sink_input) < 0)
+    if (do_move(u, o, parent, is_sink_input) < 0)
         pa_log_info("Failed to move %s for \"%s\" to <%s>.", is_sink_input ? "sink-input" : "source-output",
                     pa_strnull(pa_proplist_gets(pl, PA_PROP_APPLICATION_NAME)), name);
     else
@@ -311,11 +409,11 @@ static void move_object_for_filter(pa_object *o, struct filter* filter, bool res
     pa_proplist_unset(pl, PA_PROP_FILTER_APPLY_MOVING);
 }
 
-static void move_objects_for_filter(struct userdata *u, pa_object *o, struct filter* filter, bool restore,
+static void move_objects_for_filter(struct userdata *u, pa_object *o, struct filter *filter, bool restore,
         bool is_sink_input) {
 
     if (!should_group_filter(filter))
-        move_object_for_filter(o, filter, restore, is_sink_input);
+        move_object_for_filter(u, o, filter, restore, is_sink_input);
     else {
         pa_source_output *so;
         pa_sink_input *si;
@@ -328,7 +426,7 @@ static void move_objects_for_filter(struct userdata *u, pa_object *o, struct fil
             g = get_group(PA_OBJECT(so), false);
 
             if (pa_streq(g, group))
-                move_object_for_filter(PA_OBJECT(so), filter, restore, false);
+                move_object_for_filter(u, PA_OBJECT(so), filter, restore, false);
 
             pa_xfree(g);
         }
@@ -337,7 +435,7 @@ static void move_objects_for_filter(struct userdata *u, pa_object *o, struct fil
             g = get_group(PA_OBJECT(si), true);
 
             if (pa_streq(g, group))
-                move_object_for_filter(PA_OBJECT(si), filter, restore, true);
+                move_object_for_filter(u, PA_OBJECT(si), filter, restore, true);
 
             pa_xfree(g);
         }
@@ -348,7 +446,7 @@ static void move_objects_for_filter(struct userdata *u, pa_object *o, struct fil
 
 /* Note that we assume a filter will provide at most one sink and at most one
  * source (and at least one of either). */
-static void find_filters_for_module(struct userdata *u, pa_module *m, const char *name) {
+static void find_filters_for_module(struct userdata *u, pa_module *m, const char *name, const char *parameters) {
     uint32_t idx;
     pa_sink *sink;
     pa_source *source;
@@ -358,7 +456,7 @@ static void find_filters_for_module(struct userdata *u, pa_module *m, const char
         if (sink->module == m) {
             pa_assert(pa_sink_is_filter(sink));
 
-            fltr = filter_new(name, sink->input_to_master->sink, NULL);
+            fltr = filter_new(name, parameters, sink->input_to_master->sink, NULL);
             fltr->module_index = m->index;
             fltr->sink = sink;
 
@@ -371,7 +469,7 @@ static void find_filters_for_module(struct userdata *u, pa_module *m, const char
             pa_assert(pa_source_is_filter(source));
 
             if (!fltr) {
-                fltr = filter_new(name, NULL, source->output_from_master->source);
+                fltr = filter_new(name, parameters, NULL, source->output_from_master->source);
                 fltr->module_index = m->index;
                 fltr->source = source;
             } else {
@@ -399,82 +497,99 @@ static bool can_unload_module(struct userdata *u, uint32_t idx) {
     return true;
 }
 
-static pa_hook_result_t process(struct userdata *u, pa_object *o, bool is_sink_input) {
+static pa_hook_result_t process(struct userdata *u, pa_object *o, bool is_sink_input, bool is_property_change) {
     const char *want;
+    const char *parameters;
     bool done_something = false;
     pa_sink *sink = NULL;
     pa_source *source = NULL;
     pa_module *module = NULL;
+    char *module_name = NULL;
+    struct filter *fltr = NULL, *filter = NULL;
+    pa_proplist *pl;
 
     if (is_sink_input) {
-        sink = PA_SINK_INPUT(o)->sink;
-
-        if (sink)
+        if ((sink = PA_SINK_INPUT(o)->sink))
             module = sink->module;
+        pl = PA_SINK_INPUT(o)->proplist;
     } else {
-        source = PA_SOURCE_OUTPUT(o)->source;
-
-        if (source)
+        if ((source = PA_SOURCE_OUTPUT(o)->source))
             module = source->module;
+        pl = PA_SOURCE_OUTPUT(o)->proplist;
     }
 
     /* If there is no sink/source yet, we can't do much */
     if ((is_sink_input && !sink) || (!is_sink_input && !source))
-        return PA_HOOK_OK;
+        goto done;
 
-    /* If the stream doesn't what any filter, then let it be. */
-    if ((want = should_filter(o, is_sink_input))) {
-        char *module_name;
-        struct filter *fltr, *filter;
-
+    /* If the stream doesn't want any filter, then let it be. */
+    if ((want = get_filter_name(o, is_sink_input))) {
         /* We need to ensure the SI is playing on a sink of this type
          * attached to the sink it's "officially" playing on */
 
         if (!module)
-            return PA_HOOK_OK;
+            goto done;
 
         module_name = pa_sprintf_malloc("module-%s", want);
         if (pa_streq(module->name, module_name)) {
             pa_log_debug("Stream appears to be playing on an appropriate sink already. Ignoring.");
-            pa_xfree(module_name);
-            return PA_HOOK_OK;
+            goto done;
         }
 
-        fltr = filter_new(want, sink, source);
+        /* If the stream originally did not have the filter.apply property set and is
+         * manually moved away from the filter, remove the filter properties from the
+         * stream */
+        if (pa_proplist_gets(pl, PA_PROP_FILTER_APPLY_SET_BY_MFA)) {
+
+            set_filter_properties(pl, NULL, false);
+
+            /* If the new sink/source is also a filter, the stream has been moved from
+             * one filter to another, so add the properties for the new filter. */
+            if ((filter = get_filter_for_object(u, o, is_sink_input)))
+                set_filter_properties(pl, filter, true);
+
+            done_something = true;
+            goto done;
+        }
+
+        /* The stream needs be moved to a filter. */
+
+        /* Some filter modules might require parameters by default.
+         * (e.g 'plugin', 'label', 'control' of module-ladspa-sink) */
+        parameters = get_filter_parameters(o, want, is_sink_input);
+
+        fltr = filter_new(want, parameters, sink, source);
 
         if (should_group_filter(fltr) && !find_paired_master(u, fltr, o, is_sink_input)) {
             pa_log_debug("Want group filtering but don't have enough streams.");
-            return PA_HOOK_OK;
+            goto done;
         }
 
         if (!(filter = pa_hashmap_get(u->filters, fltr))) {
             char *args;
             pa_module *m;
 
-            args = pa_sprintf_malloc("autoloaded=1 %s%s %s%s",
+            args = pa_sprintf_malloc("autoloaded=1 %s%s %s%s %s",
                     fltr->sink_master ? "sink_master=" : "",
                     fltr->sink_master ? fltr->sink_master->name : "",
                     fltr->source_master ? "source_master=" : "",
-                    fltr->source_master ? fltr->source_master->name : "");
+                    fltr->source_master ? fltr->source_master->name : "",
+                    fltr->parameters ? fltr->parameters : "");
 
             pa_log_debug("Loading %s with arguments '%s'", module_name, args);
 
-            if ((m = pa_module_load(u->core, module_name, args))) {
-                find_filters_for_module(u, m, want);
+            if (pa_module_load(&m, u->core, module_name, args) >= 0) {
+                find_filters_for_module(u, m, want, parameters);
                 filter = pa_hashmap_get(u->filters, fltr);
                 done_something = true;
             }
             pa_xfree(args);
         }
 
-        pa_xfree(fltr);
-
         if (!filter) {
             pa_log("Unable to load %s", module_name);
-            pa_xfree(module_name);
-            return PA_HOOK_OK;
+            goto done;
         }
-        pa_xfree(module_name);
 
         /* We can move the stream now as we know the destination. If this
          * isn't true, we will do it later when the sink appears. */
@@ -483,22 +598,30 @@ static pa_hook_result_t process(struct userdata *u, pa_object *o, bool is_sink_i
             done_something = true;
         }
     } else {
-        void *state;
-        struct filter *filter = NULL;
+        /* The filter.apply property is not set. If the stream is nevertheless using a
+         * filter sink/source, it either has been moved to the filter manually or the
+         * user just removed the filter.apply property. */
 
-        /* We do not want to filter... but are we already filtered?
-         * This can happen if an input's proplist changes */
-        PA_HASHMAP_FOREACH(filter, u->filters, state) {
-            if ((is_sink_input && sink == filter->sink) || (!is_sink_input && source == filter->source)) {
+        if ((filter = get_filter_for_object(u, o, is_sink_input))) {
+            if (is_property_change) {
+                /* 'filter.apply' has been manually unset. Do restore. */
                 move_objects_for_filter(u, o, filter, true, is_sink_input);
+                set_filter_properties(pl, filter, false);
                 done_something = true;
-                break;
+            } else {
+                /* Stream has been manually moved to a filter sink/source
+                 * without 'filter.apply' set. Leave sink as it is. */
+                set_filter_properties(pl, filter, true);
             }
         }
     }
 
+done:
     if (done_something)
         trigger_housekeeping(u);
+
+    pa_xfree(module_name);
+    filter_free(fltr);
 
     return PA_HOOK_OK;
 }
@@ -507,7 +630,7 @@ static pa_hook_result_t sink_input_put_cb(pa_core *core, pa_sink_input *i, struc
     pa_core_assert_ref(core);
     pa_sink_input_assert_ref(i);
 
-    return process(u, PA_OBJECT(i), true);
+    return process(u, PA_OBJECT(i), true, false);
 }
 
 static pa_hook_result_t sink_input_move_finish_cb(pa_core *core, pa_sink_input *i, struct userdata *u) {
@@ -517,14 +640,22 @@ static pa_hook_result_t sink_input_move_finish_cb(pa_core *core, pa_sink_input *
     if (pa_proplist_gets(i->proplist, PA_PROP_FILTER_APPLY_MOVING))
         return PA_HOOK_OK;
 
-    return process(u, PA_OBJECT(i), true);
+    /* If we're managing m-d-m.auto_filtered on this, remove and re-add if we're continuing to manage it */
+    pa_hashmap_remove(u->mdm_ignored_inputs, i);
+
+    return process(u, PA_OBJECT(i), true, false);
 }
 
 static pa_hook_result_t sink_input_proplist_cb(pa_core *core, pa_sink_input *i, struct userdata *u) {
     pa_core_assert_ref(core);
     pa_sink_input_assert_ref(i);
 
-    return process(u, PA_OBJECT(i), true);
+    /* Eliminate nested and redundant hook event that is triggered by
+       pa_sink_input_set_property() in do_move(). */
+    if (pa_proplist_gets(i->proplist, PA_PROP_FILTER_APPLY_MOVING))
+        return PA_HOOK_OK;
+
+    return process(u, PA_OBJECT(i), true, true);
 }
 
 static pa_hook_result_t sink_input_unlink_cb(pa_core *core, pa_sink_input *i, struct userdata *u) {
@@ -535,6 +666,8 @@ static pa_hook_result_t sink_input_unlink_cb(pa_core *core, pa_sink_input *i, st
 
     if (pa_hashmap_size(u->filters) > 0)
         trigger_housekeeping(u);
+
+    pa_hashmap_remove(u->mdm_ignored_inputs, i);
 
     return PA_HOOK_OK;
 }
@@ -579,7 +712,7 @@ static pa_hook_result_t source_output_put_cb(pa_core *core, pa_source_output *o,
     pa_core_assert_ref(core);
     pa_source_output_assert_ref(o);
 
-    return process(u, PA_OBJECT(o), false);
+    return process(u, PA_OBJECT(o), false, false);
 }
 
 static pa_hook_result_t source_output_move_finish_cb(pa_core *core, pa_source_output *o, struct userdata *u) {
@@ -589,14 +722,22 @@ static pa_hook_result_t source_output_move_finish_cb(pa_core *core, pa_source_ou
     if (pa_proplist_gets(o->proplist, PA_PROP_FILTER_APPLY_MOVING))
         return PA_HOOK_OK;
 
-    return process(u, PA_OBJECT(o), false);
+    /* If we're managing m-d-m.auto_filtered on this, remove and re-add if we're continuing to manage it */
+    pa_hashmap_remove(u->mdm_ignored_outputs, o);
+
+    return process(u, PA_OBJECT(o), false, false);
 }
 
 static pa_hook_result_t source_output_proplist_cb(pa_core *core, pa_source_output *o, struct userdata *u) {
     pa_core_assert_ref(core);
     pa_source_output_assert_ref(o);
 
-    return process(u, PA_OBJECT(o), false);
+    /* Eliminate nested and redundant hook event that is triggered by
+       pa_source_output_set_property() in do_move(). */
+    if (pa_proplist_gets(o->proplist, PA_PROP_FILTER_APPLY_MOVING))
+        return PA_HOOK_OK;
+
+    return process(u, PA_OBJECT(o), false, true);
 }
 
 static pa_hook_result_t source_output_unlink_cb(pa_core *core, pa_source_output *o, struct userdata *u) {
@@ -607,6 +748,8 @@ static pa_hook_result_t source_output_unlink_cb(pa_core *core, pa_source_output 
 
     if (pa_hashmap_size(u->filters) > 0)
         trigger_housekeeping(u);
+
+    pa_hashmap_remove(u->mdm_ignored_outputs, o);
 
     return PA_HOOK_OK;
 }
@@ -647,6 +790,16 @@ static pa_hook_result_t source_unlink_cb(pa_core *core, pa_source *source, struc
     return PA_HOOK_OK;
 }
 
+static void unset_mdm_ignore_input(pa_sink_input *i)
+{
+    pa_sink_input_set_property(i, PA_PROP_MDM_AUTO_FILTERED, NULL);
+}
+
+static void unset_mdm_ignore_output(pa_source_output *o)
+{
+    pa_source_output_set_property(o, PA_PROP_MDM_AUTO_FILTERED, NULL);
+}
+
 int pa__init(pa_module *m) {
     pa_modargs *ma = NULL;
     struct userdata *u;
@@ -669,6 +822,8 @@ int pa__init(pa_module *m) {
     }
 
     u->filters = pa_hashmap_new(filter_hash, filter_compare);
+    u->mdm_ignored_inputs = pa_hashmap_new_full(NULL, NULL, (pa_free_cb_t) unset_mdm_ignore_input, NULL);
+    u->mdm_ignored_outputs = pa_hashmap_new_full(NULL, NULL, (pa_free_cb_t) unset_mdm_ignore_output, NULL);
 
     pa_module_hook_connect(m, &m->core->hooks[PA_CORE_HOOK_SINK_INPUT_PUT], PA_HOOK_LATE, (pa_hook_cb_t) sink_input_put_cb, u);
     pa_module_hook_connect(m, &m->core->hooks[PA_CORE_HOOK_SINK_INPUT_MOVE_FINISH], PA_HOOK_LATE, (pa_hook_cb_t) sink_input_move_finish_cb, u);
@@ -715,6 +870,12 @@ void pa__done(pa_module *m) {
 
         pa_hashmap_free(u->filters);
     }
+
+    if (u->mdm_ignored_inputs)
+        pa_hashmap_free(u->mdm_ignored_inputs);
+
+    if (u->mdm_ignored_outputs)
+        pa_hashmap_free(u->mdm_ignored_outputs);
 
     pa_xfree(u);
 }

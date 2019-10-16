@@ -30,6 +30,7 @@ typedef struct pa_memblock pa_memblock;
 #include <pulse/xmalloc.h>
 #include <pulsecore/atomic.h>
 #include <pulsecore/memchunk.h>
+#include <pulsecore/mem.h>
 
 /* A pa_memblock is a reference counted memory block. PulseAudio
  * passes references to pa_memblocks around instead of copying
@@ -116,32 +117,43 @@ void *pa_memblock_acquire_chunk(const pa_memchunk *c);
 void pa_memblock_release(pa_memblock *b);
 
 size_t pa_memblock_get_length(pa_memblock *b);
+
+/* Note! Always unref the returned pool after use */
 pa_mempool * pa_memblock_get_pool(pa_memblock *b);
 
 pa_memblock *pa_memblock_will_need(pa_memblock *b);
 
 /* The memory block manager */
-pa_mempool* pa_mempool_new(bool shared, size_t size);
-void pa_mempool_free(pa_mempool *p);
+pa_mempool *pa_mempool_new(pa_mem_type_t type, size_t size, bool per_client);
+void pa_mempool_unref(pa_mempool *p);
+pa_mempool* pa_mempool_ref(pa_mempool *p);
 const pa_mempool_stat* pa_mempool_get_stat(pa_mempool *p);
 void pa_mempool_vacuum(pa_mempool *p);
 int pa_mempool_get_shm_id(pa_mempool *p, uint32_t *id);
 bool pa_mempool_is_shared(pa_mempool *p);
+bool pa_mempool_is_memfd_backed(const pa_mempool *p);
+bool pa_mempool_is_global(pa_mempool *p);
+bool pa_mempool_is_per_client(pa_mempool *p);
 bool pa_mempool_is_remote_writable(pa_mempool *p);
 void pa_mempool_set_is_remote_writable(pa_mempool *p, bool writable);
 size_t pa_mempool_block_size_max(pa_mempool *p);
 
+int pa_mempool_take_memfd_fd(pa_mempool *p);
+int pa_mempool_get_memfd_fd(pa_mempool *p);
+
 /* For receiving blocks from other nodes */
 pa_memimport* pa_memimport_new(pa_mempool *p, pa_memimport_release_cb_t cb, void *userdata);
 void pa_memimport_free(pa_memimport *i);
-pa_memblock* pa_memimport_get(pa_memimport *i, uint32_t block_id, uint32_t shm_id,
-                              size_t offset, size_t size, bool writable);
+int pa_memimport_attach_memfd(pa_memimport *i, uint32_t shm_id, int memfd_fd, bool writable);
+pa_memblock* pa_memimport_get(pa_memimport *i, pa_mem_type_t type, uint32_t block_id,
+                              uint32_t shm_id, size_t offset, size_t size, bool writable);
 int pa_memimport_process_revoke(pa_memimport *i, uint32_t block_id);
 
 /* For sending blocks to other nodes */
 pa_memexport* pa_memexport_new(pa_mempool *p, pa_memexport_revoke_cb_t cb, void *userdata);
 void pa_memexport_free(pa_memexport *e);
-int pa_memexport_put(pa_memexport *e, pa_memblock *b, uint32_t *block_id, uint32_t *shm_id, size_t *offset, size_t *size);
+int pa_memexport_put(pa_memexport *e, pa_memblock *b, pa_mem_type_t *type, uint32_t *block_id,
+                     uint32_t *shm_id, size_t *offset, size_t * size);
 int pa_memexport_process_release(pa_memexport *e, uint32_t id);
 
 #endif

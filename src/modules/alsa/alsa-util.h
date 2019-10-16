@@ -21,7 +21,7 @@
   along with PulseAudio; if not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <asoundlib.h>
+#include <alsa/asoundlib.h>
 
 #include <pulse/sample.h>
 #include <pulse/channelmap.h>
@@ -132,6 +132,7 @@ char *pa_alsa_get_driver_name_by_pcm(snd_pcm_t *pcm);
 char *pa_alsa_get_reserve_name(const char *device);
 
 unsigned int *pa_alsa_get_supported_rates(snd_pcm_t *pcm, unsigned int fallback_rate);
+pa_sample_format_t *pa_alsa_get_supported_formats(snd_pcm_t *pcm, pa_sample_format_t fallback_format);
 
 bool pa_alsa_pcm_is_hw(snd_pcm_t *pcm);
 bool pa_alsa_pcm_is_modem(snd_pcm_t *pcm);

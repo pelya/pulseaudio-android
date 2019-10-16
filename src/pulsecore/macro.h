@@ -44,17 +44,6 @@
 #endif
 #endif
 
-#if defined(PAGE_SIZE)
-#define PA_PAGE_SIZE ((size_t) PAGE_SIZE)
-#elif defined(PAGESIZE)
-#define PA_PAGE_SIZE ((size_t) PAGESIZE)
-#elif defined(HAVE_SYSCONF)
-#define PA_PAGE_SIZE ((size_t) (sysconf(_SC_PAGE_SIZE)))
-#else
-/* Let's hope it's like x86. */
-#define PA_PAGE_SIZE ((size_t) 4096)
-#endif
-
 /* Rounds down */
 static inline void* PA_ALIGN_PTR(const void *p) {
     return (void*) (((size_t) p) & ~(sizeof(void*) - 1));
@@ -63,16 +52,6 @@ static inline void* PA_ALIGN_PTR(const void *p) {
 /* Rounds up */
 static inline size_t PA_ALIGN(size_t l) {
     return ((l + sizeof(void*) - 1) & ~(sizeof(void*) - 1));
-}
-
-/* Rounds down */
-static inline void* PA_PAGE_ALIGN_PTR(const void *p) {
-    return (void*) (((size_t) p) & ~(PA_PAGE_SIZE - 1));
-}
-
-/* Rounds up */
-static inline size_t PA_PAGE_ALIGN(size_t l) {
-    return (l + PA_PAGE_SIZE - 1) & ~(PA_PAGE_SIZE - 1);
 }
 
 #if defined(__GNUC__)
@@ -190,7 +169,7 @@ static inline size_t PA_PAGE_ALIGN(size_t l) {
 #define pa_return_if_fail(expr)                                         \
     do {                                                                \
         if (PA_UNLIKELY(!(expr))) {                                     \
-            pa_log_debug("Assertion '%s' failed at %s:%u, function %s.\n", #expr , __FILE__, __LINE__, PA_PRETTY_FUNCTION); \
+            pa_log_debug("Assertion '%s' failed at %s:%u, function %s.", #expr , __FILE__, __LINE__, PA_PRETTY_FUNCTION); \
             return;                                                     \
         }                                                               \
     } while(false)
@@ -198,7 +177,7 @@ static inline size_t PA_PAGE_ALIGN(size_t l) {
 #define pa_return_val_if_fail(expr, val)                                \
     do {                                                                \
         if (PA_UNLIKELY(!(expr))) {                                     \
-            pa_log_debug("Assertion '%s' failed at %s:%u, function %s.\n", #expr , __FILE__, __LINE__, PA_PRETTY_FUNCTION); \
+            pa_log_debug("Assertion '%s' failed at %s:%u, function %s.", #expr , __FILE__, __LINE__, PA_PRETTY_FUNCTION); \
             return (val);                                               \
         }                                                               \
     } while(false)
@@ -207,6 +186,7 @@ static inline size_t PA_PAGE_ALIGN(size_t l) {
 
 /* pa_assert_se() is an assert which guarantees side effects of x,
  * i.e. is never optimized away, regardless of NDEBUG or FASTPATH. */
+#ifndef __COVERITY__
 #define pa_assert_se(expr)                                              \
     do {                                                                \
         if (PA_UNLIKELY(!(expr))) {                                     \
@@ -214,6 +194,14 @@ static inline size_t PA_PAGE_ALIGN(size_t l) {
             abort();                                                    \
         }                                                               \
     } while (false)
+#else
+#define pa_assert_se(expr)                                              \
+    do {                                                                \
+        int _unique_var = (expr);                                       \
+        if (!_unique_var)                                               \
+            abort();                                                    \
+    } while (false)
+#endif
 
 /* Does exactly nothing */
 #define pa_nop() do {} while (false)
@@ -298,15 +286,23 @@ static inline size_t PA_PAGE_ALIGN(size_t l) {
 
 #define PA_INT_TYPE_SIGNED(type) (!!((type) 0 > (type) -1))
 
+#define PA_INT_TYPE_HALF(type) ((type) 1 << (sizeof(type)*8 - 2))
+
 #define PA_INT_TYPE_MAX(type)                                          \
     ((type) (PA_INT_TYPE_SIGNED(type)                                  \
-             ? ~(~(type) 0 << (8*sizeof(type)-1))                      \
+             ? (PA_INT_TYPE_HALF(type) - 1 + PA_INT_TYPE_HALF(type))   \
              : (type) -1))
 
 #define PA_INT_TYPE_MIN(type)                                          \
     ((type) (PA_INT_TYPE_SIGNED(type)                                  \
-             ? (~(type) 0 << (8*sizeof(type)-1))                       \
+             ? (-1 - PA_INT_TYPE_MAX(type))                            \
              : (type) 0))
+
+/* The '#' preprocessor operator doesn't expand any macros that are in the
+ * parameter, which is why we need a separate macro for those cases where the
+ * parameter contains a macro that needs expanding. */
+#define PA_STRINGIZE(x) #x
+#define PA_EXPAND_AND_STRINGIZE(x) PA_STRINGIZE(x)
 
 /* We include this at the very last place */
 #include <pulsecore/log.h>

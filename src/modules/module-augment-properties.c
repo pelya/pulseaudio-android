@@ -34,8 +34,6 @@
 #include <pulsecore/client.h>
 #include <pulsecore/conf-parser.h>
 
-#include "module-augment-properties-symdef.h"
-
 PA_MODULE_AUTHOR("Lennart Poettering");
 PA_MODULE_DESCRIPTION("Augment the property sets of streams with additional static information");
 PA_MODULE_VERSION(PACKAGE_VERSION);
@@ -131,8 +129,49 @@ static int catch_all(pa_config_parser_state *state) {
     return 0;
 }
 
+static char * find_desktop_file_in_dir(struct rule *r, const char *desktop_file_dir, struct stat *st) {
+    char *fn = NULL;
+
+    pa_assert(st);
+
+    fn = pa_sprintf_malloc("%s" PA_PATH_SEP "%s.desktop", desktop_file_dir, r->process_name);
+    if (stat(fn, st) == 0)
+        return fn;
+
+    pa_xfree(fn);
+
+#ifdef DT_DIR
+    {
+        DIR *desktopfiles_dir;
+        struct dirent *dir;
+
+        /* Let's try a more aggressive search, but only one level */
+        if ((desktopfiles_dir = opendir(desktop_file_dir))) {
+            while ((dir = readdir(desktopfiles_dir))) {
+                if (dir->d_type != DT_DIR
+                    || pa_streq(dir->d_name, ".")
+                    || pa_streq(dir->d_name, ".."))
+                    continue;
+
+                fn = pa_sprintf_malloc("%s" PA_PATH_SEP "%s" PA_PATH_SEP "%s.desktop", desktop_file_dir, dir->d_name, r->process_name);
+
+                if (stat(fn, st) == 0) {
+                    closedir(desktopfiles_dir);
+                    return fn;
+                }
+
+                pa_xfree(fn);
+            }
+            closedir(desktopfiles_dir);
+        }
+    }
+#endif
+
+    return NULL;
+}
+
 static void update_rule(struct rule *r) {
-    char *fn;
+    char *fn = NULL;
     struct stat st;
     static pa_config_item table[] = {
         { "Name", pa_config_parse_string,              NULL, "Desktop Entry" },
@@ -143,41 +182,33 @@ static void update_rule(struct rule *r) {
         { NULL,  catch_all, NULL, NULL },
         { NULL, NULL, NULL, NULL },
     };
-    bool found = false;
+    const char *state = NULL;
+    const char *xdg_data_dirs = NULL;
+    char *data_dir = NULL;
+    char *desktop_file_dir = NULL;
 
     pa_assert(r);
-    fn = pa_sprintf_malloc(DESKTOPFILEDIR PA_PATH_SEP "%s.desktop", r->process_name);
 
-    if (stat(fn, &st) == 0)
-        found = true;
-    else {
-#ifdef DT_DIR
-        DIR *desktopfiles_dir;
-        struct dirent *dir;
+    if ((xdg_data_dirs = getenv("XDG_DATA_DIRS"))) {
+        while ((data_dir = pa_split(xdg_data_dirs, ":", &state))) {
+            desktop_file_dir = pa_sprintf_malloc("%s" PA_PATH_SEP "applications", data_dir);
 
-        /* Let's try a more aggressive search, but only one level */
-        if ((desktopfiles_dir = opendir(DESKTOPFILEDIR))) {
-            while ((dir = readdir(desktopfiles_dir))) {
-                if (dir->d_type != DT_DIR
-                    || pa_streq(dir->d_name, ".")
-                    || pa_streq(dir->d_name, ".."))
-                    continue;
+            pa_xfree(fn);
+            fn = find_desktop_file_in_dir(r, desktop_file_dir, &st);
 
-                pa_xfree(fn);
-                fn = pa_sprintf_malloc(DESKTOPFILEDIR PA_PATH_SEP "%s" PA_PATH_SEP "%s.desktop", dir->d_name, r->process_name);
+            pa_xfree(desktop_file_dir);
+            pa_xfree(data_dir);
 
-                if (stat(fn, &st) == 0) {
-                    found = true;
-                    break;
-                }
+            if (fn) {
+                break;
             }
-            closedir(desktopfiles_dir);
         }
-#endif
+    } else {
+        fn = find_desktop_file_in_dir(r, DESKTOPFILEDIR, &st);
     }
-    if (!found) {
+
+    if (!fn) {
         r->good = false;
-        pa_xfree(fn);
         return;
     }
 
@@ -204,7 +235,7 @@ static void update_rule(struct rule *r) {
     table[0].data = &r->application_name;
     table[1].data = &r->icon_name;
 
-    if (pa_config_parse(fn, NULL, table, NULL, r) < 0)
+    if (pa_config_parse(fn, NULL, table, NULL, false, r) < 0)
         pa_log_warn("Failed to parse .desktop file %s.", fn);
 
     pa_xfree(fn);

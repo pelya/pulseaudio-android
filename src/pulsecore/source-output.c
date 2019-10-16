@@ -123,7 +123,8 @@ void pa_source_output_new_data_set_muted(pa_source_output_new_data *data, bool m
     data->muted = mute;
 }
 
-bool pa_source_output_new_data_set_source(pa_source_output_new_data *data, pa_source *s, bool save) {
+bool pa_source_output_new_data_set_source(pa_source_output_new_data *data, pa_source *s, bool save,
+                                          bool requested_by_application) {
     bool ret = true;
     pa_idxset *formats = NULL;
 
@@ -134,6 +135,7 @@ bool pa_source_output_new_data_set_source(pa_source_output_new_data *data, pa_so
         /* We're not working with the extended API */
         data->source = s;
         data->save_source = save;
+        data->source_requested_by_application = requested_by_application;
     } else {
         /* Extended API: let's see if this source supports the formats the client would like */
         formats = pa_source_check_formats(s, data->req_formats);
@@ -142,6 +144,7 @@ bool pa_source_output_new_data_set_source(pa_source_output_new_data *data, pa_so
             /* Source supports at least one of the requested formats */
             data->source = s;
             data->save_source = save;
+            data->source_requested_by_application = requested_by_application;
             if (data->nego_formats)
                 pa_idxset_free(data->nego_formats, (pa_free_cb_t) pa_format_info_free);
             data->nego_formats = formats;
@@ -167,7 +170,8 @@ bool pa_source_output_new_data_set_formats(pa_source_output_new_data *data, pa_i
 
     if (data->source) {
         /* Trigger format negotiation */
-        return pa_source_output_new_data_set_source(data, data->source, data->save_source);
+        return pa_source_output_new_data_set_source(data, data->source, data->save_source,
+                                                    data->source_requested_by_application);
     }
 
     return true;
@@ -271,7 +275,7 @@ int pa_source_output_new(
             pa_return_val_if_fail(source, -PA_ERR_NOENTITY);
         }
 
-        pa_source_output_new_data_set_source(data, source, false);
+        pa_source_output_new_data_set_source(data, source, false, false);
     }
 
     /* If something didn't pick a format for us, pick the top-most format since
@@ -280,6 +284,11 @@ int pa_source_output_new(
         data->format = pa_format_info_copy(pa_idxset_first(data->nego_formats, NULL));
 
     if (PA_LIKELY(data->format)) {
+        /* We know that data->source is set, because data->format has been set.
+         * data->format is set after a successful format negotiation, and that
+         * can't happen before data->source has been set. */
+        pa_assert(data->source);
+
         pa_log_debug("Negotiated format: %s", pa_format_info_snprint(fmt, sizeof(fmt), data->format));
     } else {
         pa_format_info *format;
@@ -292,12 +301,12 @@ int pa_source_output_new(
         return -PA_ERR_NOTSUPPORTED;
     }
 
-    pa_return_val_if_fail(PA_SOURCE_IS_LINKED(pa_source_get_state(data->source)), -PA_ERR_BADSTATE);
+    pa_return_val_if_fail(PA_SOURCE_IS_LINKED(data->source->state), -PA_ERR_BADSTATE);
     pa_return_val_if_fail(!data->direct_on_input || data->direct_on_input->sink == data->source->monitor_of, -PA_ERR_INVALID);
 
     /* Routing is done. We have a source and a format. */
 
-    if (data->volume_is_set && pa_format_info_is_pcm(data->format)) {
+    if (data->volume_is_set && !pa_source_output_new_data_is_passthrough(data)) {
         /* If volume is set, we need to save the original data->channel_map,
          * so that we can remap the volume from the original channel map to the
          * final channel map of the stream in case data->channel_map gets
@@ -305,6 +314,10 @@ int pa_source_output_new(
         r = pa_stream_get_volume_channel_map(&data->volume, data->channel_map_is_set ? &data->channel_map : NULL, data->format, &volume_map);
         if (r < 0)
             return r;
+    } else {
+        /* Initialize volume_map to invalid state. We check the state later to
+         * determine if volume remapping is needed. */
+        pa_channel_map_init(&volume_map);
     }
 
     /* Now populate the sample spec and channel map according to the final
@@ -332,7 +345,7 @@ int pa_source_output_new(
     if (!data->volume_writable)
         data->save_volume = false;
 
-    if (data->volume_is_set)
+    if (pa_channel_map_valid(&volume_map))
         /* The original volume channel map may be different than the final
          * stream channel map, so remapping may be needed. */
         pa_cvolume_remap(&data->volume, &volume_map, &data->channel_map);
@@ -352,12 +365,11 @@ int pa_source_output_new(
 
     if (!(data->flags & PA_SOURCE_OUTPUT_VARIABLE_RATE) &&
         !pa_sample_spec_equal(&data->sample_spec, &data->source->sample_spec)) {
-        /* try to change source rate. This is done before the FIXATE hook since
+        /* try to change source format and rate. This is done before the FIXATE hook since
            module-suspend-on-idle can resume a source */
 
-        pa_log_info("Trying to change sample rate");
-        if (pa_source_update_rate(data->source, data->sample_spec.rate, pa_source_output_new_data_is_passthrough(data)) >= 0)
-            pa_log_info("Rate changed to %u Hz", data->source->sample_spec.rate);
+        pa_log_info("Trying to change sample spec");
+        pa_source_reconfigure(data->source, &data->sample_spec, pa_source_output_new_data_is_passthrough(data));
     }
 
     if (pa_source_output_new_data_is_passthrough(data) &&
@@ -377,7 +389,7 @@ int pa_source_output_new(
         return r;
 
     if ((data->flags & PA_SOURCE_OUTPUT_NO_CREATE_ON_SUSPEND) &&
-        pa_source_get_state(data->source) == PA_SOURCE_SUSPENDED) {
+        data->source->state == PA_SOURCE_SUSPENDED) {
         pa_log("Failed to create source output: source is suspended.");
         return -PA_ERR_BADSTATE;
     }
@@ -401,6 +413,7 @@ int pa_source_output_new(
                         ((data->flags & PA_SOURCE_OUTPUT_VARIABLE_RATE) ? PA_RESAMPLER_VARIABLE_RATE : 0) |
                         ((data->flags & PA_SOURCE_OUTPUT_NO_REMAP) ? PA_RESAMPLER_NO_REMAP : 0) |
                         (core->disable_remixing || (data->flags & PA_SOURCE_OUTPUT_NO_REMIX) ? PA_RESAMPLER_NO_REMIX : 0) |
+                        (core->remixing_use_all_sink_channels ? 0 : PA_RESAMPLER_NO_FILL_SINK) |
                         (core->disable_lfe_remixing ? PA_RESAMPLER_NO_LFE : 0)))) {
                 pa_log_warn("Unsupported resampling operation.");
                 return -PA_ERR_NOTSUPPORTED;
@@ -418,6 +431,7 @@ int pa_source_output_new(
     o->driver = pa_xstrdup(pa_path_get_filename(data->driver));
     o->module = data->module;
     o->source = data->source;
+    o->source_requested_by_application = data->source_requested_by_application;
     o->destination_source = data->destination_source;
     o->client = data->client;
 
@@ -523,14 +537,18 @@ static void source_output_set_state(pa_source_output *o, pa_source_output_state_
     if (o->state == state)
         return;
 
-    if (o->state == PA_SOURCE_OUTPUT_CORKED && state == PA_SOURCE_OUTPUT_RUNNING && pa_source_used_by(o->source) == 0 &&
-        !pa_sample_spec_equal(&o->sample_spec, &o->source->sample_spec)) {
-        /* We were uncorked and the source was not playing anything -- let's try
-         * to update the sample rate to avoid resampling */
-        pa_source_update_rate(o->source, o->sample_spec.rate, pa_source_output_is_passthrough(o));
-    }
+    if (o->source) {
+        if (o->state == PA_SOURCE_OUTPUT_CORKED && state == PA_SOURCE_OUTPUT_RUNNING && pa_source_used_by(o->source) == 0 &&
+            !pa_sample_spec_equal(&o->sample_spec, &o->source->sample_spec)) {
+            /* We were uncorked and the source was not playing anything -- let's try
+             * to update the sample format and rate to avoid resampling */
+            pa_source_reconfigure(o->source, &o->sample_spec, pa_source_output_is_passthrough(o));
+        }
 
-    pa_assert_se(pa_asyncmsgq_send(o->source->asyncmsgq, PA_MSGOBJECT(o), PA_SOURCE_OUTPUT_MESSAGE_SET_STATE, PA_UINT_TO_PTR(state), 0, NULL) == 0);
+        pa_assert_se(pa_asyncmsgq_send(o->source->asyncmsgq, PA_MSGOBJECT(o), PA_SOURCE_OUTPUT_MESSAGE_SET_STATE, PA_UINT_TO_PTR(state), 0, NULL) == 0);
+    } else
+        /* If the source is not valid, pa_source_output_set_state_within_thread() must be called directly */
+        pa_source_output_set_state_within_thread(o, state);
 
     update_n_corked(o, state);
     o->state = state;
@@ -542,13 +560,15 @@ static void source_output_set_state(pa_source_output *o, pa_source_output_state_
             pa_subscription_post(o->core, PA_SUBSCRIPTION_EVENT_SOURCE_OUTPUT|PA_SUBSCRIPTION_EVENT_CHANGE, o->index);
     }
 
-    pa_source_update_status(o->source);
+    if (o->source)
+        pa_source_update_status(o->source);
 }
 
 /* Called from main context */
 void pa_source_output_unlink(pa_source_output*o) {
     bool linked;
-    pa_assert(o);
+
+    pa_source_output_assert_ref(o);
     pa_assert_ctl_context();
 
     /* See pa_sink_unlink() for a couple of comments how this function
@@ -590,16 +610,16 @@ void pa_source_output_unlink(pa_source_output*o) {
 
     reset_callbacks(o);
 
-    if (linked) {
-        pa_subscription_post(o->core, PA_SUBSCRIPTION_EVENT_SOURCE_OUTPUT|PA_SUBSCRIPTION_EVENT_REMOVE, o->index);
-        pa_hook_fire(&o->core->hooks[PA_CORE_HOOK_SOURCE_OUTPUT_UNLINK_POST], o);
-    }
-
     if (o->source) {
-        if (PA_SOURCE_IS_LINKED(pa_source_get_state(o->source)))
+        if (PA_SOURCE_IS_LINKED(o->source->state))
             pa_source_update_status(o->source);
 
         o->source = NULL;
+    }
+
+    if (linked) {
+        pa_subscription_post(o->core, PA_SUBSCRIPTION_EVENT_SOURCE_OUTPUT|PA_SUBSCRIPTION_EVENT_REMOVE, o->index);
+        pa_hook_fire(&o->core->hooks[PA_CORE_HOOK_SOURCE_OUTPUT_UNLINK_POST], o);
     }
 
     pa_core_maybe_vacuum(o->core);
@@ -614,9 +634,7 @@ static void source_output_free(pa_object* mo) {
     pa_assert(o);
     pa_assert_ctl_context();
     pa_assert(pa_source_output_refcnt(o) == 0);
-
-    if (PA_SOURCE_OUTPUT_IS_LINKED(o->state))
-        pa_source_output_unlink(o);
+    pa_assert(!PA_SOURCE_OUTPUT_IS_LINKED(o->state));
 
     pa_log_info("Freeing output %u \"%s\"", o->index,
                 o->proplist ? pa_strnull(pa_proplist_gets(o->proplist, PA_PROP_MEDIA_NAME)) : "");
@@ -748,7 +766,7 @@ void pa_source_output_push(pa_source_output *o, const pa_memchunk *chunk) {
          * of the queued data is actually still changeable. Hence
          * FIXME! */
 
-        latency = pa_sink_get_latency_within_thread(o->source->monitor_of);
+        latency = pa_sink_get_latency_within_thread(o->source->monitor_of, false);
 
         n = pa_usec_to_bytes(latency, &o->source->sample_spec);
 
@@ -792,14 +810,14 @@ void pa_source_output_push(pa_source_output *o, const pa_memchunk *chunk) {
                 pa_volume_memchunk(&qchunk, &o->source->sample_spec, &o->thread_info.soft_volume);
         }
 
-        if (!o->thread_info.resampler) {
-            if (nvfs) {
-                pa_memchunk_make_writable(&qchunk, 0);
-                pa_volume_memchunk(&qchunk, &o->thread_info.sample_spec, &o->volume_factor_source);
-            }
+        if (nvfs) {
+            pa_memchunk_make_writable(&qchunk, 0);
+            pa_volume_memchunk(&qchunk, &o->source->sample_spec, &o->volume_factor_source);
+        }
 
+        if (!o->thread_info.resampler)
             o->push(o, &qchunk);
-        } else {
+        else {
             pa_memchunk rchunk;
 
             if (mbs == 0)
@@ -810,14 +828,8 @@ void pa_source_output_push(pa_source_output *o, const pa_memchunk *chunk) {
 
             pa_resampler_run(o->thread_info.resampler, &qchunk, &rchunk);
 
-            if (rchunk.length > 0) {
-                if (nvfs) {
-                    pa_memchunk_make_writable(&rchunk, 0);
-                    pa_volume_memchunk(&rchunk, &o->thread_info.sample_spec, &o->volume_factor_source);
-                }
-
+            if (rchunk.length > 0)
                 o->push(o, &rchunk);
-            }
 
             if (rchunk.memblock)
                 pa_memblock_unref(rchunk.memblock);
@@ -854,7 +866,7 @@ void pa_source_output_process_rewind(pa_source_output *o, size_t nbytes /* in so
             pa_resampler_rewind(o->thread_info.resampler, nbytes);
 
     } else
-        pa_memblockq_rewind(o->thread_info.delay_memblockq, nbytes);
+        pa_memblockq_seek(o->thread_info.delay_memblockq, - ((int64_t) nbytes), PA_SEEK_RELATIVE, true);
 }
 
 /* Called from thread context */
@@ -1084,17 +1096,119 @@ void pa_source_output_set_mute(pa_source_output *o, bool mute, bool save) {
     pa_hook_fire(&o->core->hooks[PA_CORE_HOOK_SOURCE_OUTPUT_MUTE_CHANGED], o);
 }
 
-/* Called from main thread */
-void pa_source_output_update_proplist(pa_source_output *o, pa_update_mode_t mode, pa_proplist *p) {
-    pa_source_output_assert_ref(o);
-    pa_assert_ctl_context();
+void pa_source_output_set_property(pa_source_output *o, const char *key, const char *value) {
+    char *old_value = NULL;
+    const char *new_value;
 
-    if (p)
-        pa_proplist_update(o->proplist, mode, p);
+    pa_assert(o);
+    pa_assert(key);
+
+    if (pa_proplist_contains(o->proplist, key)) {
+        old_value = pa_xstrdup(pa_proplist_gets(o->proplist, key));
+        if (value && old_value && pa_streq(value, old_value))
+            goto finish;
+
+        if (!old_value)
+            old_value = pa_xstrdup("(data)");
+    } else {
+        if (!value)
+            goto finish;
+
+        old_value = pa_xstrdup("(unset)");
+    }
+
+    if (value) {
+        pa_proplist_sets(o->proplist, key, value);
+        new_value = value;
+    } else {
+        pa_proplist_unset(o->proplist, key);
+        new_value = "(unset)";
+    }
 
     if (PA_SOURCE_OUTPUT_IS_LINKED(o->state)) {
+        pa_log_debug("Source output %u: proplist[%s]: %s -> %s", o->index, key, old_value, new_value);
         pa_hook_fire(&o->core->hooks[PA_CORE_HOOK_SOURCE_OUTPUT_PROPLIST_CHANGED], o);
-        pa_subscription_post(o->core, PA_SUBSCRIPTION_EVENT_SOURCE_OUTPUT|PA_SUBSCRIPTION_EVENT_CHANGE, o->index);
+        pa_subscription_post(o->core, PA_SUBSCRIPTION_EVENT_SOURCE_OUTPUT | PA_SUBSCRIPTION_EVENT_CHANGE, o->index);
+    }
+
+finish:
+    pa_xfree(old_value);
+}
+
+void pa_source_output_set_property_arbitrary(pa_source_output *o, const char *key, const uint8_t *value, size_t nbytes) {
+    const uint8_t *old_value;
+    size_t old_nbytes;
+    const char *old_value_str;
+    const char *new_value_str;
+
+    pa_assert(o);
+    pa_assert(key);
+
+    if (pa_proplist_get(o->proplist, key, (const void **) &old_value, &old_nbytes) >= 0) {
+        if (value && nbytes == old_nbytes && !memcmp(value, old_value, nbytes))
+            return;
+
+        old_value_str = "(data)";
+
+    } else {
+        if (!value)
+            return;
+
+        old_value_str = "(unset)";
+    }
+
+    if (value) {
+        pa_proplist_set(o->proplist, key, value, nbytes);
+        new_value_str = "(data)";
+    } else {
+        pa_proplist_unset(o->proplist, key);
+        new_value_str = "(unset)";
+    }
+
+    if (PA_SOURCE_OUTPUT_IS_LINKED(o->state)) {
+        pa_log_debug("Source output %u: proplist[%s]: %s -> %s", o->index, key, old_value_str, new_value_str);
+        pa_hook_fire(&o->core->hooks[PA_CORE_HOOK_SOURCE_OUTPUT_PROPLIST_CHANGED], o);
+        pa_subscription_post(o->core, PA_SUBSCRIPTION_EVENT_SOURCE_OUTPUT | PA_SUBSCRIPTION_EVENT_CHANGE, o->index);
+    }
+}
+
+/* Called from main thread */
+void pa_source_output_update_proplist(pa_source_output *o, pa_update_mode_t mode, pa_proplist *p) {
+    void *state;
+    const char *key;
+    const uint8_t *value;
+    size_t nbytes;
+
+    pa_source_output_assert_ref(o);
+    pa_assert(p);
+    pa_assert_ctl_context();
+
+    switch (mode) {
+        case PA_UPDATE_SET:
+            /* Delete everything that is not in p. */
+            for (state = NULL; (key = pa_proplist_iterate(o->proplist, &state));) {
+                if (!pa_proplist_contains(p, key))
+                    pa_source_output_set_property(o, key, NULL);
+            }
+
+            /* Fall through. */
+        case PA_UPDATE_REPLACE:
+            for (state = NULL; (key = pa_proplist_iterate(p, &state));) {
+                pa_proplist_get(p, key, (const void **) &value, &nbytes);
+                pa_source_output_set_property_arbitrary(o, key, value, nbytes);
+            }
+
+            break;
+        case PA_UPDATE_MERGE:
+            for (state = NULL; (key = pa_proplist_iterate(p, &state));) {
+                if (pa_proplist_contains(o->proplist, key))
+                    continue;
+
+                pa_proplist_get(p, key, (const void **) &value, &nbytes);
+                pa_source_output_set_property_arbitrary(o, key, value, nbytes);
+            }
+
+            break;
     }
 }
 
@@ -1123,31 +1237,6 @@ int pa_source_output_set_rate(pa_source_output *o, uint32_t rate) {
 
     pa_subscription_post(o->core, PA_SUBSCRIPTION_EVENT_SOURCE_OUTPUT|PA_SUBSCRIPTION_EVENT_CHANGE, o->index);
     return 0;
-}
-
-/* Called from main context */
-void pa_source_output_set_name(pa_source_output *o, const char *name) {
-    const char *old;
-    pa_assert_ctl_context();
-    pa_source_output_assert_ref(o);
-
-    if (!name && !pa_proplist_contains(o->proplist, PA_PROP_MEDIA_NAME))
-        return;
-
-    old = pa_proplist_gets(o->proplist, PA_PROP_MEDIA_NAME);
-
-    if (old && name && pa_streq(old, name))
-        return;
-
-    if (name)
-        pa_proplist_sets(o->proplist, PA_PROP_MEDIA_NAME, name);
-    else
-        pa_proplist_unset(o->proplist, PA_PROP_MEDIA_NAME);
-
-    if (PA_SOURCE_OUTPUT_IS_LINKED(o->state)) {
-        pa_hook_fire(&o->core->hooks[PA_CORE_HOOK_SOURCE_OUTPUT_PROPLIST_CHANGED], o);
-        pa_subscription_post(o->core, PA_SUBSCRIPTION_EVENT_SOURCE_OUTPUT|PA_SUBSCRIPTION_EVENT_CHANGE, o->index);
-    }
 }
 
 /* Called from main context */
@@ -1184,6 +1273,22 @@ static bool find_filter_source_output(pa_source_output *target, pa_source *s) {
     return false;
 }
 
+static bool is_filter_source_moving(pa_source_output *o) {
+    pa_source *source = o->source;
+
+    if (!source)
+        return false;
+
+    while (source->output_from_master) {
+        source = source->output_from_master->source;
+
+        if (!source)
+            return true;
+    }
+
+    return false;
+}
+
 /* Called from main context */
 bool pa_source_output_may_move_to(pa_source_output *o, pa_source *dest) {
     pa_source_output_assert_ref(o);
@@ -1193,12 +1298,26 @@ bool pa_source_output_may_move_to(pa_source_output *o, pa_source *dest) {
     if (dest == o->source)
         return true;
 
+    if (dest->unlink_requested)
+        return false;
+
     if (!pa_source_output_may_move(o))
         return false;
 
     /* Make sure we're not creating a filter source cycle */
     if (find_filter_source_output(o, dest)) {
         pa_log_debug("Can't connect output to %s, as that would create a cycle.", dest->name);
+        return false;
+    }
+
+    /* If this source output is connected to a filter source that itself is
+     * moving, then don't allow the move. Moving requires sending a message to
+     * the IO thread of the old source, and if the old source is a filter
+     * source that is moving, there's no IO thread associated to the old
+     * source. */
+    if (is_filter_source_moving(o)) {
+        pa_log_debug("Can't move output from filter source %s, because the filter source itself is currently moving.",
+                     o->source->name);
         return false;
     }
 
@@ -1230,11 +1349,13 @@ int pa_source_output_start_move(pa_source_output *o) {
     if ((r = pa_hook_fire(&o->core->hooks[PA_CORE_HOOK_SOURCE_OUTPUT_MOVE_START], o)) < 0)
         return r;
 
+    pa_log_debug("Starting to move source output %u from '%s'", (unsigned) o->index, o->source->name);
+
     origin = o->source;
 
     pa_idxset_remove_by_data(o->source->outputs, o, NULL);
 
-    if (pa_source_output_get_state(o) == PA_SOURCE_OUTPUT_CORKED)
+    if (o->state == PA_SOURCE_OUTPUT_CORKED)
         pa_assert_se(origin->n_corked-- >= 1);
 
     if (pa_source_output_is_passthrough(o))
@@ -1248,7 +1369,11 @@ int pa_source_output_start_move(pa_source_output *o) {
     pa_assert_se(pa_asyncmsgq_send(o->source->asyncmsgq, PA_MSGOBJECT(o->source), PA_SOURCE_MESSAGE_REMOVE_OUTPUT, o, 0, NULL) == 0);
 
     pa_source_update_status(o->source);
+
+    pa_cvolume_remap(&o->volume_factor_source, &o->source->channel_map, &o->channel_map);
+
     o->source = NULL;
+    o->source_requested_by_application = false;
 
     pa_source_output_unref(o);
 
@@ -1407,13 +1532,12 @@ int pa_source_output_finish_move(pa_source_output *o, pa_source *dest, bool save
 
     if (!(o->flags & PA_SOURCE_OUTPUT_VARIABLE_RATE) &&
         !pa_sample_spec_equal(&o->sample_spec, &dest->sample_spec)) {
-        /* try to change dest sink rate if possible without glitches.
+        /* try to change dest source format and rate if possible without glitches.
            module-suspend-on-idle resumes destination source with
            SOURCE_OUTPUT_MOVE_FINISH hook */
 
-        pa_log_info("Trying to change sample rate");
-        if (pa_source_update_rate(dest, o->sample_spec.rate, pa_source_output_is_passthrough(o)) >= 0)
-            pa_log_info("Rate changed to %u Hz", dest->sample_spec.rate);
+        pa_log_info("Trying to change sample spec");
+        pa_source_reconfigure(dest, &o->sample_spec, pa_source_output_is_passthrough(o));
     }
 
     if (o->moving)
@@ -1425,10 +1549,10 @@ int pa_source_output_finish_move(pa_source_output *o, pa_source *dest, bool save
 
     pa_cvolume_remap(&o->volume_factor_source, &o->channel_map, &o->source->channel_map);
 
-    if (pa_source_output_get_state(o) == PA_SOURCE_OUTPUT_CORKED)
+    if (o->state == PA_SOURCE_OUTPUT_CORKED)
         o->source->n_corked++;
 
-    pa_source_output_update_rate(o);
+    pa_source_output_update_resampler(o);
 
     pa_source_update_status(dest);
 
@@ -1500,10 +1624,9 @@ int pa_source_output_move_to(pa_source_output *o, pa_source *dest, bool save) {
     return 0;
 }
 
-/* Called from IO thread context */
+/* Called from IO thread context except when cork() is called without a valid source. */
 void pa_source_output_set_state_within_thread(pa_source_output *o, pa_source_output_state_t state) {
     pa_source_output_assert_ref(o);
-    pa_source_output_assert_io_context(o);
 
     if (state == o->thread_info.state)
         return;
@@ -1525,7 +1648,7 @@ int pa_source_output_process_msg(pa_msgobject *mo, int code, void *userdata, int
             pa_usec_t *r = userdata;
 
             r[0] += pa_bytes_to_usec(pa_memblockq_get_length(o->thread_info.delay_memblockq), &o->source->sample_spec);
-            r[1] += pa_source_get_latency_within_thread(o->source);
+            r[1] += pa_source_get_latency_within_thread(o->source, false);
 
             return 0;
         }
@@ -1604,8 +1727,8 @@ finish:
 
 /* Called from main context */
 /* Updates the source output's resampler with whatever the current source
- * requires -- useful when the underlying source's rate might have changed */
-int pa_source_output_update_rate(pa_source_output *o) {
+ * requires -- useful when the underlying source's sample spec might have changed */
+int pa_source_output_update_resampler(pa_source_output *o) {
     pa_resampler *new_resampler;
     char *memblockq_name;
 
@@ -1631,6 +1754,7 @@ int pa_source_output_update_rate(pa_source_output *o) {
                                      ((o->flags & PA_SOURCE_OUTPUT_VARIABLE_RATE) ? PA_RESAMPLER_VARIABLE_RATE : 0) |
                                      ((o->flags & PA_SOURCE_OUTPUT_NO_REMAP) ? PA_RESAMPLER_NO_REMAP : 0) |
                                      (o->core->disable_remixing || (o->flags & PA_SOURCE_OUTPUT_NO_REMIX) ? PA_RESAMPLER_NO_REMIX : 0) |
+                                     (o->core->remixing_use_all_sink_channels ? 0 : PA_RESAMPLER_NO_FILL_SINK) |
                                      (o->core->disable_lfe_remixing ? PA_RESAMPLER_NO_LFE : 0));
 
         if (!new_resampler) {
@@ -1668,6 +1792,30 @@ int pa_source_output_update_rate(pa_source_output *o) {
     pa_log_debug("Updated resampler for source output %d", o->index);
 
     return 0;
+}
+
+/* Called from the IO thread. */
+void pa_source_output_attach(pa_source_output *o) {
+    pa_assert(o);
+    pa_assert(!o->thread_info.attached);
+
+    o->thread_info.attached = true;
+
+    if (o->attach)
+        o->attach(o);
+}
+
+/* Called from the IO thread. */
+void pa_source_output_detach(pa_source_output *o) {
+    pa_assert(o);
+
+    if (!o->thread_info.attached)
+        return;
+
+    o->thread_info.attached = false;
+
+    if (o->detach)
+        o->detach(o);
 }
 
 /* Called from the main thread. */

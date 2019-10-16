@@ -76,7 +76,7 @@ static void run_mix_test(
     samples_ref = out_ref + (8 - align);
     nsamples = channels * (SAMPLES - (8 - align));
 
-    fail_unless((pool = pa_mempool_new(false, 0)) != NULL, NULL);
+    fail_unless((pool = pa_mempool_new(PA_MEM_TYPE_PRIVATE, 0, true)) != NULL, NULL);
 
     pa_random(samples0, nsamples * sizeof(int16_t));
     c0.memblock = pa_memblock_new_fixed(pool, samples0, nsamples * sizeof(int16_t), false);
@@ -114,11 +114,11 @@ static void run_mix_test(
         for (i = 0; i < nsamples; i++) {
             if (samples[i] != samples_ref[i]) {
                 pa_log_debug("Correctness test failed: align=%d, channels=%d", align, channels);
-                pa_log_debug("%d: %hd != %04hd (%hd + %hd)\n",
+                pa_log_debug("%d: %hd != %04hd (%hd + %hd)",
                     i,
                     samples[i], samples_ref[i],
                     samples0[i], samples1[i]);
-                fail();
+                ck_abort();
             }
         }
     }
@@ -142,7 +142,7 @@ static void run_mix_test(
     pa_memblock_unref(c0.memblock);
     pa_memblock_unref(c1.memblock);
 
-    pa_mempool_free(pool);
+    pa_mempool_unref(pool);
 }
 
 START_TEST (mix_special_test) {

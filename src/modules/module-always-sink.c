@@ -30,8 +30,6 @@
 #include <pulsecore/modargs.h>
 #include <pulsecore/log.h>
 
-#include "module-always-sink-symdef.h"
-
 PA_MODULE_AUTHOR("Colin Guthrie");
 PA_MODULE_DESCRIPTION(_("Always keeps at least one sink loaded even if it's a null one"));
 PA_MODULE_VERSION(PACKAGE_VERSION);
@@ -47,7 +45,6 @@ static const char* const valid_modargs[] = {
 };
 
 struct userdata {
-    pa_hook_slot *put_slot, *unlink_slot;
     uint32_t null_module;
     bool ignore;
     char *sink_name;
@@ -81,7 +78,7 @@ static void load_null_sink_if_needed(pa_core *c, pa_sink *sink, struct userdata*
 
     t = pa_sprintf_malloc("sink_name=%s sink_properties='device.description=\"%s\"'", u->sink_name,
                           _("Dummy Output"));
-    m = pa_module_load(c, "module-null-sink", t);
+    pa_module_load(&m, c, "module-null-sink", t);
     u->null_module = m ? m->index : PA_INVALID_INDEX;
     pa_xfree(t);
 
@@ -162,8 +159,8 @@ int pa__init(pa_module*m) {
 
     m->userdata = u = pa_xnew(struct userdata, 1);
     u->sink_name = pa_xstrdup(pa_modargs_get_value(ma, "sink_name", DEFAULT_SINK_NAME));
-    u->put_slot = pa_hook_connect(&m->core->hooks[PA_CORE_HOOK_SINK_PUT], PA_HOOK_LATE, (pa_hook_cb_t) put_hook_callback, u);
-    u->unlink_slot = pa_hook_connect(&m->core->hooks[PA_CORE_HOOK_SINK_UNLINK], PA_HOOK_EARLY, (pa_hook_cb_t) unlink_hook_callback, u);
+    pa_module_hook_connect(m, &m->core->hooks[PA_CORE_HOOK_SINK_PUT], PA_HOOK_LATE, (pa_hook_cb_t) put_hook_callback, u);
+    pa_module_hook_connect(m, &m->core->hooks[PA_CORE_HOOK_SINK_UNLINK], PA_HOOK_EARLY, (pa_hook_cb_t) unlink_hook_callback, u);
     u->null_module = PA_INVALID_INDEX;
     u->ignore = false;
 
@@ -182,10 +179,6 @@ void pa__done(pa_module*m) {
     if (!(u = m->userdata))
         return;
 
-    if (u->put_slot)
-        pa_hook_slot_free(u->put_slot);
-    if (u->unlink_slot)
-        pa_hook_slot_free(u->unlink_slot);
     if (u->null_module != PA_INVALID_INDEX && m->core->state != PA_CORE_SHUTDOWN)
         pa_module_unload_request_by_index(m->core, u->null_module, true);
 

@@ -2,10 +2,7 @@
 .version
 .*.swp
 ABOUT-NLS
-build-aux
-intltool-extract.in
-intltool-merge.in
-intltool-update.in
+build*
 *~
 *.tar.gz
 *.pc
@@ -24,6 +21,9 @@ config.rpath
 config.status
 config.sub
 configure
+cscope.out
+cscope.in.out
+cscope.po.out
 pulse-daemon.log
 depcomp
 install-sh
@@ -34,8 +34,5 @@ missing
 mkinstalldirs
 stamp-*
 .dirstamp
-
-/armeabi-v7a/
-/armeabi/
-/mips/
-/x86/
+*.orig
+*.rej

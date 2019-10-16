@@ -1,4 +1,3 @@
-/.intltool-merge-cache
 /Makefile.in.in
 /Makevars.template
 /POTFILES
@@ -9,7 +8,7 @@
 /insert-header.sin
 /pulseaudio.pot
 /quot.sed
-/remove-potcdate.sin
+/remove-potcdate.*
 /*.mo
 /*.gmo
 /Makefile

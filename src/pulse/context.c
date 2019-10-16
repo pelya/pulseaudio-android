@@ -69,6 +69,7 @@
 void pa_command_extension(pa_pdispatch *pd, uint32_t command, uint32_t tag, pa_tagstruct *t, void *userdata);
 static void pa_command_enable_srbchannel(pa_pdispatch *pd, uint32_t command, uint32_t tag, pa_tagstruct *t, void *userdata);
 static void pa_command_disable_srbchannel(pa_pdispatch *pd, uint32_t command, uint32_t tag, pa_tagstruct *t, void *userdata);
+static void pa_command_register_memfd_shmid(pa_pdispatch *pd, uint32_t command, uint32_t tag, pa_tagstruct *t, void *userdata);
 
 static const pa_pdispatch_cb_t command_table[PA_COMMAND_MAX] = {
     [PA_COMMAND_REQUEST] = pa_command_request,
@@ -90,6 +91,7 @@ static const pa_pdispatch_cb_t command_table[PA_COMMAND_MAX] = {
     [PA_COMMAND_RECORD_BUFFER_ATTR_CHANGED] = pa_command_stream_buffer_attr,
     [PA_COMMAND_ENABLE_SRBCHANNEL] = pa_command_enable_srbchannel,
     [PA_COMMAND_DISABLE_SRBCHANNEL] = pa_command_disable_srbchannel,
+    [PA_COMMAND_REGISTER_MEMFD_SHMID] = pa_command_register_memfd_shmid,
 };
 static void context_free(pa_context *c);
 
@@ -123,8 +125,9 @@ static void reset_callbacks(pa_context *c) {
     c->ext_stream_restore.userdata = NULL;
 }
 
-pa_context *pa_context_new_with_proplist(pa_mainloop_api *mainloop, const char *name, pa_proplist *p) {
+pa_context *pa_context_new_with_proplist(pa_mainloop_api *mainloop, const char *name, const pa_proplist *p) {
     pa_context *c;
+    pa_mem_type_t type;
 
     pa_assert(mainloop);
 
@@ -135,6 +138,9 @@ pa_context *pa_context_new_with_proplist(pa_mainloop_api *mainloop, const char *
 
     c = pa_xnew0(pa_context, 1);
     PA_REFCNT_INIT(c);
+
+    c->error = pa_xnew0(pa_context_error, 1);
+    assert(c->error);
 
     c->proplist = p ? pa_proplist_copy(p) : pa_proplist_new();
 
@@ -153,7 +159,7 @@ pa_context *pa_context_new_with_proplist(pa_mainloop_api *mainloop, const char *
     PA_LLIST_HEAD_INIT(pa_stream, c->streams);
     PA_LLIST_HEAD_INIT(pa_operation, c->operations);
 
-    c->error = PA_OK;
+    c->error->error = PA_OK;
     c->state = PA_CONTEXT_UNCONNECTED;
 
     reset_callbacks(c);
@@ -170,10 +176,18 @@ pa_context *pa_context_new_with_proplist(pa_mainloop_api *mainloop, const char *
     c->srb_template.readfd = -1;
     c->srb_template.writefd = -1;
 
-    if (!(c->mempool = pa_mempool_new(!c->conf->disable_shm, c->conf->shm_size))) {
+    c->memfd_on_local = (!c->conf->disable_memfd && pa_memfd_is_locally_supported());
 
-        if (!c->conf->disable_shm)
-            c->mempool = pa_mempool_new(false, c->conf->shm_size);
+    type = (c->conf->disable_shm) ? PA_MEM_TYPE_PRIVATE :
+           ((!c->memfd_on_local) ?
+               PA_MEM_TYPE_SHARED_POSIX : PA_MEM_TYPE_SHARED_MEMFD);
+
+    if (!(c->mempool = pa_mempool_new(type, c->conf->shm_size, true))) {
+
+        if (!c->conf->disable_shm) {
+            pa_log_warn("Failed to allocate shared memory pool. Falling back to a normal private one.");
+            c->mempool = pa_mempool_new(PA_MEM_TYPE_PRIVATE, c->conf->shm_size, true);
+        }
 
         if (!c->mempool) {
             context_free(c);
@@ -249,7 +263,7 @@ static void context_free(pa_context *c) {
         pa_hashmap_free(c->playback_streams);
 
     if (c->mempool)
-        pa_mempool_free(c->mempool);
+        pa_mempool_unref(c->mempool);
 
     if (c->conf)
         pa_client_conf_free(c->conf);
@@ -299,12 +313,12 @@ void pa_context_set_state(pa_context *c, pa_context_state_t st) {
     pa_context_unref(c);
 }
 
-int pa_context_set_error(pa_context *c, int error) {
+int pa_context_set_error(const pa_context *c, int error) {
     pa_assert(error >= 0);
     pa_assert(error < PA_ERR_MAX);
 
     if (c)
-        c->error = error;
+        c->error->error = error;
 
     return error;
 }
@@ -326,7 +340,7 @@ static void pstream_die_callback(pa_pstream *p, void *userdata) {
     pa_context_fail(c, PA_ERR_CONNECTIONTERMINATED);
 }
 
-static void pstream_packet_callback(pa_pstream *p, pa_packet *packet, const pa_cmsg_ancil_data *ancil_data, void *userdata) {
+static void pstream_packet_callback(pa_pstream *p, pa_packet *packet, pa_cmsg_ancil_data *ancil_data, void *userdata) {
     pa_context *c = userdata;
 
     pa_assert(p);
@@ -364,7 +378,11 @@ static void handle_srbchannel_memblock(pa_context *c, pa_memblock *memblock) {
     pa_memblock_ref(memblock);
     sr = pa_srbchannel_new_from_template(c->mainloop, &c->srb_template);
     if (!sr) {
-        pa_context_fail(c, PA_ERR_PROTOCOL);
+        pa_log_warn("Failed to create srbchannel from template");
+        c->srb_template.readfd = -1;
+        c->srb_template.writefd = -1;
+        pa_memblock_unref(c->srb_template.memblock);
+        c->srb_template.memblock = NULL;
         return;
     }
 
@@ -472,6 +490,7 @@ static void setup_complete_callback(pa_pdispatch *pd, uint32_t command, uint32_t
         case PA_CONTEXT_AUTHORIZING: {
             pa_tagstruct *reply;
             bool shm_on_remote = false;
+            bool memfd_on_remote = false;
 
             if (pa_tagstruct_getu32(t, &c->version) < 0 ||
                 !pa_tagstruct_eof(t)) {
@@ -488,9 +507,17 @@ static void setup_complete_callback(pa_pdispatch *pd, uint32_t command, uint32_t
             /* Starting with protocol version 13 the MSB of the version
                tag reflects if shm is available for this connection or
                not. */
-            if (c->version >= 13) {
-                shm_on_remote = !!(c->version & 0x80000000U);
-                c->version &= 0x7FFFFFFFU;
+            if ((c->version & PA_PROTOCOL_VERSION_MASK) >= 13) {
+                shm_on_remote = !!(c->version & PA_PROTOCOL_FLAG_SHM);
+
+                /* Starting with protocol version 31, the second MSB of the version
+                 * tag reflects whether memfd is supported on the other PA end. */
+                if ((c->version & PA_PROTOCOL_VERSION_MASK) >= 31)
+                    memfd_on_remote = !!(c->version & PA_PROTOCOL_FLAG_MEMFD);
+
+                /* Reserve the two most-significant _bytes_ of the version tag
+                 * for flags. */
+                c->version &= PA_PROTOCOL_VERSION_MASK;
             }
 
             pa_log_debug("Protocol version: remote %u, local %u", c->version, PA_PROTOCOL_VERSION);
@@ -515,6 +542,26 @@ static void setup_complete_callback(pa_pdispatch *pd, uint32_t command, uint32_t
 
             pa_log_debug("Negotiated SHM: %s", pa_yes_no(c->do_shm));
             pa_pstream_enable_shm(c->pstream, c->do_shm);
+
+            c->shm_type = PA_MEM_TYPE_PRIVATE;
+            if (c->do_shm) {
+                if (c->version >= 31 && memfd_on_remote && c->memfd_on_local) {
+                    const char *reason;
+
+                    pa_pstream_enable_memfd(c->pstream);
+                    if (pa_mempool_is_memfd_backed(c->mempool))
+                        if (pa_pstream_register_memfd_mempool(c->pstream, c->mempool, &reason))
+                            pa_log("Failed to regester memfd mempool. Reason: %s", reason);
+
+                    /* Even if memfd pool registration fails, the negotiated SHM type
+                     * shall remain memfd as both endpoints claim to support it. */
+                    c->shm_type = PA_MEM_TYPE_SHARED_MEMFD;
+                } else
+                    c->shm_type = PA_MEM_TYPE_SHARED_POSIX;
+            }
+
+            pa_log_debug("Memfd possible: %s", pa_yes_no(c->memfd_on_local));
+            pa_log_debug("Negotiated SHM type: %s", pa_mem_type_to_string(c->shm_type));
 
             reply = pa_tagstruct_command(c, PA_COMMAND_SET_CLIENT_NAME, &tag);
 
@@ -583,8 +630,10 @@ static void setup_context(pa_context *c, pa_iochannel *io) {
     pa_log_debug("SHM possible: %s", pa_yes_no(c->do_shm));
 
     /* Starting with protocol version 13 we use the MSB of the version
-     * tag for informing the other side if we could do SHM or not */
-    pa_tagstruct_putu32(t, PA_PROTOCOL_VERSION | (c->do_shm ? 0x80000000U : 0));
+     * tag for informing the other side if we could do SHM or not.
+     * Starting from version 31, second MSB is used to flag memfd support. */
+    pa_tagstruct_putu32(t, PA_PROTOCOL_VERSION | (c->do_shm ? PA_PROTOCOL_FLAG_SHM : 0) |
+                        (c->memfd_on_local ? PA_PROTOCOL_FLAG_MEMFD: 0));
     pa_tagstruct_put_arbitrary(t, cookie, sizeof(cookie));
 
 #ifdef HAVE_CREDS
@@ -707,7 +756,7 @@ static int context_autospawn(pa_context *c) {
 
     if (r < 0) {
 
-        if (errno != ESRCH) {
+        if (errno != ECHILD) {
             pa_log(_("waitpid(): %s"), pa_cstrerror(errno));
             pa_context_fail(c, PA_ERR_INTERNAL);
             goto fail;
@@ -1012,21 +1061,21 @@ void pa_context_disconnect(pa_context *c) {
         pa_context_set_state(c, PA_CONTEXT_TERMINATED);
 }
 
-pa_context_state_t pa_context_get_state(pa_context *c) {
+pa_context_state_t pa_context_get_state(const pa_context *c) {
     pa_assert(c);
     pa_assert(PA_REFCNT_VALUE(c) >= 1);
 
     return c->state;
 }
 
-int pa_context_errno(pa_context *c) {
+int pa_context_errno(const pa_context *c) {
 
     if (!c)
         return PA_ERR_INVALID;
 
     pa_assert(PA_REFCNT_VALUE(c) >= 1);
 
-    return c->error;
+    return c->error->error;
 }
 
 void pa_context_set_state_callback(pa_context *c, pa_context_notify_cb_t cb, void *userdata) {
@@ -1057,7 +1106,7 @@ void pa_context_set_event_callback(pa_context *c, pa_context_event_cb_t cb, void
     c->event_userdata = userdata;
 }
 
-int pa_context_is_pending(pa_context *c) {
+int pa_context_is_pending(const pa_context *c) {
     pa_assert(c);
     pa_assert(PA_REFCNT_VALUE(c) >= 1);
 
@@ -1226,7 +1275,7 @@ pa_operation* pa_context_set_default_source(pa_context *c, const char *name, pa_
     return o;
 }
 
-int pa_context_is_local(pa_context *c) {
+int pa_context_is_local(const pa_context *c) {
     pa_assert(c);
     pa_assert(PA_REFCNT_VALUE(c) >= 1);
 
@@ -1270,7 +1319,7 @@ const char* pa_get_library_version(void) {
     return pa_get_headers_version();
 }
 
-const char* pa_context_get_server(pa_context *c) {
+const char* pa_context_get_server(const pa_context *c) {
     pa_assert(c);
     pa_assert(PA_REFCNT_VALUE(c) >= 1);
 
@@ -1285,11 +1334,11 @@ const char* pa_context_get_server(pa_context *c) {
     return c->server;
 }
 
-uint32_t pa_context_get_protocol_version(pa_context *c) {
+uint32_t pa_context_get_protocol_version(const pa_context *c) {
     return PA_PROTOCOL_VERSION;
 }
 
-uint32_t pa_context_get_server_protocol_version(pa_context *c) {
+uint32_t pa_context_get_server_protocol_version(const pa_context *c) {
     pa_assert(c);
     pa_assert(PA_REFCNT_VALUE(c) >= 1);
 
@@ -1312,7 +1361,7 @@ pa_tagstruct *pa_tagstruct_command(pa_context *c, uint32_t command, uint32_t *ta
     return t;
 }
 
-uint32_t pa_context_get_index(pa_context *c) {
+uint32_t pa_context_get_index(const pa_context *c) {
     pa_assert(c);
     pa_assert(PA_REFCNT_VALUE(c) >= 1);
 
@@ -1323,7 +1372,7 @@ uint32_t pa_context_get_index(pa_context *c) {
     return c->client_index;
 }
 
-pa_operation *pa_context_proplist_update(pa_context *c, pa_update_mode_t mode, pa_proplist *p, pa_context_success_cb_t cb, void *userdata) {
+pa_operation *pa_context_proplist_update(pa_context *c, pa_update_mode_t mode, const pa_proplist *p, pa_context_success_cb_t cb, void *userdata) {
     pa_operation *o;
     pa_tagstruct *t;
     uint32_t tag;
@@ -1424,8 +1473,7 @@ static void pa_command_enable_srbchannel(pa_pdispatch *pd, uint32_t command, uin
     pa_context *c = userdata;
 
 #ifdef HAVE_CREDS
-    const int *fds;
-    int nfd;
+    pa_cmsg_ancil_data *ancil = NULL;
 
     pa_assert(pd);
     pa_assert(command == PA_COMMAND_ENABLE_SRBCHANNEL);
@@ -1433,26 +1481,34 @@ static void pa_command_enable_srbchannel(pa_pdispatch *pd, uint32_t command, uin
     pa_assert(c);
     pa_assert(PA_REFCNT_VALUE(c) >= 1);
 
-    /* Currently only one srb channel is supported, might change in future versions */
-    if (c->srb_template.readfd != -1) {
-        pa_context_fail(c, PA_ERR_PROTOCOL);
-        return;
-    }
+    ancil = pa_pdispatch_take_ancil_data(pd);
+    if (!ancil)
+        goto fail;
 
-    fds = pa_pdispatch_fds(pd, &nfd);
-    if (nfd != 2 || !fds || fds[0] == -1 || fds[1] == -1) {
-        pa_context_fail(c, PA_ERR_PROTOCOL);
-        return;
-    }
+    /* Currently only one srb channel is supported, might change in future versions */
+    if (c->srb_template.readfd != -1)
+        goto fail;
+
+    if (ancil->nfd != 2 || ancil->fds[0] == -1 || ancil->fds[1] == -1)
+        goto fail;
 
     pa_context_ref(c);
 
-    c->srb_template.readfd = fds[0];
-    c->srb_template.writefd = fds[1];
+    c->srb_template.readfd = ancil->fds[0];
+    c->srb_template.writefd = ancil->fds[1];
     c->srb_setup_tag = tag;
 
     pa_context_unref(c);
 
+    ancil->close_fds_on_cleanup = false;
+    return;
+
+fail:
+    if (ancil)
+        pa_cmsg_ancil_data_close_fds(ancil);
+
+    pa_context_fail(c, PA_ERR_PROTOCOL);
+    return;
 #else
     pa_assert(c);
     pa_context_fail(c, PA_ERR_PROTOCOL);
@@ -1485,6 +1541,18 @@ static void pa_command_disable_srbchannel(pa_pdispatch *pd, uint32_t command, ui
     pa_pstream_send_tagstruct(c->pstream, t2);
 }
 
+static void pa_command_register_memfd_shmid(pa_pdispatch *pd, uint32_t command, uint32_t tag, pa_tagstruct *t, void *userdata) {
+    pa_context *c = userdata;
+
+    pa_assert(pd);
+    pa_assert(command == PA_COMMAND_REGISTER_MEMFD_SHMID);
+    pa_assert(t);
+    pa_assert(c);
+    pa_assert(PA_REFCNT_VALUE(c) >= 1);
+
+    if (pa_common_command_register_memfd_shmid(c->pstream, pd, c->version, command, t))
+        pa_context_fail(c, PA_ERR_PROTOCOL);
+}
 
 void pa_command_client_event(pa_pdispatch *pd, uint32_t command, uint32_t tag, pa_tagstruct *t, void *userdata) {
     pa_context *c = userdata;
@@ -1523,7 +1591,7 @@ finish:
         pa_proplist_free(pl);
 }
 
-pa_time_event* pa_context_rttime_new(pa_context *c, pa_usec_t usec, pa_time_event_cb_t cb, void *userdata) {
+pa_time_event* pa_context_rttime_new(const pa_context *c, pa_usec_t usec, pa_time_event_cb_t cb, void *userdata) {
     struct timeval tv;
 
     pa_assert(c);
@@ -1538,7 +1606,7 @@ pa_time_event* pa_context_rttime_new(pa_context *c, pa_usec_t usec, pa_time_even
     return c->mainloop->time_new(c->mainloop, &tv, cb, userdata);
 }
 
-void pa_context_rttime_restart(pa_context *c, pa_time_event *e, pa_usec_t usec) {
+void pa_context_rttime_restart(const pa_context *c, pa_time_event *e, pa_usec_t usec) {
     struct timeval tv;
 
     pa_assert(c);
@@ -1553,7 +1621,7 @@ void pa_context_rttime_restart(pa_context *c, pa_time_event *e, pa_usec_t usec) 
     }
 }
 
-size_t pa_context_get_tile_size(pa_context *c, const pa_sample_spec *ss) {
+size_t pa_context_get_tile_size(const pa_context *c, const pa_sample_spec *ss) {
     size_t fs, mbs;
 
     pa_assert(c);

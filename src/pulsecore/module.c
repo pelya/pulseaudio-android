@@ -84,7 +84,11 @@ bool pa_module_exists(const char *name) {
     state = NULL;
     if (PA_UNLIKELY(pa_run_from_build_tree())) {
         while ((p = pa_split(paths, ":", &state))) {
+#ifdef MESON_BUILD
+            pathname = pa_sprintf_malloc("%s" PA_PATH_SEP "src" PA_PATH_SEP "modules" PA_PATH_SEP "%s" PA_SOEXT, p, n);
+#else
             pathname = pa_sprintf_malloc("%s" PA_PATH_SEP ".libs" PA_PATH_SEP "%s" PA_SOEXT, p, n);
+#endif
             result = access(pathname, F_OK) == 0 ? true : false;
             pa_log_debug("Checking for existence of '%s': %s", pathname, result ? "success" : "failure");
             pa_xfree(pathname);
@@ -107,17 +111,21 @@ void pa_module_hook_connect(pa_module *m, pa_hook *hook, pa_hook_priority_t prio
     pa_dynarray_append(m->hooks, pa_hook_connect(hook, prio, cb, data));
 }
 
-pa_module* pa_module_load(pa_core *c, const char *name, const char *argument) {
+int pa_module_load(pa_module** module, pa_core *c, const char *name, const char *argument) {
     pa_module *m = NULL;
     bool (*load_once)(void);
     const char* (*get_deprecated)(void);
     pa_modinfo *mi;
+    int errcode;
 
+    pa_assert(module);
     pa_assert(c);
     pa_assert(name);
 
-    if (c->disallow_module_loading)
+    if (c->disallow_module_loading) {
+        errcode = -PA_ERR_ACCESS;
         goto fail;
+    }
 
     m = pa_xnew(pa_module, 1);
     m->name = pa_xstrdup(name);
@@ -135,6 +143,7 @@ pa_module* pa_module_load(pa_core *c, const char *name, const char *argument) {
          * loader, which never finds anything, and therefore says "file not
          * found". */
         pa_log("Failed to open module \"%s\".", name);
+        errcode = -PA_ERR_IO;
         goto fail;
     }
 
@@ -150,6 +159,7 @@ pa_module* pa_module_load(pa_core *c, const char *name, const char *argument) {
             PA_IDXSET_FOREACH(i, c->modules, idx) {
                 if (pa_streq(name, i->name)) {
                     pa_log("Module \"%s\" should be loaded once at most. Refusing to load.", name);
+                    errcode = -PA_ERR_EXIST;
                     goto fail;
                 }
             }
@@ -165,6 +175,7 @@ pa_module* pa_module_load(pa_core *c, const char *name, const char *argument) {
 
     if (!(m->init = (int (*)(pa_module*_m)) pa_load_sym(m->dl, name, PA_SYMBOL_INIT))) {
         pa_log("Failed to load module \"%s\": symbol \""PA_SYMBOL_INIT"\" not found.", name);
+        errcode = -PA_ERR_IO;
         goto fail;
     }
 
@@ -179,6 +190,7 @@ pa_module* pa_module_load(pa_core *c, const char *name, const char *argument) {
 
     if (m->init(m) < 0) {
         pa_log_error("Failed to load module \"%s\" (argument: \"%s\"): initialization failed.", name, argument ? argument : "");
+        errcode = -PA_ERR_IO;
         goto fail;
     }
 
@@ -202,7 +214,9 @@ pa_module* pa_module_load(pa_core *c, const char *name, const char *argument) {
 
     pa_hook_fire(&m->core->hooks[PA_CORE_HOOK_MODULE_NEW], m);
 
-    return m;
+    *module = m;
+
+    return 0;
 
 fail:
 
@@ -225,7 +239,15 @@ fail:
         pa_xfree(m);
     }
 
-    return NULL;
+    *module = NULL;
+
+    return errcode;
+}
+
+static void postponed_dlclose(pa_mainloop_api *api, void *userdata) {
+    lt_dlhandle dl = userdata;
+
+    lt_dlclose(dl);
 }
 
 static void pa_module_free(pa_module *m) {
@@ -246,7 +268,15 @@ static void pa_module_free(pa_module *m) {
     if (m->proplist)
         pa_proplist_free(m->proplist);
 
-    lt_dlclose(m->dl);
+    /* If a module unloads itself with pa_module_unload(), we can't call
+     * lt_dlclose() here, because otherwise pa_module_unload() may return to a
+     * code location that has been removed from memory. Therefore, let's
+     * postpone the lt_dlclose() call a bit.
+     *
+     * Apparently lt_dlclose() doesn't always remove the module from memory,
+     * but it can happen, as can be seen here:
+     * https://bugs.freedesktop.org/show_bug.cgi?id=96831 */
+    pa_mainloop_api_once(m->core->mainloop, postponed_dlclose, m->dl);
 
     pa_hashmap_remove(m->core->modules_pending_unload, m);
 
@@ -259,14 +289,13 @@ static void pa_module_free(pa_module *m) {
     pa_xfree(m);
 }
 
-void pa_module_unload(pa_core *c, pa_module *m, bool force) {
-    pa_assert(c);
+void pa_module_unload(pa_module *m, bool force) {
     pa_assert(m);
 
     if (m->core->disallow_module_loading && !force)
         return;
 
-    if (!(m = pa_idxset_remove_by_data(c->modules, m, NULL)))
+    if (!(m = pa_idxset_remove_by_data(m->core->modules, m, NULL)))
         return;
 
     pa_module_free(m);
@@ -334,7 +363,7 @@ static void defer_cb(pa_mainloop_api*api, pa_defer_event *e, void *userdata) {
     api->defer_enable(e, 0);
 
     while ((m = pa_hashmap_first(c->modules_pending_unload)))
-        pa_module_unload(c, m, true);
+        pa_module_unload(m, true);
 }
 
 void pa_module_unload_request(pa_module *m, bool force) {

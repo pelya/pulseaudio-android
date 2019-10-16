@@ -1,21 +1,23 @@
+# use the trusty beta
+sudo: required
+dist: trusty
+
 language: c
 
 compiler:
   - gcc
- #- clang
+  - clang
 
 before_install:
-  - sudo sh -c 'echo "deb http://archive.ubuntu.com/ubuntu/ trusty main universe\ndeb-src http://archive.ubuntu.com/ubuntu/ trusty main universe" >> /etc/apt/sources.list'
-  - sudo apt-get -qq update
-install:
+  - sudo apt-get -qq -y update
   - >
-    sudo apt-get -qq install
+    sudo apt-get -qq -y install
     git-core
     autopoint
     autoconf
     automake
-    intltool
     check
+    gettext
     libasound2-dev
     libasyncns-dev
     libatomic-ops-dev
@@ -56,9 +58,12 @@ before_script:
   - NOCONFIGURE=1 ./bootstrap.sh
 
 script:
-  - ./configure --localstatedir=/var && make && make check && make check-daemon
+  - ./configure --localstatedir=/var && make && make check && make check-daemon && make install DESTDIR=`mktemp -d`
 
 notifications:
   email:
     recipients:
       - pulseaudio-commits@lists.freedesktop.org
+
+  irc:
+    - "irc.freenode.net#pulseaudio"

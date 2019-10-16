@@ -38,7 +38,6 @@
 #include "alsa-ucm.h"
 #include "alsa-sink.h"
 #include "alsa-source.h"
-#include "module-alsa-card-symdef.h"
 
 PA_MODULE_AUTHOR("Lennart Poettering");
 PA_MODULE_DESCRIPTION("ALSA Card");
@@ -69,6 +68,8 @@ PA_MODULE_USAGE(
         "profile_set=<profile set configuration file> "
         "paths_dir=<directory containing the path configuration files> "
         "use_ucm=<load use case manager> "
+        "avoid_resampling=<use stream original sample rate if possible?> "
+        "control=<name of mixer control> "
 );
 
 static const char* const valid_modargs[] = {
@@ -96,6 +97,8 @@ static const char* const valid_modargs[] = {
     "profile_set",
     "paths_dir",
     "use_ucm",
+    "avoid_resampling",
+    "control",
     NULL
 };
 
@@ -143,6 +146,8 @@ static void add_profiles(struct userdata *u, pa_hashmap *h, pa_hashmap *ports) {
 
         cp = pa_card_profile_new(ap->name, ap->description, sizeof(struct profile_data));
         cp->priority = ap->priority;
+        cp->input_name = pa_xstrdup(ap->input_name);
+        cp->output_name = pa_xstrdup(ap->output_name);
 
         if (ap->output_mappings) {
             cp->n_sinks = pa_idxset_size(ap->output_mappings);
@@ -364,8 +369,25 @@ static int report_jack_state(snd_mixer_elem_t *melem, unsigned int mask) {
     void *state;
     pa_alsa_jack *jack;
     struct temp_port_avail *tp, *tports;
+    pa_card_profile *profile;
+    pa_available_t active_available = PA_AVAILABLE_UNKNOWN;
 
     pa_assert(u);
+
+    /* Changing the jack state may cause a port change, and a port change will
+     * make the sink or source change the mixer settings. If there are multiple
+     * users having pulseaudio running, the mixer changes done by inactive
+     * users may mess up the volume settings for the active users, because when
+     * the inactive users change the mixer settings, those changes are picked
+     * up by the active user's pulseaudio instance and the changes are
+     * interpreted as if the active user changed the settings manually e.g.
+     * with alsamixer. Even single-user systems suffer from this, because gdm
+     * runs its own pulseaudio instance.
+     *
+     * We rerun this function when being unsuspended to catch up on jack state
+     * changes */
+    if (u->card->suspend_cause & PA_SUSPEND_SESSION)
+        return 0;
 
     if (mask == SND_CTL_EVENT_MASK_REMOVE)
         return 0;
@@ -408,6 +430,84 @@ static int report_jack_state(snd_mixer_elem_t *melem, unsigned int mask) {
     for (tp = tports; tp->port; tp++)
         if (tp->avail == PA_AVAILABLE_NO)
            pa_device_port_set_available(tp->port, tp->avail);
+
+    for (tp = tports; tp->port; tp++) {
+        pa_alsa_port_data *data;
+        pa_sink *sink;
+        uint32_t idx;
+
+        data = PA_DEVICE_PORT_DATA(tp->port);
+
+        if (!data->suspend_when_unavailable)
+            continue;
+
+        PA_IDXSET_FOREACH(sink, u->core->sinks, idx) {
+            if (sink->active_port == tp->port)
+                pa_sink_suspend(sink, tp->avail == PA_AVAILABLE_NO, PA_SUSPEND_UNAVAILABLE);
+        }
+    }
+
+    /* Update profile availabilities. Ideally we would mark all profiles
+     * unavailable that contain unavailable devices. We can't currently do that
+     * in all cases, because if there are multiple sinks in a profile, and the
+     * profile contains a mix of available and unavailable ports, we don't know
+     * how the ports are distributed between the different sinks. It's possible
+     * that some sinks contain only unavailable ports, in which case we should
+     * mark the profile as unavailable, but it's also possible that all sinks
+     * contain at least one available port, in which case we should mark the
+     * profile as available. Until the data structures are improved so that we
+     * can distinguish between these two cases, we mark the problematic cases
+     * as available (well, "unknown" to be precise, but there's little
+     * practical difference).
+     *
+     * When all output ports are unavailable, we know that all sinks are
+     * unavailable, and therefore the profile is marked unavailable as well.
+     * The same applies to input ports as well, of course.
+     *
+     * If there are no output ports at all, but the profile contains at least
+     * one sink, then the output is considered to be available. */
+    if (u->card->active_profile)
+        active_available = u->card->active_profile->available;
+    PA_HASHMAP_FOREACH(profile, u->card->profiles, state) {
+        pa_device_port *port;
+        void *state2;
+        bool has_input_port = false;
+        bool has_output_port = false;
+        bool found_available_input_port = false;
+        bool found_available_output_port = false;
+        pa_available_t available = PA_AVAILABLE_UNKNOWN;
+
+        PA_HASHMAP_FOREACH(port, u->card->ports, state2) {
+            if (!pa_hashmap_get(port->profiles, profile->name))
+                continue;
+
+            if (port->direction == PA_DIRECTION_INPUT) {
+                has_input_port = true;
+
+                if (port->available != PA_AVAILABLE_NO)
+                    found_available_input_port = true;
+            } else {
+                has_output_port = true;
+
+                if (port->available != PA_AVAILABLE_NO)
+                    found_available_output_port = true;
+            }
+        }
+
+        if ((has_input_port && !found_available_input_port) || (has_output_port && !found_available_output_port))
+            available = PA_AVAILABLE_NO;
+
+        /* We want to update the active profile's status last, so logic that
+         * may change the active profile based on profile availability status
+         * has an updated view of all profiles' availabilities. */
+        if (profile == u->card->active_profile)
+            active_available = available;
+        else
+            pa_card_profile_set_available(profile, available);
+    }
+
+    if (u->card->active_profile)
+        pa_card_profile_set_available(u->card->active_profile, active_available);
 
     pa_xfree(tports);
     return 0;
@@ -574,6 +674,21 @@ static void set_card_name(pa_card_new_data *data, pa_modargs *ma, const char *de
     pa_xfree(t);
 }
 
+static pa_hook_result_t card_suspend_changed(pa_core *c, pa_card *card, struct userdata *u) {
+    void *state;
+    pa_alsa_jack *jack;
+
+    if (card->suspend_cause == 0) {
+        /* We were unsuspended, update jack state in case it changed while we were suspended */
+        PA_HASHMAP_FOREACH(jack, u->jacks, state) {
+            if (jack->melem)
+                report_jack_state(jack->melem, 0);
+        }
+    }
+
+    return PA_HOOK_OK;
+}
+
 static pa_hook_result_t sink_input_put_hook_callback(pa_core *c, pa_sink_input *sink_input, struct userdata *u) {
     const char *role;
     pa_sink *sink = sink_input->sink;
@@ -640,7 +755,7 @@ int pa__init(pa_module *m) {
     struct userdata *u;
     pa_reserve_wrapper *reserve = NULL;
     const char *description;
-    const char *profile = NULL;
+    const char *profile_str = NULL;
     char *fn = NULL;
     bool namereg_fail = false;
 
@@ -683,7 +798,18 @@ int pa__init(pa_module *m) {
         }
     }
 
-    pa_modargs_get_value_boolean(u->modargs, "use_ucm", &u->use_ucm);
+    if (pa_modargs_get_value_boolean(u->modargs, "use_ucm", &u->use_ucm) < 0) {
+        pa_log("Failed to parse use_ucm argument.");
+        goto fail;
+    }
+
+    /* Force ALSA to reread its configuration. This matters if our device
+     * was hot-plugged after ALSA has already read its configuration - see
+     * https://bugs.freedesktop.org/show_bug.cgi?id=54029
+     */
+
+    snd_config_update_free_global();
+
     if (u->use_ucm && !pa_alsa_ucm_query_profiles(&u->ucm, u->alsa_card_index)) {
         pa_log_info("Found UCM profiles");
 
@@ -768,8 +894,23 @@ int pa__init(pa_module *m) {
         goto fail;
     }
 
-    if ((profile = pa_modargs_get_value(u->modargs, "profile", NULL)))
-        pa_card_new_data_set_profile(&data, profile);
+    /* The Intel HDMI LPE driver needs some special handling. When the HDMI
+     * cable is not plugged in, trying to play audio doesn't work. Any written
+     * audio is immediately discarded and an underrun is reported, and that
+     * results in an infinite loop of "fill buffer, handle underrun". To work
+     * around this issue, the suspend_when_unavailable flag is used to stop
+     * playback when the HDMI cable is unplugged. */
+    if (pa_safe_streq(pa_proplist_gets(data.proplist, "alsa.driver_name"), "snd_hdmi_lpe_audio")) {
+        pa_device_port *port;
+        void *state;
+
+        PA_HASHMAP_FOREACH(port, data.ports, state) {
+            pa_alsa_port_data *port_data;
+
+            port_data = PA_DEVICE_PORT_DATA(port);
+            port_data->suspend_when_unavailable = true;
+        }
+    }
 
     u->card = pa_card_new(m->core, &data);
     pa_card_new_data_done(&data);
@@ -780,7 +921,30 @@ int pa__init(pa_module *m) {
     u->card->userdata = u;
     u->card->set_profile = card_set_profile;
 
+    pa_module_hook_connect(m, &m->core->hooks[PA_CORE_HOOK_CARD_SUSPEND_CHANGED], PA_HOOK_NORMAL,
+            (pa_hook_cb_t) card_suspend_changed, u);
+
     init_jacks(u);
+
+    pa_card_choose_initial_profile(u->card);
+
+    /* If the "profile" modarg is given, we have to override whatever the usual
+     * policy chose in pa_card_choose_initial_profile(). */
+    profile_str = pa_modargs_get_value(u->modargs, "profile", NULL);
+    if (profile_str) {
+        pa_card_profile *profile;
+
+        profile = pa_hashmap_get(u->card->profiles, profile_str);
+        if (!profile) {
+            pa_log("No such profile: %s", profile_str);
+            goto fail;
+        }
+
+        pa_card_set_profile(u->card, profile, false);
+    }
+
+    pa_card_put(u->card);
+
     init_profile(u);
     init_eld_ctls(u);
 

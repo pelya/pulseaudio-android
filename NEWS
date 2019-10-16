@@ -1,3 +1,450 @@
+PulseAudio 13.0
+
+Changes at a glance:
+
+ * Added support for Dolby TrueHD and DTS-HD Master Audio
+ * Improved initial card profile selection for ALSA cards
+ * Bluetooth card profile choices aren't persistent any more by default
+ * Added support for SteelSeries Arctis 5 USB headset
+ * New "max_latency_msec" module argument for module-loopback
+ * New "stream_name" module argument for module-rtp-send
+ * Fixed S/PDIF for CMEDIA USB2.0 High-Speed True HD Audio
+ * Use source sample spec and channel map by default in module-loopback
+ * New "avoid_resampling" module argument for module-udev-detect and module-alsa-card
+ * "avoid_resampling" also tries to avoid format conversion if the ALSA device supports it
+ * New function to enable realtime scheduling for client threads
+ * Removed BlueZ 4 support
+ * Dropped intltool
+ * Introduction of the Meson build system
+ * Const-ification of parameters across headers
+ * Minor bug-fixes, bindings updates and several translation updates
+
+Detailed change log:
+
+  https://www.freedesktop.org/wiki/Software/PulseAudio/Notes/13.0/
+
+Contributors
+
+  Alan Coopersmith
+  Alexander E. Patrakov
+  Alexander Potashev
+  Andika Triwidada
+  Arnaud Rebillout
+  Arun Raghavan
+  Bert Hekman
+  Carlos Garnacho
+  Danny O'Brien
+  David Emett
+  David Heidelberg
+  David Hewitt
+  Diego Viola
+  Felipe Sateler
+  Fran Diéguez
+  Friedel Wolff
+  Frédéric Danis
+  Georg Chini
+  Hans de Goede
+  Hongxu Jia
+  Hui Wang
+  Ing. Jaroslav Safka
+  Jan Alexander Steffens (heftig)
+  Javier Jardón
+  Jean-Philippe Guillemin
+  Jordi Mas
+  Josef Andersson
+  Joseph Herlant
+  João Paulo Rechi Vita
+  Kaleb Ercanbrack
+  Lucas Stach
+  Luiz Augusto von Dentz
+  Lyndon Brown
+  Marek Cernocky
+  Mark Filion
+  Milo Casagrande
+  Moo
+  Mr. M
+  Nate Brown
+  Nazar Mokrynskyi
+  Nicolas Fella
+  Olaf Hering
+  Pali Rohár
+  Pierre-Louis Bossart
+  Piotr Drąg
+  RODRIGUEZ Christophe
+  Rafael Fontenelle
+  Raman Shyshniou
+  Russell Treleaven
+  S Page
+  Sangchul Lee
+  Sascha Silbe
+  Stefan Huber
+  Takashi Iwai
+  Takashi Sakamoto
+  Tanu Kaskinen
+  Thomas Hutschenreuther
+  Tomaz Solc
+  Topi Miettinen
+  Wellington Wallace
+  Will Stott
+  Yclept Nemo
+  Yuri Chornoivan
+  Zakhary Husak
+  jorisc90
+  muzena
+  scootergrisen
+  shdown
+
+
+PulseAudio 12.2
+
+The previous release tarball contained a broken configure script, this release
+fixes the tarball. There are no changes in the source, except for this NEWS
+file update.
+
+Contributors
+
+  Tanu Kaskinen
+
+
+PulseAudio 12.1
+
+A bug fix release.
+
+ * Fixed crash when switching to A2DP bluetooth profile
+ * Fixed plugin search path in module-ladspa-sink
+ * Fixed file permissions for the pipes created by module-pipe-sink and
+   module-pipe-source
+
+Contributors
+
+  Mr. M
+  Tanu Kaskinen
+
+
+PulseAudio 12.0
+
+Changes at a glance:
+
+ * Better latency reporting (and hence better A/V sync) with the A2DP bluetooth
+   profile
+ * Much more accurate latency reporting for AirPlay devices
+ * module-switch-on-connect now ignores virtual devices
+ * When using passthrough for compressed audio, set the "non-audio" bit
+ * Prioritize HDMI output over S/PDIF output
+ * HSP support for more bluetooth headsets
+ * Choose the A2DP bluetooth profile by default instead of HSP
+ * New "sink_input_properties" module argument for module-ladspa-sink
+ * New "use_system_clock_for_timing" module argument for module-pipe-sink
+ * module-pipe-sink can now use an existing pipe
+ * Fixed a crash or high CPU use problem with Intel HDMI LPE
+ * Steelseries Arctis 7 USB headset stereo output support
+ * Dell Thunderbolt Dock TB16 speaker jack support
+ * Fixed digital input support for some USB sound cards
+ * Fixed Native Instruments Traktor Audio 6 detection
+ * Ability to disable input or output on macOS
+ * New "dereverb" option for the Speex echo canceller
+ * New module: module-always-source
+ * State files not any more readable by all users in the system mode
+ * module-augment-properties now uses XDG_DATA_DIRS to find .desktop files
+ * Updates for the Vala bindings
+ * The GConf dependency can now be avoided
+ * qpaeq license changed from AGPL to LGPL
+ * qpaeq ported to Qt 5
+ * Compatibility with glibc 2.27
+ * The esdcompat tool isn't any more installed if esound support is disabled
+
+Detailed change log:
+
+  https://www.freedesktop.org/wiki/Software/PulseAudio/Notes/12.0/
+
+Contributors
+
+  Andika Triwidada
+  Andrius Štikonas
+  Arun Raghavan
+  Cheng-Chia Tseng
+  Colin Leroy
+  Constantine Kharlamov
+  Daniel Rusek
+  David Henningsson
+  David Hewitt
+  Felipe Sateler
+  Georg Chini
+  Guenter Milde
+  Hui Wang
+  Ian Ray
+  Iceyer
+  jnqnfe
+  Johan Heikkilä
+  Josef Andersson
+  Jungsup Lee
+  Khem Raj
+  KimJeongYeon
+  Kristian Klausen
+  Laurent Bigonville
+  Mihai Moldovan
+  Mr. M
+  Peter Meerwald-Stadler
+  Pierre-Louis Bossart
+  Piotr Drąg
+  Roliga
+  Russell Treleaven
+  Salvador Fandino
+  Samo Pogačnik
+  Sangchul Lee
+  Sebastian Dröge
+  Sylvain Baubeau
+  Tanu Kaskinen
+  Vivek Dasmohapatra
+  wellington wallace
+  Yuri Chornoivan
+
+
+PulseAudio 11.1
+
+A bug fix release.
+
+ * Fix a crash in filter modules related to flat volumes and volume sharing
+ * Fix a crash when the bluetooth adapter reports weird MTU size
+ * Disable bluetooth MTU autodetection by default
+ * Add mixer handling back for hardware that doesn't have any alsa-lib
+   configuration
+ * Prioritize USB devices over built-in sound cards (11.0 was supposed to have
+   this feature, but the implementation turned out to be incomplete)
+
+Contributors
+
+  Arun Raghavan
+  Tanu Kaskinen
+
+
+PulseAudio 11.0
+
+Changes at a glance:
+
+ * Support for newer AirPlay hardware
+ * USB and bluetooth devices preferred over internal sound cards
+ * Bluetooth HSP headset role implemented
+ * Bluetooth HFP audio gateway role implemented (requires oFono)
+ * Bluetooth HSP audio gateway and HFP hands-free unit roles can be enabled
+   simultaneously
+ * Upmixing can now be disabled without bad side effects
+ * Avoid having unavailable sinks or sources as the default
+ * Option to avoid resampling more often
+ * Option to automatically switch bluetooth profile to HSP more often
+ * Better latency control in module-loopback
+ * Changed module argument names in module-ladspa-sink and
+   module-virtual-surround-sink
+ * Fixed input device handling in module-waveout
+ * Improved bluetooth MTU configuration
+ * GNU Hurd support
+ * Applications can request LADSPA or virtual surround filtering for their
+   streams
+ * Support for 32-bit applications on 64-bit systems in padsp
+
+Detailed change log:
+
+  https://www.freedesktop.org/wiki/Software/PulseAudio/Notes/11.0/
+
+Contributors
+
+  Arun Raghavan
+  ced2c
+  Christian Kellner
+  Colin Leroy
+  Corentin Noël
+  David Mandelberg
+  David Michael
+  Denis Shulyaka
+  Felipe Sateler
+  Georg Chini
+  Grzegorz Kolodziejczyk
+  Hajime Fujita
+  Hui Wang
+  Imre Vadász
+  Jungsup Lee
+  Karl Ove Hufthammer
+  KimJeongYeon
+  Luiz Augusto von Dentz
+  Martin Blanchard
+  Matthias Wabersich
+  Mihai Moldovan
+  Milo Casagrande
+  Moo
+  Moritz Bruder
+  Muhammet Kara
+  muzena
+  Pali Rohár
+  Paul Seyfert
+  Peter Meerwald-Stadler
+  Philip Chimento
+  Piotr Drąg
+  Rafael Fontenelle
+  Renjith Thomas
+  Stephen Paul Weber
+  Takashi Sakamoto
+  Tanu Kaskinen
+  Ted Ying
+  Vadim Troshchinskiy
+  Wim Taymans
+  Yuri Chornoivan
+
+
+PulseAudio 10.0
+
+Changes at a glance:
+
+ * Automatically switch Bluetooth profile when using VoIP applications
+ * New module for prioritizing passthrough streams (module-allow-passthrough)
+ * Fix hotplugging support for USB surround sound cards
+ * Separate volumes for Bluetooth A2DP and HSP profiles
+ * memfd-based shared memory mechanism enabled by default
+ * Removed module-xenpv-sink
+ * Dropped dependency to json-c
+ * When using systemd to start PulseAudio, pulseaudio.socket is always started
+   first
+ * Compatibility with OpenSSL 1.1.0
+ * Clarified qpaeq license
+
+Detailed change log:
+
+  https://www.freedesktop.org/wiki/Software/PulseAudio/Notes/10.0/
+
+Contributors
+
+  Ahmed S. Darwish
+  Aidan Gauland
+  Alexander E. Patrakov
+  Anton Lundin
+  Arun Raghavan
+  Balázs Úr
+  Chris Billington
+  Cédric Valmary
+  Deepak Srivastava
+  Dušan Kazik
+  Felipe Sateler
+  Fran Dieguez
+  Georg Chini
+  Guillaume Desmottes
+  Jan Alexander Steffens
+  John Paul Adrian Glaubitz
+  Juha Kuikka
+  Juho Hämäläinen
+  KimJeongYeon
+  Marcin Lewandowski
+  Mario Blättermann
+  Moo
+  Nils Schneider
+  Pali Rohár
+  Peter Meerwald-Stadler
+  Philip Withnall
+  Pierre Ossman
+  Piotr Drąg
+  Rikard Söderström
+  Romain Naour
+  Sylvain Baubeau
+  Tanu Kaskinen
+  Ulrich Eckhardt
+  Viktar Vaŭčkievič
+
+
+PulseAudio 9.0
+
+Changes at a glance:
+
+ * Automatic routing improvements
+ * Beamforming and various other new features in the WebRTC echo canceller
+ * Various improvements in module-role-cork and module-role-ducking
+ * LFE remixing disabled by default
+ * memfd-backed shared memory transport
+ * Support for sample rates up to 384 kHz
+ * webrtc-audio-processing dependency minimum version bumped to 0.2
+ * Changed the C standard from C99 to C11.
+
+Detailed change log:
+
+  http://www.freedesktop.org/wiki/Software/PulseAudio/Notes/9.0
+
+Contributors
+
+  Ahmed S. Darwish
+  Alexander E. Patrakov
+  Arun Raghavan
+  Barun Kumar Singh
+  David Henningsson
+  Deepak Srivastava
+  Gabor Kelemen
+  Georg Chini
+  Jeremy Huddleston Sequoia
+  Jonathan Perkin
+  Juho Hämäläinen
+  Jungsup Lee
+  Kamil Rytarowski
+  Marcin Lewandowski
+  Milo Casagrande
+  Muhammet Kara
+  Nazar Mokrynskyi
+  Peter Meerwald
+  Piotr Drąg
+  Sachin Kumar Chauhan
+  Sangchul Lee
+  Tanu Kaskinen
+  YunQiang Su
+
+
+PulseAudio 8.0
+
+Changes at a glance:
+
+ * Automatic routing more likely to change profile
+ * OS X and NetBSD support improvements
+ * Systemd journal logging for clients
+ * New LFE balance programming interface
+ * Module-dbus-protocol improvements
+ * More flexible configuration file handling
+ * pulsecore-8.0.so moved to a private directory
+ * New script for measuring memory consumption
+ * Various bug fixes and small improvements
+
+Detailed change log:
+
+  http://www.freedesktop.org/wiki/Software/PulseAudio/Notes/8.0
+
+Contributors
+
+  Ahmed S. Darwish
+  Alexander E. Patrakov
+  Andrey Semashev
+  Arun Raghavan
+  David Henningsson
+  Deepak Srivastava
+  Felipe Sateler
+  Georg Chini
+  Jason Gerecke
+  John Horan
+  Juho Hämäläinen
+  Julien Isorce
+  Kamil Rytarowski
+  KimJeongYeon
+  Kiran Krishnappa
+  Lev Melnikovsky
+  Manish Sogi
+  Mihai Moldovan
+  Mingye Wang
+  Nazar Mokrynskyi
+  Peter Mattern
+  Peter Meerwald
+  Pierre Ossman
+  Ross Burton
+  Shawn Walker
+  Takashi Iwai
+  Tanu Kaskinen
+  Thomas Petazzoni
+  Yuri Chornoivan
+  Zbigniew Kempczyński
+  jungsup lee
+
+
 PulseAudio 7.0
 
 Changes at a glance:
@@ -60,7 +507,7 @@ Changes at a glance:
   * Better support for multichannel and 2.1 profiles
   * Protocol optimisations
   * Remap optimisations
-  * Lots of other enhancements, bug fixes, and documenation and i18n updates
+  * Lots of other enhancements, bug fixes, and documentation and i18n updates
 
 Detailed change log:
 
@@ -135,7 +582,7 @@ Changes at a glance:
   * Improved float->s16 and s16->float sample conversion for ARM NEON
   * "Available" flag for card profiles
   * Removed module-dbus-protocol from the default configuration
-  * Lots of other enhancements, bug fixes, and documenation and i18n updates
+  * Lots of other enhancements, bug fixes, and documentation and i18n updates
 
 Detailed change log:
 
@@ -200,7 +647,7 @@ Changes at a glance:
   * Echo canceller infrastructure fixes
   * Bash and zsh completion for command line tools
   * Solaris and OS X fixes
-  * Lots of other enhancements, bug fixes, and documenation and i18n updates
+  * Lots of other enhancements, bug fixes, and documentation and i18n updates
 
 Detailed change log:
 

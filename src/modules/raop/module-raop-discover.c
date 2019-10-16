@@ -43,16 +43,33 @@
 #include <pulsecore/namereg.h>
 #include <pulsecore/avahi-wrap.h>
 
-#include "module-raop-discover-symdef.h"
+#include "raop-util.h"
 
 PA_MODULE_AUTHOR("Colin Guthrie");
 PA_MODULE_DESCRIPTION("mDNS/DNS-SD Service Discovery of RAOP devices");
 PA_MODULE_VERSION(PACKAGE_VERSION);
 PA_MODULE_LOAD_ONCE(true);
+PA_MODULE_USAGE(
+        "latency_msec=<audio latency - applies to all devices> ");
 
 #define SERVICE_TYPE_SINK "_raop._tcp"
 
+struct userdata {
+    pa_core *core;
+    pa_module *module;
+
+    AvahiPoll *avahi_poll;
+    AvahiClient *client;
+    AvahiServiceBrowser *sink_browser;
+
+    pa_hashmap *tunnels;
+
+    bool latency_set;
+    uint32_t latency;
+};
+
 static const char* const valid_modargs[] = {
+    "latency_msec",
     NULL
 };
 
@@ -61,16 +78,6 @@ struct tunnel {
     AvahiProtocol protocol;
     char *name, *type, *domain;
     uint32_t module_index;
-};
-
-struct userdata {
-    pa_core *core;
-    pa_module *module;
-    AvahiPoll *avahi_poll;
-    AvahiClient *client;
-    AvahiServiceBrowser *sink_browser;
-
-    pa_hashmap *tunnels;
 };
 
 static unsigned tunnel_hash(const void *p) {
@@ -102,11 +109,11 @@ static int tunnel_compare(const void *a, const void *b) {
     return 0;
 }
 
-static struct tunnel *tunnel_new(
+static struct tunnel* tunnel_new(
         AvahiIfIndex interface, AvahiProtocol protocol,
         const char *name, const char *type, const char *domain) {
-
     struct tunnel *t;
+
     t = pa_xnew(struct tunnel, 1);
     t->interface = interface;
     t->protocol = protocol;
@@ -114,6 +121,7 @@ static struct tunnel *tunnel_new(
     t->type = pa_xstrdup(type);
     t->domain = pa_xstrdup(domain);
     t->module_index = PA_IDXSET_INVALID;
+
     return t;
 }
 
@@ -125,6 +133,26 @@ static void tunnel_free(struct tunnel *t) {
     pa_xfree(t);
 }
 
+/* This functions returns RAOP audio latency as guessed by the
+ * device model header.
+ * Feel free to complete the possible values after testing with
+ * your hardware.
+ */
+static uint32_t guess_latency_from_device(const char *model) {
+    uint32_t default_latency = RAOP_DEFAULT_LATENCY;
+
+    if (pa_streq(model, "PIONEER,1")) {
+        /* Pioneer N-30 */
+        default_latency = 2352;
+    } else if (pa_streq(model, "ShairportSync")) {
+        /* Shairport - software AirPort server */
+        default_latency = 2352;
+    }
+
+    pa_log_debug("Default latency is %u ms for device model %s.", default_latency, model);
+    return default_latency;
+}
+
 static void resolver_cb(
         AvahiServiceResolver *r,
         AvahiIfIndex interface, AvahiProtocol protocol,
@@ -134,88 +162,206 @@ static void resolver_cb(
         AvahiStringList *txt,
         AvahiLookupResultFlags flags,
         void *userdata) {
-
     struct userdata *u = userdata;
     struct tunnel *tnl;
+    char *device = NULL, *nicename, *dname, *vname, *args;
+    char *tp = NULL, *et = NULL, *cn = NULL;
+    char *ch = NULL, *ss = NULL, *sr = NULL;
+    char *dm = NULL;
+    char *t = NULL;
+    char at[AVAHI_ADDRESS_STR_MAX];
+    AvahiStringList *l;
+    pa_module *m;
+    uint32_t latency = RAOP_DEFAULT_LATENCY;
 
     pa_assert(u);
 
     tnl = tunnel_new(interface, protocol, name, type, domain);
 
-    if (event != AVAHI_RESOLVER_FOUND)
+    if (event != AVAHI_RESOLVER_FOUND) {
         pa_log("Resolving of '%s' failed: %s", name, avahi_strerror(avahi_client_errno(u->client)));
-    else {
-        char *device = NULL, *nicename, *dname, *vname, *args;
-        char at[AVAHI_ADDRESS_STR_MAX];
-        AvahiStringList *l;
-        pa_module *m;
-
-        if ((nicename = strstr(name, "@"))) {
-            ++nicename;
-            if (strlen(nicename) > 0) {
-                pa_log_debug("Found RAOP: %s", nicename);
-                nicename = pa_escape(nicename, "\"'");
-            } else
-                nicename = NULL;
-        }
-
-        for (l = txt; l; l = l->next) {
-            char *key, *value;
-            pa_assert_se(avahi_string_list_get_pair(l, &key, &value, NULL) == 0);
-
-            pa_log_debug("Found key: '%s' with value: '%s'", key, value);
-            if (pa_streq(key, "device")) {
-                pa_xfree(device);
-                device = value;
-                value = NULL;
-            }
-            avahi_free(key);
-            avahi_free(value);
-        }
-
-        if (device)
-            dname = pa_sprintf_malloc("raop.%s.%s", host_name, device);
-        else
-            dname = pa_sprintf_malloc("raop.%s", host_name);
-
-        if (!(vname = pa_namereg_make_valid_name(dname))) {
-            pa_log("Cannot construct valid device name from '%s'.", dname);
-            avahi_free(device);
-            pa_xfree(dname);
-            goto finish;
-        }
-        pa_xfree(dname);
-
-        if (nicename) {
-            args = pa_sprintf_malloc("server=[%s]:%u "
-                                     "sink_name=%s "
-                                     "sink_properties='device.description=\"%s\"'",
-                                     avahi_address_snprint(at, sizeof(at), a), port,
-                                     vname,
-                                     nicename);
-            pa_xfree(nicename);
-        } else {
-            args = pa_sprintf_malloc("server=[%s]:%u "
-                                     "sink_name=%s",
-                                     avahi_address_snprint(at, sizeof(at), a), port,
-                                     vname);
-        }
-
-        pa_log_debug("Loading module-raop-sink with arguments '%s'", args);
-
-        if ((m = pa_module_load(u->core, "module-raop-sink", args))) {
-            tnl->module_index = m->index;
-            pa_hashmap_put(u->tunnels, tnl, tnl);
-            tnl = NULL;
-        }
-
-        pa_xfree(vname);
-        pa_xfree(args);
-        avahi_free(device);
+        goto finish;
     }
 
-finish:
+    if ((nicename = strstr(name, "@"))) {
+        ++nicename;
+        if (strlen(nicename) > 0) {
+            pa_log_debug("Found RAOP: %s", nicename);
+            nicename = pa_escape(nicename, "\"'");
+        } else
+            nicename = NULL;
+    }
 
+    for (l = txt; l; l = l->next) {
+        char *key, *value;
+        pa_assert_se(avahi_string_list_get_pair(l, &key, &value, NULL) == 0);
+
+        pa_log_debug("Found key: '%s' with value: '%s'", key, value);
+        if (pa_streq(key, "device")) {
+            device = value;
+            value = NULL;
+        } else if (pa_streq(key, "tp")) {
+            /* Transport protocol:
+             *  - TCP = only TCP,
+             *  - UDP = only UDP,
+             *  - TCP,UDP = both supported (UDP should be preferred) */
+            pa_xfree(tp);
+            if (pa_str_in_list(value, ",", "UDP"))
+                tp = pa_xstrdup("UDP");
+            else if (pa_str_in_list(value, ",", "TCP"))
+                tp = pa_xstrdup("TCP");
+            else
+                tp = pa_xstrdup(value);
+        } else if (pa_streq(key, "et")) {
+            /* Supported encryption types:
+             *  - 0 = none,
+             *  - 1 = RSA,
+             *  - 2 = FairPlay,
+             *  - 3 = MFiSAP,
+             *  - 4 = FairPlay SAPv2.5. */
+            pa_xfree(et);
+            if (pa_str_in_list(value, ",", "1"))
+                et = pa_xstrdup("RSA");
+            else
+                et = pa_xstrdup("none");
+        } else if (pa_streq(key, "cn")) {
+            /* Suported audio codecs:
+             *  - 0 = PCM,
+             *  - 1 = ALAC,
+             *  - 2 = AAC,
+             *  - 3 = AAC ELD. */
+            pa_xfree(cn);
+            if (pa_str_in_list(value, ",", "1"))
+                cn = pa_xstrdup("ALAC");
+            else
+                cn = pa_xstrdup("PCM");
+        } else if (pa_streq(key, "md")) {
+            /* Supported metadata types:
+             *  - 0 = text,
+             *  - 1 = artwork,
+             *  - 2 = progress. */
+        } else if (pa_streq(key, "pw")) {
+            /* Requires password ? (true/false) */
+        } else if (pa_streq(key, "ch")) {
+            /* Number of channels */
+            pa_xfree(ch);
+            ch = pa_xstrdup(value);
+        } else if (pa_streq(key, "ss")) {
+            /* Sample size */
+            pa_xfree(ss);
+            ss = pa_xstrdup(value);
+        } else if (pa_streq(key, "sr")) {
+            /* Sample rate */
+            pa_xfree(sr);
+            sr = pa_xstrdup(value);
+        } else if (pa_streq(key, "am")) {
+            /* Device model */
+            pa_xfree(dm);
+            dm = pa_xstrdup(value);
+        }
+
+        avahi_free(key);
+        avahi_free(value);
+    }
+
+    if (device)
+        dname = pa_sprintf_malloc("raop_output.%s.%s", host_name, device);
+    else
+        dname = pa_sprintf_malloc("raop_output.%s", host_name);
+
+    if (!(vname = pa_namereg_make_valid_name(dname))) {
+        pa_log("Cannot construct valid device name from '%s'.", dname);
+        avahi_free(device);
+        pa_xfree(dname);
+        pa_xfree(tp);
+        pa_xfree(et);
+        pa_xfree(cn);
+        pa_xfree(ch);
+        pa_xfree(ss);
+        pa_xfree(sr);
+        pa_xfree(dm);
+        goto finish;
+    }
+
+    avahi_free(device);
+    pa_xfree(dname);
+
+    avahi_address_snprint(at, sizeof(at), a);
+
+    if (nicename == NULL)
+        nicename = pa_xstrdup("RAOP");
+
+    if (dm == NULL)
+        dm = pa_xstrdup(_("Unknown device model"));
+
+    latency = guess_latency_from_device(dm);
+
+    args = pa_sprintf_malloc("server=[%s]:%u "
+                             "sink_name=%s "
+                             "sink_properties='device.description=\"%s\" device.model=\"%s\"'",
+                             at, port,
+                             vname,
+                             nicename,
+                             dm);
+    pa_xfree(nicename);
+    pa_xfree(dm);
+
+    if (tp != NULL) {
+        t = args;
+        args = pa_sprintf_malloc("%s protocol=%s", args, tp);
+        pa_xfree(tp);
+        pa_xfree(t);
+    }
+    if (et != NULL) {
+        t = args;
+        args = pa_sprintf_malloc("%s encryption=%s", args, et);
+        pa_xfree(et);
+        pa_xfree(t);
+    }
+    if (cn != NULL) {
+        t = args;
+        args = pa_sprintf_malloc("%s codec=%s", args, cn);
+        pa_xfree(cn);
+        pa_xfree(t);
+    }
+    if (ch != NULL) {
+        t = args;
+        args = pa_sprintf_malloc("%s channels=%s", args, ch);
+        pa_xfree(ch);
+        pa_xfree(t);
+    }
+    if (ss != NULL) {
+        t = args;
+        args = pa_sprintf_malloc("%s format=%s", args, ss);
+        pa_xfree(ss);
+        pa_xfree(t);
+    }
+    if (sr != NULL) {
+        t = args;
+        args = pa_sprintf_malloc("%s rate=%s", args, sr);
+        pa_xfree(sr);
+        pa_xfree(t);
+    }
+
+    if (u->latency_set)
+        latency = u->latency;
+
+    t = args;
+    args = pa_sprintf_malloc("%s latency_msec=%u", args, latency);
+    pa_xfree(t);
+
+    pa_log_debug("Loading module-raop-sink with arguments '%s'", args);
+
+    if (pa_module_load(&m, u->core, "module-raop-sink", args) >= 0) {
+        tnl->module_index = m->index;
+        pa_hashmap_put(u->tunnels, tnl, tnl);
+        tnl = NULL;
+    }
+
+    pa_xfree(vname);
+    pa_xfree(args);
+
+finish:
     avahi_service_resolver_free(r);
 
     if (tnl)
@@ -229,7 +375,6 @@ static void browser_cb(
         const char *name, const char *type, const char *domain,
         AvahiLookupResultFlags flags,
         void *userdata) {
-
     struct userdata *u = userdata;
     struct tunnel *t;
 
@@ -248,7 +393,7 @@ static void browser_cb(
 
         /* We ignore the returned resolver object here, since the we don't
          * need to attach any special data to it, and we can still destroy
-         * it from the callback */
+         * it from the callback. */
 
     } else if (event == AVAHI_BROWSER_REMOVE) {
         struct tunnel *t2;
@@ -275,9 +420,7 @@ static void client_callback(AvahiClient *c, AvahiClientState state, void *userda
         case AVAHI_CLIENT_S_REGISTERING:
         case AVAHI_CLIENT_S_RUNNING:
         case AVAHI_CLIENT_S_COLLISION:
-
             if (!u->sink_browser) {
-
                 if (!(u->sink_browser = avahi_service_browser_new(
                               c,
                               AVAHI_IF_UNSPEC, AVAHI_PROTO_UNSPEC,
@@ -299,16 +442,16 @@ static void client_callback(AvahiClient *c, AvahiClientState state, void *userda
 
                 pa_log_debug("Avahi daemon disconnected.");
 
+                /* Try to reconnect. */
                 if (!(u->client = avahi_client_new(u->avahi_poll, AVAHI_CLIENT_NO_FAIL, client_callback, u, &error))) {
                     pa_log("avahi_client_new() failed: %s", avahi_strerror(error));
                     pa_module_unload_request(u->module, true);
                 }
             }
 
-            /* Fall through */
+            /* Fall through. */
 
         case AVAHI_CLIENT_CONNECTING:
-
             if (u->sink_browser) {
                 avahi_service_browser_free(u->sink_browser);
                 u->sink_browser = NULL;
@@ -316,12 +459,12 @@ static void client_callback(AvahiClient *c, AvahiClientState state, void *userda
 
             break;
 
-        default: ;
+        default:
+            break;
     }
 }
 
-int pa__init(pa_module*m) {
-
+int pa__init(pa_module *m) {
     struct userdata *u;
     pa_modargs *ma = NULL;
     int error;
@@ -331,10 +474,17 @@ int pa__init(pa_module*m) {
         goto fail;
     }
 
-    m->userdata = u = pa_xnew(struct userdata, 1);
+    m->userdata = u = pa_xnew0(struct userdata, 1);
     u->core = m->core;
     u->module = m;
-    u->sink_browser = NULL;
+
+    if (pa_modargs_get_value(ma, "latency_msec", NULL) != NULL) {
+        u->latency_set = true;
+        if (pa_modargs_get_value_u32(ma, "latency_msec", &u->latency) < 0) {
+            pa_log("Failed to parse latency_msec argument.");
+            goto fail;
+        }
+    }
 
     u->tunnels = pa_hashmap_new(tunnel_hash, tunnel_compare);
 
@@ -358,8 +508,9 @@ fail:
     return -1;
 }
 
-void pa__done(pa_module*m) {
-    struct userdata*u;
+void pa__done(pa_module *m) {
+    struct userdata *u;
+
     pa_assert(m);
 
     if (!(u = m->userdata))

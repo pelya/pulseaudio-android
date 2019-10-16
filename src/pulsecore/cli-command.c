@@ -344,8 +344,6 @@ static int pa_cli_command_stat(pa_core *c, pa_tokenizer *t, pa_strbuf *buf, bool
     char bytes[PA_BYTES_SNPRINT_MAX];
     const pa_mempool_stat *mstat;
     unsigned k;
-    pa_sink *def_sink;
-    pa_source *def_source;
 
     static const char* const type_table[PA_MEMBLOCK_TYPE_MAX] = {
         [PA_MEMBLOCK_POOL] = "POOL",
@@ -388,12 +386,10 @@ static int pa_cli_command_stat(pa_core *c, pa_tokenizer *t, pa_strbuf *buf, bool
     pa_strbuf_printf(buf, "Default channel map: %s\n",
                      pa_channel_map_snprint(cm, sizeof(cm), &c->default_channel_map));
 
-    def_sink = pa_namereg_get_default_sink(c);
-    def_source = pa_namereg_get_default_source(c);
     pa_strbuf_printf(buf, "Default sink name: %s\n"
                      "Default source name: %s\n",
-                     def_sink ? def_sink->name : "none",
-                     def_source ? def_source->name : "none");
+                     c->default_sink ? c->default_sink->name : "none",
+                     c->default_source ? c->default_source->name : "none");
 
     for (k = 0; k < PA_MEMBLOCK_TYPE_MAX; k++)
         pa_strbuf_printf(buf,
@@ -425,6 +421,8 @@ static int pa_cli_command_info(pa_core *c, pa_tokenizer *t, pa_strbuf *buf, bool
 
 static int pa_cli_command_load(pa_core *c, pa_tokenizer *t, pa_strbuf *buf, bool *fail) {
     const char *name;
+    pa_error_code_t err;
+    pa_module *m = NULL;
 
     pa_core_assert_ref(c);
     pa_assert(t);
@@ -436,9 +434,13 @@ static int pa_cli_command_load(pa_core *c, pa_tokenizer *t, pa_strbuf *buf, bool
         return -1;
     }
 
-    if (!pa_module_load(c, name,  pa_tokenizer_get(t, 2))) {
-        pa_strbuf_puts(buf, "Module load failed.\n");
-        return -1;
+    if ((err = pa_module_load(&m, c, name,  pa_tokenizer_get(t, 2))) < 0) {
+        if (err == PA_ERR_EXIST) {
+            pa_strbuf_puts(buf, "Module already loaded; ignoring.\n");
+        } else {
+            pa_strbuf_puts(buf, "Module load failed.\n");
+            return -1;
+        }
     }
 
     return 0;
@@ -466,13 +468,13 @@ static int pa_cli_command_unload(pa_core *c, pa_tokenizer *t, pa_strbuf *buf, bo
             return -1;
         }
 
-        pa_module_unload_request(m, false);
+        pa_module_unload(m, false);
 
     } else {
         PA_IDXSET_FOREACH(m, c->modules, idx)
             if (pa_streq(i, m->name)) {
                 unloaded = true;
-                pa_module_unload_request(m, false);
+                pa_module_unload(m, false);
             }
 
         if (unloaded == false) {
@@ -1034,7 +1036,7 @@ static int pa_cli_command_sink_default(pa_core *c, pa_tokenizer *t, pa_strbuf *b
     }
 
     if ((s = pa_namereg_get(c, n, PA_NAMEREG_SINK)))
-        pa_namereg_set_default_sink(c, s);
+        pa_core_set_configured_default_sink(c, s->name);
     else
         pa_strbuf_printf(buf, "Sink %s does not exist.\n", n);
 
@@ -1056,7 +1058,7 @@ static int pa_cli_command_source_default(pa_core *c, pa_tokenizer *t, pa_strbuf 
     }
 
     if ((s = pa_namereg_get(c, n, PA_NAMEREG_SOURCE)))
-        pa_namereg_set_default_source(c, s);
+        pa_core_set_configured_default_source(c, s->name);
     else
         pa_strbuf_printf(buf, "Source %s does not exist.\n", n);
     return 0;
@@ -1280,7 +1282,12 @@ static int pa_cli_command_play_file(pa_core *c, pa_tokenizer *t, pa_strbuf *buf,
         return -1;
     }
 
-    return pa_play_file(sink, fname, NULL);
+    if (pa_play_file(sink, fname, NULL) < 0) {
+        pa_strbuf_puts(buf, "Failed to play sound file.\n");
+        return -1;
+    }
+
+    return 0;
 }
 
 static int pa_cli_command_list_shared_props(pa_core *c, pa_tokenizer *t, pa_strbuf *buf, bool *fail) {
@@ -1822,7 +1829,7 @@ static int pa_cli_command_dump(pa_core *c, pa_tokenizer *t, pa_strbuf *buf, bool
 
         pa_strbuf_printf(buf, "set-sink-volume %s 0x%03x\n", sink->name, pa_cvolume_max(pa_sink_get_volume(sink, false)));
         pa_strbuf_printf(buf, "set-sink-mute %s %s\n", sink->name, pa_yes_no(pa_sink_get_mute(sink, false)));
-        pa_strbuf_printf(buf, "suspend-sink %s %s\n", sink->name, pa_yes_no(pa_sink_get_state(sink) == PA_SINK_SUSPENDED));
+        pa_strbuf_printf(buf, "suspend-sink %s %s\n", sink->name, pa_yes_no(sink->state == PA_SINK_SUSPENDED));
     }
 
     nl = false;
@@ -1835,7 +1842,7 @@ static int pa_cli_command_dump(pa_core *c, pa_tokenizer *t, pa_strbuf *buf, bool
 
         pa_strbuf_printf(buf, "set-source-volume %s 0x%03x\n", source->name, pa_cvolume_max(pa_source_get_volume(source, false)));
         pa_strbuf_printf(buf, "set-source-mute %s %s\n", source->name, pa_yes_no(pa_source_get_mute(source, false)));
-        pa_strbuf_printf(buf, "suspend-source %s %s\n", source->name, pa_yes_no(pa_source_get_state(source) == PA_SOURCE_SUSPENDED));
+        pa_strbuf_printf(buf, "suspend-source %s %s\n", source->name, pa_yes_no(source->state == PA_SOURCE_SUSPENDED));
     }
 
     nl = false;
@@ -1850,20 +1857,20 @@ static int pa_cli_command_dump(pa_core *c, pa_tokenizer *t, pa_strbuf *buf, bool
     }
 
     nl = false;
-    if ((sink = pa_namereg_get_default_sink(c))) {
+    if (c->default_sink) {
         if (!nl) {
             pa_strbuf_puts(buf, "\n");
             nl = true;
         }
 
-        pa_strbuf_printf(buf, "set-default-sink %s\n", sink->name);
+        pa_strbuf_printf(buf, "set-default-sink %s\n", c->default_sink->name);
     }
 
-    if ((source = pa_namereg_get_default_source(c))) {
+    if (c->default_source) {
         if (!nl)
             pa_strbuf_puts(buf, "\n");
 
-        pa_strbuf_printf(buf, "set-default-source %s\n", source->name);
+        pa_strbuf_printf(buf, "set-default-source %s\n", c->default_source->name);
     }
 
     pa_strbuf_puts(buf, "\n### EOF\n");

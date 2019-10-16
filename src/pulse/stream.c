@@ -33,6 +33,7 @@
 #include <pulse/fork-detect.h>
 
 #include <pulsecore/pstream-util.h>
+#include <pulsecore/sample-util.h>
 #include <pulsecore/log.h>
 #include <pulsecore/hashmap.h>
 #include <pulsecore/macro.h>
@@ -330,21 +331,21 @@ pa_stream* pa_stream_ref(pa_stream *s) {
     return s;
 }
 
-pa_stream_state_t pa_stream_get_state(pa_stream *s) {
+pa_stream_state_t pa_stream_get_state(const pa_stream *s) {
     pa_assert(s);
     pa_assert(PA_REFCNT_VALUE(s) >= 1);
 
     return s->state;
 }
 
-pa_context* pa_stream_get_context(pa_stream *s) {
+pa_context* pa_stream_get_context(const pa_stream *s) {
     pa_assert(s);
     pa_assert(PA_REFCNT_VALUE(s) >= 1);
 
     return s->context;
 }
 
-uint32_t pa_stream_get_index(pa_stream *s) {
+uint32_t pa_stream_get_index(const pa_stream *s) {
     pa_assert(s);
     pa_assert(PA_REFCNT_VALUE(s) >= 1);
 
@@ -849,7 +850,7 @@ finish:
     pa_context_unref(c);
 }
 
-int64_t pa_stream_get_underflow_index(pa_stream *p) {
+int64_t pa_stream_get_underflow_index(const pa_stream *p) {
     pa_assert(p);
     return p->latest_underrun_at_index;
 }
@@ -1137,18 +1138,16 @@ void pa_create_stream_callback(pa_pdispatch *pd, uint32_t command, uint32_t tag,
         || s->context->version >= 22) {
 
         pa_format_info *f = pa_format_info_new();
-        pa_tagstruct_get_format_info(t, f);
 
-        if (pa_format_info_valid(f))
-            s->format = f;
-        else {
+        if (pa_tagstruct_get_format_info(t, f) < 0 || !pa_format_info_valid(f)) {
             pa_format_info_free(f);
             if (s->n_formats > 0) {
                 /* We used the extended API, so we should have got back a proper format */
                 pa_context_fail(s->context, PA_ERR_PROTOCOL);
                 goto finish;
             }
-        }
+        } else
+            s->format = f;
     }
 
     if (!pa_tagstruct_eof(t)) {
@@ -1534,8 +1533,12 @@ int pa_stream_write_ext_free(
                 chunk.length = t_length;
             } else {
                 void *d;
+                size_t blk_size_max;
 
-                chunk.length = PA_MIN(t_length, pa_mempool_block_size_max(s->context->mempool));
+                /* Break large audio streams into _aligned_ blocks or the
+                 * other endpoint will happily discard them upon arrival. */
+                blk_size_max = pa_frame_align(pa_mempool_block_size_max(s->context->mempool), &s->sample_spec);
+                chunk.length = PA_MIN(t_length, blk_size_max);
                 chunk.memblock = pa_memblock_new(s->context->mempool, chunk.length);
 
                 d = pa_memblock_acquire(chunk.memblock);
@@ -1675,7 +1678,7 @@ int pa_stream_drop(pa_stream *s) {
     return 0;
 }
 
-size_t pa_stream_writable_size(pa_stream *s) {
+size_t pa_stream_writable_size(const pa_stream *s) {
     pa_assert(s);
     pa_assert(PA_REFCNT_VALUE(s) >= 1);
 
@@ -1686,7 +1689,7 @@ size_t pa_stream_writable_size(pa_stream *s) {
     return s->requested_bytes > 0 ? (size_t) s->requested_bytes : 0;
 }
 
-size_t pa_stream_readable_size(pa_stream *s) {
+size_t pa_stream_readable_size(const pa_stream *s) {
     pa_assert(s);
     pa_assert(PA_REFCNT_VALUE(s) >= 1);
 
@@ -1728,7 +1731,7 @@ pa_operation * pa_stream_drain(pa_stream *s, pa_stream_success_cb_t cb, void *us
     return o;
 }
 
-static pa_usec_t calc_time(pa_stream *s, bool ignore_transport) {
+static pa_usec_t calc_time(const pa_stream *s, bool ignore_transport) {
     pa_usec_t usec;
 
     pa_assert(s);
@@ -2482,7 +2485,7 @@ int pa_stream_get_time(pa_stream *s, pa_usec_t *r_usec) {
     return 0;
 }
 
-static pa_usec_t time_counter_diff(pa_stream *s, pa_usec_t a, pa_usec_t b, int *negative) {
+static pa_usec_t time_counter_diff(const pa_stream *s, pa_usec_t a, pa_usec_t b, int *negative) {
     pa_assert(s);
     pa_assert(PA_REFCNT_VALUE(s) >= 1);
 
@@ -2567,7 +2570,7 @@ const pa_channel_map* pa_stream_get_channel_map(pa_stream *s) {
     return &s->channel_map;
 }
 
-const pa_format_info* pa_stream_get_format_info(pa_stream *s) {
+const pa_format_info* pa_stream_get_format_info(const pa_stream *s) {
     pa_assert(s);
     pa_assert(PA_REFCNT_VALUE(s) >= 1);
 
@@ -2711,7 +2714,7 @@ pa_operation* pa_stream_set_buffer_attr(pa_stream *s, const pa_buffer_attr *attr
     return o;
 }
 
-uint32_t pa_stream_get_device_index(pa_stream *s) {
+uint32_t pa_stream_get_device_index(const pa_stream *s) {
     pa_assert(s);
     pa_assert(PA_REFCNT_VALUE(s) >= 1);
 
@@ -2724,7 +2727,7 @@ uint32_t pa_stream_get_device_index(pa_stream *s) {
     return s->device_index;
 }
 
-const char *pa_stream_get_device_name(pa_stream *s) {
+const char *pa_stream_get_device_name(const pa_stream *s) {
     pa_assert(s);
     pa_assert(PA_REFCNT_VALUE(s) >= 1);
 
@@ -2737,7 +2740,7 @@ const char *pa_stream_get_device_name(pa_stream *s) {
     return s->device_name;
 }
 
-int pa_stream_is_suspended(pa_stream *s) {
+int pa_stream_is_suspended(const pa_stream *s) {
     pa_assert(s);
     pa_assert(PA_REFCNT_VALUE(s) >= 1);
 
@@ -2749,7 +2752,7 @@ int pa_stream_is_suspended(pa_stream *s) {
     return s->suspended;
 }
 
-int pa_stream_is_corked(pa_stream *s) {
+int pa_stream_is_corked(const pa_stream *s) {
     pa_assert(s);
     pa_assert(PA_REFCNT_VALUE(s) >= 1);
 
@@ -2912,7 +2915,7 @@ int pa_stream_set_monitor_stream(pa_stream *s, uint32_t sink_input_idx) {
     return 0;
 }
 
-uint32_t pa_stream_get_monitor_stream(pa_stream *s) {
+uint32_t pa_stream_get_monitor_stream(const pa_stream *s) {
     pa_assert(s);
     pa_assert(PA_REFCNT_VALUE(s) >= 1);
 

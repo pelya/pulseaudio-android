@@ -161,7 +161,7 @@ static pa_resample_method_t fix_method(
                 method = PA_RESAMPLER_AUTO;
                 break;
             }
-                                     /* Else fall through */
+            /* Else fall through */
         case PA_RESAMPLER_FFMPEG:
         case PA_RESAMPLER_SOXR_MQ:
         case PA_RESAMPLER_SOXR_HQ:
@@ -273,20 +273,28 @@ static pa_sample_format_t choose_work_format(
     switch (method) {
         /* This block is for resampling functions that only
          * support the S16 sample format. */
-        case PA_RESAMPLER_SPEEX_FIXED_BASE:     /* fall through */
+        case PA_RESAMPLER_SPEEX_FIXED_BASE:
         case PA_RESAMPLER_FFMPEG:
             work_format = PA_SAMPLE_S16NE;
             break;
 
         /* This block is for resampling functions that support
          * any sample format. */
-        case PA_RESAMPLER_COPY:                 /* fall through */
+        case PA_RESAMPLER_COPY:
         case PA_RESAMPLER_TRIVIAL:
             if (!map_required && a == b) {
                 work_format = a;
                 break;
             }
-                                                /* Else fall trough */
+            /* If both input and output are using S32NE and we don't
+             * need any resampling we can use S32NE directly, avoiding
+             * converting back and forth between S32NE and
+             * FLOAT32NE. */
+            if ((a == PA_SAMPLE_S32NE) && (b == PA_SAMPLE_S32NE)) {
+                work_format = PA_SAMPLE_S32NE;
+                break;
+            }
+            /* Else fall through */
         case PA_RESAMPLER_PEAKS:
             /* PEAKS, COPY and TRIVIAL do not benefit from increased
              * working precision, so for better performance use s16ne
@@ -295,7 +303,7 @@ static pa_sample_format_t choose_work_format(
                 work_format = PA_SAMPLE_S16NE;
                 break;
             }
-                                                /* Else fall trough */
+            /* Else fall through */
         case PA_RESAMPLER_SOXR_MQ:
         case PA_RESAMPLER_SOXR_HQ:
         case PA_RESAMPLER_SOXR_VHQ:
@@ -431,6 +439,8 @@ pa_resampler* pa_resampler_new(
     return r;
 
 fail:
+    if (r->lfe_filter)
+      pa_lfe_filter_free(r->lfe_filter);
     pa_xfree(r);
 
     return NULL;
@@ -685,6 +695,11 @@ int pa_resample_method_supported(pa_resample_method_t m) {
         return 0;
 #endif
 
+#ifndef HAVE_SOXR
+    if (m >= PA_RESAMPLER_SOXR_MQ && m <= PA_RESAMPLER_SOXR_VHQ)
+        return 0;
+#endif
+
     return 1;
 }
 
@@ -789,6 +804,64 @@ static int front_rear_side(pa_channel_position_t p) {
     return ON_OTHER;
 }
 
+/* Fill a map of which output channels should get mono from input, not including
+ * LFE output channels. (The LFE output channels are mapped separately.)
+ */
+static void setup_oc_mono_map(const pa_resampler *r, float *oc_mono_map) {
+    unsigned oc;
+    unsigned n_oc;
+    bool found_oc_for_mono = false;
+
+    pa_assert(r);
+    pa_assert(oc_mono_map);
+
+    n_oc = r->o_ss.channels;
+
+    if (!(r->flags & PA_RESAMPLER_NO_FILL_SINK)) {
+        /* Mono goes to all non-LFE output channels and we're done. */
+        for (oc = 0; oc < n_oc; oc++)
+            oc_mono_map[oc] = on_lfe(r->o_cm.map[oc]) ? 0.0f : 1.0f;
+        return;
+    } else {
+        /* Initialize to all zero so we can select individual channels below. */
+        for (oc = 0; oc < n_oc; oc++)
+            oc_mono_map[oc] = 0.0f;
+    }
+
+    for (oc = 0; oc < n_oc; oc++) {
+        if (r->o_cm.map[oc] == PA_CHANNEL_POSITION_MONO) {
+            oc_mono_map[oc] = 1.0f;
+            found_oc_for_mono = true;
+        }
+    }
+    if (found_oc_for_mono)
+        return;
+
+    for (oc = 0; oc < n_oc; oc++) {
+        if (r->o_cm.map[oc] == PA_CHANNEL_POSITION_FRONT_CENTER) {
+            oc_mono_map[oc] = 1.0f;
+            found_oc_for_mono = true;
+        }
+    }
+    if (found_oc_for_mono)
+        return;
+
+    for (oc = 0; oc < n_oc; oc++) {
+        if (r->o_cm.map[oc] == PA_CHANNEL_POSITION_FRONT_LEFT || r->o_cm.map[oc] == PA_CHANNEL_POSITION_FRONT_RIGHT) {
+            oc_mono_map[oc] = 1.0f;
+            found_oc_for_mono = true;
+        }
+    }
+    if (found_oc_for_mono)
+        return;
+
+    /* Give up on finding a suitable map for mono, and just send it to all
+     * non-LFE output channels.
+     */
+    for (oc = 0; oc < n_oc; oc++)
+        oc_mono_map[oc] = on_lfe(r->o_cm.map[oc]) ? 0.0f : 1.0f;
+}
+
 static void setup_remap(const pa_resampler *r, pa_remap_t *m, bool *lfe_remixed) {
     unsigned oc, ic;
     unsigned n_oc, n_ic;
@@ -849,16 +922,18 @@ static void setup_remap(const pa_resampler *r, pa_remap_t *m, bool *lfe_remixed)
          * The algorithm works basically like this:
          *
          * 1) Connect all channels with matching names.
+         *    This also includes fixing confusion between "5.1" and
+         *    "5.1 (Side)" layouts, done by mpv.
          *
          * 2) Mono Handling:
-         *    S:Mono: Copy into all D:channels
+         *    S:Mono: See setup_oc_mono_map().
          *    D:Mono: Avg all S:channels
          *
-         * 3) Mix D:Left, D:Right:
+         * 3) Mix D:Left, D:Right (if PA_RESAMPLER_NO_FILL_SINK is clear):
          *    D:Left: If not connected, avg all S:Left
          *    D:Right: If not connected, avg all S:Right
          *
-         * 4) Mix D:Center
+         * 4) Mix D:Center (if PA_RESAMPLER_NO_FILL_SINK is clear):
          *    If not connected, avg all S:Center
          *    If still not connected, avg all S:Left, S:Right
          *
@@ -901,6 +976,7 @@ static void setup_remap(const pa_resampler *r, pa_remap_t *m, bool *lfe_remixed)
             ic_unconnected_center = 0,
             ic_unconnected_lfe = 0;
         bool ic_unconnected_center_mixed_in = 0;
+        float oc_mono_map[PA_CHANNELS_MAX];
 
         for (ic = 0; ic < n_ic; ic++) {
             if (on_left(r->i_cm.map[ic]))
@@ -911,6 +987,8 @@ static void setup_remap(const pa_resampler *r, pa_remap_t *m, bool *lfe_remixed)
                 ic_center++;
         }
 
+        setup_oc_mono_map(r, oc_mono_map);
+
         for (oc = 0; oc < n_oc; oc++) {
             bool oc_connected = false;
             pa_channel_position_t b = r->o_cm.map[oc];
@@ -918,14 +996,17 @@ static void setup_remap(const pa_resampler *r, pa_remap_t *m, bool *lfe_remixed)
             for (ic = 0; ic < n_ic; ic++) {
                 pa_channel_position_t a = r->i_cm.map[ic];
 
-                if (a == b || a == PA_CHANNEL_POSITION_MONO) {
+                if (a == b) {
                     m->map_table_f[oc][ic] = 1.0f;
 
                     oc_connected = true;
                     ic_connected[ic] = true;
+                }
+                else if (a == PA_CHANNEL_POSITION_MONO && oc_mono_map[oc] > 0.0f) {
+                    m->map_table_f[oc][ic] = oc_mono_map[oc];
 
-                    if (a == PA_CHANNEL_POSITION_MONO && on_lfe(b) && !(r->flags & PA_RESAMPLER_NO_LFE))
-                        *lfe_remixed = true;
+                    oc_connected = true;
+                    ic_connected[ic] = true;
                 }
                 else if (b == PA_CHANNEL_POSITION_MONO) {
                     m->map_table_f[oc][ic] = 1.0f / (float) n_ic;
@@ -936,9 +1017,29 @@ static void setup_remap(const pa_resampler *r, pa_remap_t *m, bool *lfe_remixed)
             }
 
             if (!oc_connected) {
+                /* Maybe it is due to 5.1 rear/side confustion? */
+                for (ic = 0; ic < n_ic; ic++) {
+                    pa_channel_position_t a = r->i_cm.map[ic];
+                    if (ic_connected[ic])
+                        continue;
+
+                    if ((a == PA_CHANNEL_POSITION_REAR_LEFT && b == PA_CHANNEL_POSITION_SIDE_LEFT) ||
+                        (a == PA_CHANNEL_POSITION_SIDE_LEFT && b == PA_CHANNEL_POSITION_REAR_LEFT) ||
+                        (a == PA_CHANNEL_POSITION_REAR_RIGHT && b == PA_CHANNEL_POSITION_SIDE_RIGHT) ||
+                        (a == PA_CHANNEL_POSITION_SIDE_RIGHT && b == PA_CHANNEL_POSITION_REAR_RIGHT)) {
+
+                        m->map_table_f[oc][ic] = 1.0f;
+
+                        oc_connected = true;
+                        ic_connected[ic] = true;
+                    }
+                }
+            }
+
+            if (!oc_connected) {
                 /* Try to find matching input ports for this output port */
 
-                if (on_left(b)) {
+                if (on_left(b) && !(r->flags & PA_RESAMPLER_NO_FILL_SINK)) {
 
                     /* We are not connected and on the left side, let's
                      * average all left side input channels. */
@@ -953,7 +1054,7 @@ static void setup_remap(const pa_resampler *r, pa_remap_t *m, bool *lfe_remixed)
                     /* We ignore the case where there is no left input channel.
                      * Something is really wrong in this case anyway. */
 
-                } else if (on_right(b)) {
+                } else if (on_right(b) && !(r->flags & PA_RESAMPLER_NO_FILL_SINK)) {
 
                     /* We are not connected and on the right side, let's
                      * average all right side input channels. */
@@ -969,7 +1070,7 @@ static void setup_remap(const pa_resampler *r, pa_remap_t *m, bool *lfe_remixed)
                      * channel. Something is really wrong in this case anyway.
                      * */
 
-                } else if (on_center(b)) {
+                } else if (on_center(b) && !(r->flags & PA_RESAMPLER_NO_FILL_SINK)) {
 
                     if (ic_center > 0) {
 

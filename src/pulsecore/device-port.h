@@ -22,14 +22,13 @@
   along with PulseAudio; if not, see <http://www.gnu.org/licenses/>.
 ***/
 
-typedef struct pa_device_port pa_device_port;
-
 #ifdef HAVE_CONFIG_H
 #include <config.h>
 #endif
 
 #include <inttypes.h>
 
+#include <pulsecore/typedefs.h>
 #include <pulse/def.h>
 #include <pulsecore/object.h>
 #include <pulsecore/hashmap.h>
@@ -43,6 +42,7 @@ struct pa_device_port {
 
     char *name;
     char *description;
+    char *preferred_profile;
 
     unsigned priority;
     pa_available_t available;         /* PA_AVAILABLE_UNKNOWN, PA_AVAILABLE_NO or PA_AVAILABLE_YES */
@@ -51,6 +51,9 @@ struct pa_device_port {
     pa_hashmap *profiles; /* Does not own the profiles */
     pa_direction_t direction;
     int64_t latency_offset;
+
+    /* Free the extra implementation specific data. Called before other members are freed. */
+    void (*impl_free)(pa_device_port *port);
 
     /* .. followed by some implementation specific data */
 };
@@ -80,6 +83,7 @@ pa_device_port *pa_device_port_new(pa_core *c, pa_device_port_new_data *data, si
 void pa_device_port_set_available(pa_device_port *p, pa_available_t available);
 
 void pa_device_port_set_latency_offset(pa_device_port *p, int64_t offset);
+void pa_device_port_set_preferred_profile(pa_device_port *p, const char *new_pp);
 
 pa_device_port *pa_device_port_find_best(pa_hashmap *ports);
 

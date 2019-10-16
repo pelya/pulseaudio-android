@@ -29,6 +29,7 @@
 
 #include <jack/jack.h>
 
+#include <pulse/util.h>
 #include <pulse/xmalloc.h>
 
 #include <pulsecore/sink.h>
@@ -40,8 +41,6 @@
 #include <pulsecore/thread-mq.h>
 #include <pulsecore/rtpoll.h>
 #include <pulsecore/sample-util.h>
-
-#include "module-jack-sink-symdef.h"
 
 /* General overview:
  *
@@ -165,13 +164,14 @@ static int sink_process_msg(pa_msgobject *o, int code, void *data, int64_t offse
             return 0;
 
         case PA_SINK_MESSAGE_GET_LATENCY: {
-            jack_nframes_t l, ft, d;
+            jack_nframes_t ft, d;
             jack_latency_range_t r;
             size_t n;
+            int32_t number_of_frames;
 
             /* This is the "worst-case" latency */
             jack_port_get_latency_range(u->port[0], JackPlaybackLatency, &r);
-            l = r.max + u->frames_in_buffer;
+            number_of_frames = r.max + u->frames_in_buffer;
 
             if (u->saved_frame_time_valid) {
                 /* Adjust the worst case latency by the time that
@@ -179,12 +179,17 @@ static int sink_process_msg(pa_msgobject *o, int code, void *data, int64_t offse
 
                 ft = jack_frame_time(u->client);
                 d = ft > u->saved_frame_time ? ft - u->saved_frame_time : 0;
-                l = l > d ? l - d : 0;
+                number_of_frames -= d;
             }
 
             /* Convert it to usec */
-            n = l * pa_frame_size(&u->sink->sample_spec);
-            *((pa_usec_t*) data) = pa_bytes_to_usec(n, &u->sink->sample_spec);
+            if (number_of_frames > 0) {
+                n = number_of_frames * pa_frame_size(&u->sink->sample_spec);
+                *((int64_t*) data) = pa_bytes_to_usec(n, &u->sink->sample_spec);
+            } else {
+                n = - number_of_frames * pa_frame_size(&u->sink->sample_spec);
+                *((int64_t*) data) = - (int64_t)pa_bytes_to_usec(n, &u->sink->sample_spec);
+            }
 
             return 0;
         }
@@ -220,7 +225,7 @@ static void thread_func(void *userdata) {
     pa_log_debug("Thread starting up");
 
     if (u->core->realtime_scheduling)
-        pa_make_realtime(u->core->realtime_priority);
+        pa_thread_make_realtime(u->core->realtime_priority);
 
     pa_thread_mq_install(&u->thread_mq);
 
@@ -263,7 +268,7 @@ static void jack_init(void *arg) {
     pa_log_info("JACK thread starting up.");
 
     if (u->core->realtime_scheduling)
-        pa_make_realtime(u->core->realtime_priority+4);
+        pa_thread_make_realtime(u->core->realtime_priority+4);
 }
 
 /* JACK Callback: This is called when JACK kicks us */
@@ -320,10 +325,18 @@ int pa__init(pa_module*m) {
     u->module = m;
     u->saved_frame_time_valid = false;
     u->rtpoll = pa_rtpoll_new();
-    pa_thread_mq_init(&u->thread_mq, m->core->mainloop, u->rtpoll);
+
+    if (pa_thread_mq_init(&u->thread_mq, m->core->mainloop, u->rtpoll) < 0) {
+        pa_log("pa_thread_mq_init() failed.");
+        goto fail;
+    }
 
     /* The queue linking the JACK thread and our RT thread */
     u->jack_msgq = pa_asyncmsgq_new(0);
+    if (!u->jack_msgq) {
+        pa_log("pa_asyncmsgq_new() failed.");
+        goto fail;
+    }
 
     /* The msgq from the JACK RT thread should have an even higher
      * priority than the normal message queues, to match the guarantee

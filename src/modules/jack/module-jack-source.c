@@ -29,6 +29,7 @@
 
 #include <jack/jack.h>
 
+#include <pulse/util.h>
 #include <pulse/xmalloc.h>
 
 #include <pulsecore/source.h>
@@ -40,8 +41,6 @@
 #include <pulsecore/thread-mq.h>
 #include <pulsecore/rtpoll.h>
 #include <pulsecore/sample-util.h>
-
-#include "module-jack-source-symdef.h"
 
 /* See module-jack-sink for a few comments how this module basically
  * works */
@@ -141,7 +140,7 @@ static int source_process_msg(pa_msgobject *o, int code, void *data, int64_t off
 
             /* Convert it to usec */
             n = l * pa_frame_size(&u->source->sample_spec);
-            *((pa_usec_t*) data) = pa_bytes_to_usec(n, &u->source->sample_spec);
+            *((int64_t*) data) = pa_bytes_to_usec(n, &u->source->sample_spec);
 
             return 0;
         }
@@ -189,7 +188,7 @@ static void thread_func(void *userdata) {
     pa_log_debug("Thread starting up");
 
     if (u->core->realtime_scheduling)
-        pa_make_realtime(u->core->realtime_priority);
+        pa_thread_make_realtime(u->core->realtime_priority);
 
     pa_thread_mq_install(&u->thread_mq);
 
@@ -227,7 +226,7 @@ static void jack_init(void *arg) {
     pa_log_info("JACK thread starting up.");
 
     if (u->core->realtime_scheduling)
-        pa_make_realtime(u->core->realtime_priority+4);
+        pa_thread_make_realtime(u->core->realtime_priority+4);
 }
 
 static void jack_shutdown(void* arg) {
@@ -274,9 +273,18 @@ int pa__init(pa_module*m) {
     u->module = m;
     u->saved_frame_time_valid = false;
     u->rtpoll = pa_rtpoll_new();
-    pa_thread_mq_init(&u->thread_mq, m->core->mainloop, u->rtpoll);
+
+    if (pa_thread_mq_init(&u->thread_mq, m->core->mainloop, u->rtpoll) < 0) {
+        pa_log("pa_thread_mq_init() failed.");
+        goto fail;
+    }
 
     u->jack_msgq = pa_asyncmsgq_new(0);
+    if (!u->jack_msgq) {
+        pa_log("pa_asyncmsgq_new() failed.");
+        goto fail;
+    }
+
     u->rtpoll_item = pa_rtpoll_item_new_asyncmsgq_read(u->rtpoll, PA_RTPOLL_EARLY-1, u->jack_msgq);
 
     if (!(u->client = jack_client_open(client_name, server_name ? JackServerName : JackNullOption, &status, server_name))) {

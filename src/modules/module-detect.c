@@ -39,14 +39,15 @@
 #include <pulsecore/core-util.h>
 #include <pulsecore/macro.h>
 
-#include "module-detect-symdef.h"
-
 PA_MODULE_AUTHOR("Lennart Poettering");
 PA_MODULE_DESCRIPTION("Detect available audio hardware and load matching drivers");
 PA_MODULE_VERSION(PACKAGE_VERSION);
 PA_MODULE_LOAD_ONCE(true);
 PA_MODULE_USAGE("just-one=<boolean>");
+
+#ifdef __linux__
 PA_MODULE_DEPRECATED("Please use module-udev-detect instead of module-detect!");
+#endif
 
 static const char* const valid_modargs[] = {
     "just-one",
@@ -71,6 +72,7 @@ static int detect_alsa(pa_core *c, int just_one) {
         char line[64], args[64];
         unsigned device, subdevice;
         int is_sink;
+        pa_module *m = NULL;
 
         if (!fgets(line, sizeof(line), f))
             break;
@@ -98,7 +100,7 @@ static int detect_alsa(pa_core *c, int just_one) {
             continue;
 
         pa_snprintf(args, sizeof(args), "device_id=%u", device);
-        if (!pa_module_load(c, is_sink ? "module-alsa-sink" : "module-alsa-source", args))
+        if (pa_module_load(&m, c, is_sink ? "module-alsa-sink" : "module-alsa-source", args) < 0)
             continue;
 
         n++;
@@ -133,6 +135,7 @@ static int detect_oss(pa_core *c, int just_one) {
     while (!feof(f)) {
         char line[256], args[64];
         unsigned device;
+        pa_module *m = NULL;
 
         if (!fgets(line, sizeof(line), f))
             break;
@@ -153,14 +156,14 @@ static int detect_oss(pa_core *c, int just_one) {
             else
                 pa_snprintf(args, sizeof(args), "device=/dev/dsp%u", device);
 
-            if (!pa_module_load(c, "module-oss", args))
+            if (pa_module_load(&m, c, "module-oss", args) < 0)
                 continue;
 
         } else if (sscanf(line, "pcm%u: ", &device) == 1) {
             /* FreeBSD support, the devices are named /dev/dsp0.0, dsp0.1 and so on */
             pa_snprintf(args, sizeof(args), "device=/dev/dsp%u.0", device);
 
-            if (!pa_module_load(c, "module-oss", args))
+            if (pa_module_load(&m, c, "module-oss", args) < 0)
                 continue;
         }
 
@@ -180,6 +183,7 @@ static int detect_solaris(pa_core *c, int just_one) {
     struct stat s;
     const char *dev;
     char args[64];
+    pa_module *m = NULL;
 
     dev = getenv("AUDIODEV");
     if (!dev)
@@ -196,7 +200,7 @@ static int detect_solaris(pa_core *c, int just_one) {
 
     pa_snprintf(args, sizeof(args), "device=%s", dev);
 
-    if (!pa_module_load(c, "module-solaris", args))
+    if (pa_module_load(&m, c, "module-solaris", args) < 0)
         return 0;
 
     return 1;
@@ -205,11 +209,12 @@ static int detect_solaris(pa_core *c, int just_one) {
 
 #ifdef OS_IS_WIN32
 static int detect_waveout(pa_core *c, int just_one) {
+    pa_module *m = NULL;
     /*
      * FIXME: No point in enumerating devices until the plugin supports
      * selecting anything but the first.
      */
-    if (!pa_module_load(c, "module-waveout", ""))
+    if (pa_module_load(&m, c, "module-waveout", "") < 0)
         return 0;
 
     return 1;

@@ -44,11 +44,10 @@ pulseaudio -n \
         --load="module-suspend-on-idle" \
         --load="module-native-protocol-unix" \
         --load="module-cli-protocol-unix" \
-        --dl-search-path="$(dirname $SCRIPTNAME)/.libs/" \
         &
 
 # wait a few seconds to let the daemon start!
-sleep 5
+sleep 2
 
 unset DISPLAY
 

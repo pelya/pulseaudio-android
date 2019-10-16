@@ -23,18 +23,29 @@ License along with PulseAudio; if not, see <http://www.gnu.org/licenses/>.
 
   <synopsis>
     <p><file>~/.config/pulse/daemon.conf</file></p>
-
+    <p><file>~/.config/pulse/daemon.conf.d/*.conf</file></p>
     <p><file>@PA_DEFAULT_CONFIG_DIR@/daemon.conf</file></p>
+    <p><file>@PA_DEFAULT_CONFIG_DIR@/daemon.conf.d/*.conf</file></p>
   </synopsis>
 
   <description>
     <p>The PulseAudio sound server reads configuration directives from
-    a file <file>~/.config/pulse/daemon.conf</file> on startup and when that
-    file doesn't exist from
-    <file>@PA_DEFAULT_CONFIG_DIR@/daemon.conf</file>. Please note that the
-    server also reads a configuration script on startup
-    <file>default.pa</file> which also contains runtime configuration
-    directives.</p>
+    a configuration file on startup. If the per-user file
+    <file>~/.config/pulse/daemon.conf</file> exists, it is used, otherwise the
+    system configuration file <file>@PA_DEFAULT_CONFIG_DIR@/daemon.conf</file>
+    is used. In addition to those main files, configuration directives can also
+    be put in files under directories
+    <file>~/.config/pulse/daemon.conf.d/</file> and
+    <file>@PA_DEFAULT_CONFIG_DIR@/daemon.conf.d/</file>. Those files have to
+    have the .conf file name extension, but otherwise the file names can be
+    chosen freely. The files under daemon.conf.d are processed in alphabetical
+    order. In case the same option is set in multiple files, the last file to
+    set an option overrides earlier files. The main daemon.conf file is
+    processed first, so options set in files under daemon.conf.d override the
+    main file.</p>
+
+    <p>Please note that the server also reads a configuration script on
+    startup. See <manref name="default.pa" section="5"/>.</p>
 
     <p>The configuration file is a simple collection of variable
     declarations. If the configuration file parser encounters either ;
@@ -113,9 +124,26 @@ License along with PulseAudio; if not, see <http://www.gnu.org/licenses/>.
     </option>
 
     <option>
+      <p><opt>avoid-resampling=</opt> If set, try to configure the
+      device to avoid resampling. This only works on devices which
+      support reconfiguring their rate, and when no other streams are
+      already playing or capturing audio. The device will also not be
+      configured to a rate less than the default and alternate sample
+      rates.</p>
+    </option>
+
+    <option>
       <p><opt>enable-remixing=</opt> If disabled never upmix or
       downmix channels to different channel maps. Instead, do a simple
       name-based matching only. Defaults to <opt>yes.</opt></p>
+    </option>
+
+    <option>
+      <p><opt>remixing-use-all-sink-channels=</opt> If enabled, use
+      all sink channels when remixing. Otherwise, remix to the minimal
+      set of sink channels needed to reproduce all of the source
+      channels. (This has no effect on LFE remixing.) Defaults to
+      <opt>yes</opt>.</p>
     </option>
 
     <option>
@@ -125,12 +153,12 @@ License along with PulseAudio; if not, see <http://www.gnu.org/licenses/>.
       channel is available as well. If no input LFE channel is
       available the output LFE channel will always be 0. If no output
       LFE channel is available the signal on the input LFE channel
-      will be ignored. Defaults to <opt>yes</opt>.</p>
+      will be ignored. Defaults to <opt>no</opt>.</p>
     </option>
 
     <option>
       <p><opt>lfe-crossover-freq=</opt> The crossover frequency (in Hz) for the
-      LFE filter. Defaults to 120 Hz. Set it to 0 to disable the LFE filter.</p>
+      LFE filter. Set it to 0 to disable the LFE filter. Defaults to 0.</p>
     </option>
 
     <option>
@@ -178,9 +206,14 @@ License along with PulseAudio; if not, see <http://www.gnu.org/licenses/>.
 
     <option>
       <p><opt>enable-shm=</opt> Enable data transfer via POSIX
-      shared memory. Takes a boolean argument, defaults to
+      or memfd shared memory. Takes a boolean argument, defaults to
       <opt>yes</opt>. The <opt>--disable-shm</opt> command line
       argument takes precedence.</p>
+    </option>
+
+    <option>
+      <p><opt>enable-memfd=</opt>. Enable memfd shared memory. Takes
+      a boolean argument, defaults to <opt>yes</opt>.</p>
     </option>
 
     <option>
@@ -229,7 +262,7 @@ License along with PulseAudio; if not, see <http://www.gnu.org/licenses/>.
       mentioned above apply. However, if PA enters an endless loop,
       realtime scheduling causes a system lockup. Thus, realtime
       scheduling should only be enabled on trusted machines for
-      now. Please not that only the IO threads of PulseAudio are made
+      now. Please note that only the IO threads of PulseAudio are made
       real-time. The controlling thread is left a normally scheduled
       thread. Thus enabling the high-priority option is orthogonal.
       See <manref section="1" name="pulseaudio"/> for more
@@ -259,9 +292,18 @@ License along with PulseAudio; if not, see <http://www.gnu.org/licenses/>.
     <option>
       <p><opt>exit-idle-time=</opt> Terminate the daemon after the
       last client quit and this time in seconds passed. Use a negative value to
-      disable this feature. Defaults to 20. The
-      <opt>--exit-idle-time</opt> command line option takes
-      precedence.</p>
+      disable this feature. Defaults to 20. The <opt>--exit-idle-time</opt>
+      command line option takes precedence.</p>
+
+      <p>When PulseAudio runs in the per-user mode and detects a login
+      session, then any positive value will be reset to 0 so that PulseAudio
+      will terminate immediately on logout. A positive value therefore has
+      effect only in environments where there's no support for login session
+      tracking. A negative value can still be used to disable any automatic
+      exit.</p>
+
+      <p>When PulseAudio runs in the system mode, automatic exit is always
+      disabled, so this option does nothing.</p>
     </option>
 
     <option>

@@ -20,14 +20,16 @@
   along with PulseAudio; if not, see <http://www.gnu.org/licenses/>.
 ***/
 
+#include <pulsecore/typedefs.h>
 #include <pulse/mainloop-api.h>
 #include <pulse/sample.h>
 #include <pulsecore/cpu.h>
 
-typedef struct pa_core pa_core;
-
 /* This is a bitmask that encodes the cause why a sink/source is
- * suspended. */
+ * suspended.
+ *
+ * When adding new causes, remember to update pa_suspend_cause_to_string() and
+ * PA_SUSPEND_CAUSE_TO_STRING_BUF_SIZE! */
 typedef enum pa_suspend_cause {
     PA_SUSPEND_USER = 1,         /* Exposed to the user via some protocol */
     PA_SUSPEND_APPLICATION = 2,  /* Used by the device reservation logic */
@@ -35,6 +37,7 @@ typedef enum pa_suspend_cause {
     PA_SUSPEND_SESSION = 8,      /* Used by module-hal for mark inactive sessions */
     PA_SUSPEND_PASSTHROUGH = 16, /* Used to suspend monitor sources when the sink is in passthrough mode */
     PA_SUSPEND_INTERNAL = 32,    /* This is used for short period server-internal suspends, such as for sample rate updates */
+    PA_SUSPEND_UNAVAILABLE = 64, /* Used by device implementations that have to suspend when the device is unavailable */
     PA_SUSPEND_ALL = 0xFFFF      /* Magic cause that can be used to resume forcibly */
 } pa_suspend_cause_t;
 
@@ -76,6 +79,7 @@ typedef enum pa_core_hook {
     PA_CORE_HOOK_SINK_FLAGS_CHANGED,
     PA_CORE_HOOK_SINK_VOLUME_CHANGED,
     PA_CORE_HOOK_SINK_MUTE_CHANGED,
+    PA_CORE_HOOK_SINK_PORT_LATENCY_OFFSET_CHANGED,
     PA_CORE_HOOK_SOURCE_NEW,
     PA_CORE_HOOK_SOURCE_FIXATE,
     PA_CORE_HOOK_SOURCE_PUT,
@@ -87,6 +91,7 @@ typedef enum pa_core_hook {
     PA_CORE_HOOK_SOURCE_FLAGS_CHANGED,
     PA_CORE_HOOK_SOURCE_VOLUME_CHANGED,
     PA_CORE_HOOK_SOURCE_MUTE_CHANGED,
+    PA_CORE_HOOK_SOURCE_PORT_LATENCY_OFFSET_CHANGED,
     PA_CORE_HOOK_SINK_INPUT_NEW,
     PA_CORE_HOOK_SINK_INPUT_FIXATE,
     PA_CORE_HOOK_SINK_INPUT_PUT,
@@ -119,11 +124,14 @@ typedef enum pa_core_hook {
     PA_CORE_HOOK_CLIENT_PROPLIST_CHANGED,
     PA_CORE_HOOK_CLIENT_SEND_EVENT,
     PA_CORE_HOOK_CARD_NEW,
+    PA_CORE_HOOK_CARD_CHOOSE_INITIAL_PROFILE,
     PA_CORE_HOOK_CARD_PUT,
     PA_CORE_HOOK_CARD_UNLINK,
+    PA_CORE_HOOK_CARD_PREFERRED_PORT_CHANGED,
     PA_CORE_HOOK_CARD_PROFILE_CHANGED,
     PA_CORE_HOOK_CARD_PROFILE_ADDED,
     PA_CORE_HOOK_CARD_PROFILE_AVAILABLE_CHANGED,
+    PA_CORE_HOOK_CARD_SUSPEND_CHANGED,
     PA_CORE_HOOK_PORT_AVAILABLE_CHANGED,
     PA_CORE_HOOK_PORT_LATENCY_OFFSET_CHANGED,
     PA_CORE_HOOK_DEFAULT_SINK_CHANGED,
@@ -156,11 +164,23 @@ struct pa_core {
     pa_idxset *clients, *cards, *sinks, *sources, *sink_inputs, *source_outputs, *modules, *scache;
 
     /* Some hashmaps for all sorts of entities */
-    pa_hashmap *namereg, *shared;
+    pa_hashmap *namereg, *shared, *message_handlers;
 
-    /* The default sink/source */
-    pa_source *default_source;
+    /* The default sink/source as configured by the user. If the user hasn't
+     * explicitly configured anything, these are set to NULL. These are strings
+     * instead of sink/source pointers, because that allows us to reference
+     * devices that don't currently exist. That's useful for remembering that
+     * a hotplugged USB sink was previously set as the default sink. */
+    char *configured_default_sink;
+    char *configured_default_source;
+
+    /* The effective default sink/source. If no sink or source is explicitly
+     * configured as the default, we pick the device that ranks highest
+     * according to the compare_sinks() and compare_sources() functions in
+     * core.c. pa_core_update_default_sink/source() has to be called whenever
+     * anything changes that might change the comparison results. */
     pa_sink *default_sink;
+    pa_source *default_source;
 
     pa_channel_map default_channel_map;
     pa_sample_spec default_sample_spec;
@@ -178,10 +198,13 @@ struct pa_core {
     PA_LLIST_HEAD(pa_subscription_event, subscription_event_queue);
     pa_subscription_event *subscription_event_last;
 
-    /* The mempool is used for data we write to, it's readonly for the client.
-       The rw_mempool is used for data writable by both server and client (and
-       can be NULL in some cases). */
-    pa_mempool *mempool, *rw_mempool;
+    /* The mempool is used for data we write to, it's readonly for the client. */
+    pa_mempool *mempool;
+
+    /* Shared memory size, as specified either by daemon configuration
+     * or PA daemon defaults (~ 64 MiB). */
+    size_t shm_size;
+
     pa_silence_cache silence_cache;
 
     pa_time_event *exit_event;
@@ -194,7 +217,9 @@ struct pa_core {
     bool disallow_exit:1;
     bool running_as_daemon:1;
     bool realtime_scheduling:1;
+    bool avoid_resampling:1;
     bool disable_remixing:1;
+    bool remixing_use_all_sink_channels:1;
     bool disable_lfe_remixing:1;
     bool deferred_volume:1;
 
@@ -216,7 +241,24 @@ enum {
     PA_CORE_MESSAGE_MAX
 };
 
-pa_core* pa_core_new(pa_mainloop_api *m, bool shared, size_t shm_size);
+pa_core* pa_core_new(pa_mainloop_api *m, bool shared, bool enable_memfd, size_t shm_size);
+
+void pa_core_set_configured_default_sink(pa_core *core, const char *sink);
+void pa_core_set_configured_default_source(pa_core *core, const char *source);
+
+/* These should be called whenever something changes that may affect the
+ * default sink or source choice.
+ *
+ * If the default source choice happens between two monitor sources, the
+ * monitored sinks are compared, so if the default sink changes, the default
+ * source may change too. However, pa_core_update_default_sink() calls
+ * pa_core_update_default_source() internally, so it's sufficient to only call
+ * pa_core_update_default_sink() when something happens that affects the sink
+ * ordering. */
+void pa_core_update_default_sink(pa_core *core);
+void pa_core_update_default_source(pa_core *core);
+
+void pa_core_set_exit_idle_time(pa_core *core, int time);
 
 /* Check whether no one is connected to this core */
 void pa_core_check_idle(pa_core *c);
@@ -228,5 +270,12 @@ void pa_core_maybe_vacuum(pa_core *c);
 /* wrapper for c->mainloop->time_*() RT time events */
 pa_time_event* pa_core_rttime_new(pa_core *c, pa_usec_t usec, pa_time_event_cb_t cb, void *userdata);
 void pa_core_rttime_restart(pa_core *c, pa_time_event *e, pa_usec_t usec);
+
+static const size_t PA_SUSPEND_CAUSE_TO_STRING_BUF_SIZE =
+    sizeof("USER|APPLICATION|IDLE|SESSION|PASSTHROUGH|INTERNAL|UNAVAILABLE");
+
+/* Converts the given suspend cause to a string. The string is written to the
+ * provided buffer. The same buffer is the return value of this function. */
+const char *pa_suspend_cause_to_string(pa_suspend_cause_t cause, char buf[PA_SUSPEND_CAUSE_TO_STRING_BUF_SIZE]);
 
 #endif

@@ -21,6 +21,7 @@
 
 #include "device-port.h"
 #include <pulsecore/card.h>
+#include <pulsecore/core-util.h>
 
 PA_DEFINE_PUBLIC_CLASS(pa_device_port, pa_object);
 
@@ -65,6 +66,15 @@ void pa_device_port_new_data_done(pa_device_port_new_data *data) {
     pa_xfree(data->description);
 }
 
+void pa_device_port_set_preferred_profile(pa_device_port *p, const char *new_pp) {
+    pa_assert(p);
+
+    if (!pa_safe_streq(p->preferred_profile, new_pp)) {
+        pa_xfree(p->preferred_profile);
+        p->preferred_profile = pa_xstrdup(new_pp);
+    }
+}
+
 void pa_device_port_set_available(pa_device_port *p, pa_available_t status) {
     pa_assert(p);
 
@@ -74,15 +84,22 @@ void pa_device_port_set_available(pa_device_port *p, pa_available_t status) {
 /*    pa_assert(status != PA_AVAILABLE_UNKNOWN); */
 
     p->available = status;
-    pa_log_debug("Setting port %s to status %s", p->name, status == PA_AVAILABLE_YES ? "yes" :
-       status == PA_AVAILABLE_NO ? "no" : "unknown");
+    pa_log_debug("Setting port %s to status %s", p->name, pa_available_to_string(status));
 
     /* Post subscriptions to the card which owns us */
     /* XXX: We need to check p->card, because this function may be called
      * before the card object has been created. The card object should probably
      * be created before port objects, and then p->card could be non-NULL for
      * the whole lifecycle of pa_device_port. */
-    if (p->card) {
+    if (p->card && p->card->linked) {
+        /* A sink or source whose active port is unavailable can't be the
+         * default sink/source, so port availability changes may affect the
+         * default sink/source choice. */
+        if (p->direction == PA_DIRECTION_OUTPUT)
+            pa_core_update_default_sink(p->core);
+        else
+            pa_core_update_default_source(p->core);
+
         pa_subscription_post(p->core, PA_SUBSCRIPTION_EVENT_CARD|PA_SUBSCRIPTION_EVENT_CHANGE, p->card->index);
         pa_hook_fire(&p->core->hooks[PA_CORE_HOOK_PORT_AVAILABLE_CHANGED], p);
     }
@@ -94,12 +111,16 @@ static void device_port_free(pa_object *o) {
     pa_assert(p);
     pa_assert(pa_device_port_refcnt(p) == 0);
 
+    if (p->impl_free)
+        p->impl_free(p);
+
     if (p->proplist)
         pa_proplist_free(p->proplist);
 
     if (p->profiles)
         pa_hashmap_free(p->profiles);
 
+    pa_xfree(p->preferred_profile);
     pa_xfree(p->name);
     pa_xfree(p->description);
     pa_xfree(p);
@@ -150,7 +171,7 @@ void pa_device_port_set_latency_offset(pa_device_port *p, int64_t offset) {
 
             PA_IDXSET_FOREACH(sink, p->core->sinks, state) {
                 if (sink->active_port == p) {
-                    pa_sink_set_latency_offset(sink, p->latency_offset);
+                    pa_sink_set_port_latency_offset(sink, p->latency_offset);
                     break;
                 }
             }
@@ -163,7 +184,7 @@ void pa_device_port_set_latency_offset(pa_device_port *p, int64_t offset) {
 
             PA_IDXSET_FOREACH(source, p->core->sources, state) {
                 if (source->active_port == p) {
-                    pa_source_set_latency_offset(source, p->latency_offset);
+                    pa_source_set_port_latency_offset(source, p->latency_offset);
                     break;
                 }
             }

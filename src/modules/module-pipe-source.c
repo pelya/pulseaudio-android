@@ -46,8 +46,6 @@
 #include <pulsecore/rtpoll.h>
 #include <pulsecore/poll.h>
 
-#include "module-pipe-source-symdef.h"
-
 PA_MODULE_AUTHOR("Lennart Poettering");
 PA_MODULE_DESCRIPTION("UNIX pipe source");
 PA_MODULE_VERSION(PACKAGE_VERSION);
@@ -113,7 +111,7 @@ static int source_process_msg(
                 n = (size_t) l;
 #endif
 
-            *((pa_usec_t*) data) = pa_bytes_to_usec(n, &u->source->sample_spec);
+            *((int64_t*) data) = pa_bytes_to_usec(n, &u->source->sample_spec);
             return 0;
         }
     }
@@ -234,14 +232,24 @@ int pa__init(pa_module *m) {
     u->module = m;
     pa_memchunk_reset(&u->memchunk);
     u->rtpoll = pa_rtpoll_new();
-    pa_thread_mq_init(&u->thread_mq, m->core->mainloop, u->rtpoll);
+
+    if (pa_thread_mq_init(&u->thread_mq, m->core->mainloop, u->rtpoll) < 0) {
+        pa_log("pa_thread_mq_init() failed.");
+        goto fail;
+    }
 
     u->filename = pa_runtime_path(pa_modargs_get_value(ma, "file", DEFAULT_FILE_NAME));
 
     if (mkfifo(u->filename, 0666) < 0) {
         pa_log("mkfifo('%s'): %s", u->filename, pa_cstrerror(errno));
         goto fail;
+    } else {
+        /* Our umask is 077, so the pipe won't be created with the requested
+         * permissions. Let's fix the permissions with chmod(). */
+        if (chmod(u->filename, 0666) < 0)
+            pa_log_warn("chomd('%s'): %s", u->filename, pa_cstrerror(errno));
     }
+
     if ((u->fd = pa_open_cloexec(u->filename, O_RDWR, 0)) < 0) {
         pa_log("open('%s'): %s", u->filename, pa_cstrerror(errno));
         goto fail;

@@ -34,9 +34,9 @@
  *
  * \section overv_sec Overview
  *
- * Sinks, sources, sink inputs and samples can all have their own volumes.
- * To deal with these, The PulseAudio library contains a number of functions
- * that ease handling.
+ * Sinks, sources, sink inputs, source outputs and samples can all have their
+ * own volumes. To deal with these, The PulseAudio library contains a number of
+ * functions that ease handling.
  *
  * The basic volume type in PulseAudio is the \ref pa_volume_t type. Most of
  * the time, applications will use the aggregated pa_cvolume structure that
@@ -47,13 +47,12 @@
  *
  * There is no single well-defined meaning attached to the 100% volume for a
  * sink input. In fact, it depends on the server configuration. With flat
- * volumes enabled (the default in most Linux distributions), it means the
- * maximum volume that the sound hardware is capable of, which is usually so
- * high that you absolutely must not set sink input volume to 100% unless the
- * the user explicitly requests that (note that usually you shouldn't set the
- * volume anyway if the user doesn't explicitly request it, instead, let
- * PulseAudio decide the volume for the sink input). With flat volumes disabled
- * (the default in Ubuntu), the sink input volume is relative to the sink
+ * volumes enabled, it means the maximum volume that the sound hardware is
+ * capable of, which is usually so high that you absolutely must not set sink
+ * input volume to 100% unless the the user explicitly requests that (note that
+ * usually you shouldn't set the volume anyway if the user doesn't explicitly
+ * request it, instead, let PulseAudio decide the volume for the sink input).
+ * With flat volumes disabled the sink input volume is relative to the sink
  * volume, so 100% sink input volume means that the sink input is played at the
  * current sink volume level. In this case 100% is often a good default volume
  * for a sink input, although you still should let PulseAudio decide the
@@ -62,9 +61,9 @@
  *
  * \section calc_sec Calculations
  *
- * The volumes in PulseAudio are logarithmic in nature and applications
- * shouldn't perform calculations with them directly. Instead, they should
- * be converted to and from either dB or a linear scale:
+ * The volumes in PulseAudio are cubic in nature and applications shouldn't
+ * perform calculations with them directly. Instead, they should be converted
+ * to and from either dB or a linear scale:
  *
  * \li dB - pa_sw_volume_from_dB() / pa_sw_volume_to_dB()
  * \li Linear - pa_sw_volume_from_linear() / pa_sw_volume_to_linear()
@@ -72,14 +71,12 @@
  * For simple multiplication, pa_sw_volume_multiply() and
  * pa_sw_cvolume_multiply() can be used.
  *
- * Calculations can only be reliably performed on software volumes
- * as it is commonly unknown what scale hardware volumes relate to.
- *
- * The functions described above are only valid when used with
- * software volumes. Hence it is usually a better idea to treat all
- * volume values as opaque with a range from PA_VOLUME_MUTED (0%) to
- * PA_VOLUME_NORM (100%) and to refrain from any calculations with
- * them.
+ * It's often unknown what scale hardware volumes relate to. Don't use the
+ * above functions on sink and source volumes, unless the sink or source in
+ * question has the PA_SINK_DECIBEL_VOLUME or PA_SOURCE_DECIBEL_VOLUME flag
+ * set. The conversion functions are rarely needed anyway, most of the time
+ * it's sufficient to treat all volumes as opaque with a range from
+ * PA_VOLUME_MUTED (0%) to PA_VOLUME_NORM (100%).
  *
  * \section conv_sec Convenience Functions
  *
@@ -150,7 +147,9 @@ typedef struct pa_cvolume {
     pa_volume_t values[PA_CHANNELS_MAX];  /**< Per-channel volume */
 } pa_cvolume;
 
-/** Return non-zero when *a == *b */
+/** Return non-zero when *a == *b, checking that both a and b
+ * have the same number of channels and that the volumes of
+ * channels in a equal those in b. */
 int pa_cvolume_equal(const pa_cvolume *a, const pa_cvolume *b) PA_GCC_PURE;
 
 /** Initialize the specified volume and return a pointer to
@@ -174,7 +173,7 @@ pa_cvolume* pa_cvolume_set(pa_cvolume *a, unsigned channels, pa_volume_t v);
  * might become part of an ABI.*/
 #define PA_CVOLUME_SNPRINT_MAX 320
 
-/** Pretty print a volume structure */
+/** Pretty print a volume structure. Returns \a s. */
 char *pa_cvolume_snprint(char *s, size_t l, const pa_cvolume *c);
 
 /** Maximum length of the strings returned by
@@ -184,7 +183,7 @@ char *pa_cvolume_snprint(char *s, size_t l, const pa_cvolume *c);
  * might become part of an ABI. \since 0.9.13 */
 #define PA_SW_CVOLUME_SNPRINT_DB_MAX 448
 
-/** Pretty print a volume structure but show dB values. \since 0.9.13 */
+/** Pretty print a volume structure, showing dB values. Returns \a s. \since 0.9.13 */
 char *pa_sw_cvolume_snprint_dB(char *s, size_t l, const pa_cvolume *c);
 
 /** Maximum length of the strings returned by pa_cvolume_snprint_verbose().
@@ -196,7 +195,7 @@ char *pa_sw_cvolume_snprint_dB(char *s, size_t l, const pa_cvolume *c);
 /** Pretty print a volume structure in a verbose way. The volume for each
  * channel is printed in several formats: the raw pa_volume_t value,
  * percentage, and if print_dB is non-zero, also the dB value. If map is not
- * NULL, the channel names will be printed. \since 5.0 */
+ * NULL, the channel names will be printed. Returns \a s. \since 5.0 */
 char *pa_cvolume_snprint_verbose(char *s, size_t l, const pa_cvolume *c, const pa_channel_map *map, int print_dB);
 
 /** Maximum length of the strings returned by
@@ -206,7 +205,7 @@ char *pa_cvolume_snprint_verbose(char *s, size_t l, const pa_cvolume *c, const p
  * might become part of an ABI. \since 0.9.15 */
 #define PA_VOLUME_SNPRINT_MAX 10
 
-/** Pretty print a volume \since 0.9.15 */
+/** Pretty print a volume. Returns \a s. \since 0.9.15 */
 char *pa_volume_snprint(char *s, size_t l, pa_volume_t v);
 
 /** Maximum length of the strings returned by
@@ -216,7 +215,7 @@ char *pa_volume_snprint(char *s, size_t l, pa_volume_t v);
  * might become part of an ABI. \since 0.9.15 */
 #define PA_SW_VOLUME_SNPRINT_DB_MAX 11
 
-/** Pretty print a volume but show dB values. \since 0.9.15 */
+/** Pretty print a volume but show dB values. Returns \a s. \since 0.9.15 */
 char *pa_sw_volume_snprint_dB(char *s, size_t l, pa_volume_t v);
 
 /** Maximum length of the strings returned by pa_volume_snprint_verbose().
@@ -227,7 +226,7 @@ char *pa_sw_volume_snprint_dB(char *s, size_t l, pa_volume_t v);
 
 /** Pretty print a volume in a verbose way. The volume is printed in several
  * formats: the raw pa_volume_t value, percentage, and if print_dB is non-zero,
- * also the dB value. \since 5.0 */
+ * also the dB value. Returns \a s. \since 5.0 */
 char *pa_volume_snprint_verbose(char *s, size_t l, pa_volume_t v, int print_dB);
 
 /** Return the average volume of all channels */
@@ -279,13 +278,13 @@ pa_volume_t pa_sw_volume_multiply(pa_volume_t a, pa_volume_t b) PA_GCC_CONST;
 
 /** Multiply two per-channel volumes and return the result in
  * *dest. This is only valid for software volumes! a, b and dest may
- * point to the same structure. */
+ * point to the same structure. Returns dest, or NULL on error. */
 pa_cvolume *pa_sw_cvolume_multiply(pa_cvolume *dest, const pa_cvolume *a, const pa_cvolume *b);
 
 /** Multiply a per-channel volume with a scalar volume and return the
  * result in *dest. This is only valid for software volumes! a
- * and dest may point to the same structure. \since
- * 0.9.16 */
+ * and dest may point to the same structure. Returns dest, or NULL on error.
+ * \since 0.9.16 */
 pa_cvolume *pa_sw_cvolume_multiply_scalar(pa_cvolume *dest, const pa_cvolume *a, pa_volume_t b);
 
 /** Divide two volume specifications, return the result. This uses
@@ -296,13 +295,14 @@ pa_volume_t pa_sw_volume_divide(pa_volume_t a, pa_volume_t b) PA_GCC_CONST;
 
 /** Divide two per-channel volumes and return the result in
  * *dest. This is only valid for software volumes! a, b
- * and dest may point to the same structure. \since 0.9.13 */
+ * and dest may point to the same structure. Returns dest,
+ * or NULL on error. \since 0.9.13 */
 pa_cvolume *pa_sw_cvolume_divide(pa_cvolume *dest, const pa_cvolume *a, const pa_cvolume *b);
 
 /** Divide a per-channel volume by a scalar volume and return the
  * result in *dest. This is only valid for software volumes! a
- * and dest may point to the same structure. \since
- * 0.9.16 */
+ * and dest may point to the same structure. Returns dest,
+ * or NULL on error. \since 0.9.16 */
 pa_cvolume *pa_sw_cvolume_divide_scalar(pa_cvolume *dest, const pa_cvolume *a, pa_volume_t b);
 
 /** Convert a decibel value to a volume (amplitude, not power). This is only valid for software volumes! */
@@ -311,8 +311,8 @@ pa_volume_t pa_sw_volume_from_dB(double f) PA_GCC_CONST;
 /** Convert a volume to a decibel value (amplitude, not power). This is only valid for software volumes! */
 double pa_sw_volume_to_dB(pa_volume_t v) PA_GCC_CONST;
 
-/** Convert a linear factor to a volume.  0.0 and less is muted while
- * 1.0 is PA_VOLUME_NORM.  This is only valid for software volumes! */
+/** Convert a linear factor to a volume. 0.0 and less is muted while
+ * 1.0 is PA_VOLUME_NORM. This is only valid for software volumes! */
 pa_volume_t pa_sw_volume_from_linear(double v) PA_GCC_CONST;
 
 /** Convert a volume to a linear factor. This is only valid for software volumes! */
@@ -325,7 +325,8 @@ double pa_sw_volume_to_linear(pa_volume_t v) PA_GCC_CONST;
 #define PA_DECIBEL_MININFTY ((double) -200.0)
 #endif
 
-/** Remap a volume from one channel mapping to a different channel mapping. \since 0.9.12 */
+/** Remap a volume from one channel mapping to a different channel mapping.
+ * Returns \a v. \since 0.9.12 */
 pa_cvolume *pa_cvolume_remap(pa_cvolume *v, const pa_channel_map *from, const pa_channel_map *to);
 
 /** Return non-zero if the specified volume is compatible with the
@@ -351,7 +352,7 @@ float pa_cvolume_get_balance(const pa_cvolume *v, const pa_channel_map *map) PA_
  * requested balance value (e.g. when the input volume was zero anyway for
  * all channels). If no balance value is applicable to
  * this channel map the volume will not be modified. See
- * pa_channel_map_can_balance(). \since 0.9.15 */
+ * pa_channel_map_can_balance(). Will return NULL on error. \since 0.9.15 */
 pa_cvolume* pa_cvolume_set_balance(pa_cvolume *v, const pa_channel_map *map, float new_balance);
 
 /** Calculate a 'fade' value (i.e.\ 'balance' between front and rear)
@@ -369,7 +370,7 @@ float pa_cvolume_get_fade(const pa_cvolume *v, const pa_channel_map *map) PA_GCC
  * return the requested fade value (e.g. when the input volume was
  * zero anyway for all channels). If no fade value is applicable to
  * this channel map the volume will not be modified. See
- * pa_channel_map_can_fade(). \since 0.9.15 */
+ * pa_channel_map_can_fade(). Will return NULL on error. \since 0.9.15 */
 pa_cvolume* pa_cvolume_set_fade(pa_cvolume *v, const pa_channel_map *map, float new_fade);
 
 /** Calculate a 'lfe balance' value for the specified volume with
@@ -387,48 +388,53 @@ float pa_cvolume_get_lfe_balance(const pa_cvolume *v, const pa_channel_map *map)
  * return the requested value (e.g. when the input volume was
  * zero anyway for all channels). If no lfe balance value is applicable to
  * this channel map the volume will not be modified. See
- * pa_channel_map_can_lfe_balance(). \since 8.0 */
+ * pa_channel_map_can_lfe_balance(). Will return NULL on error. \since 8.0 */
 pa_cvolume* pa_cvolume_set_lfe_balance(pa_cvolume *v, const pa_channel_map *map, float new_balance);
 
 /** Scale the passed pa_cvolume structure so that the maximum volume
  * of all channels equals max. The proportions between the channel
- * volumes are kept. \since 0.9.15 */
+ * volumes are kept. Returns \a v, or NULL on error. \since 0.9.15 */
 pa_cvolume* pa_cvolume_scale(pa_cvolume *v, pa_volume_t max);
 
 /** Scale the passed pa_cvolume structure so that the maximum volume
  * of all channels selected via cm/mask equals max. This also modifies
  * the volume of those channels that are unmasked. The proportions
- * between the channel volumes are kept. \since 0.9.16 */
-pa_cvolume* pa_cvolume_scale_mask(pa_cvolume *v, pa_volume_t max, pa_channel_map *cm, pa_channel_position_mask_t mask);
+ * between the channel volumes are kept. If cm is NULL this call is
+ * identical to pa_cvolume_scale(). Returns \a v, or NULL on error.
+ * \since 0.9.16 */
+pa_cvolume* pa_cvolume_scale_mask(pa_cvolume *v, pa_volume_t max, const pa_channel_map *cm, pa_channel_position_mask_t mask);
 
 /** Set the passed volume to all channels at the specified channel
  * position. Will return the updated volume struct, or NULL if there
  * is no channel at the position specified. You can check if a channel
  * map includes a specific position by calling
- * pa_channel_map_has_position(). \since 0.9.16 */
+ * pa_channel_map_has_position(). Returns \a cv, or NULL on error.
+ * \since 0.9.16 */
 pa_cvolume* pa_cvolume_set_position(pa_cvolume *cv, const pa_channel_map *map, pa_channel_position_t t, pa_volume_t v);
 
 /** Get the maximum volume of all channels at the specified channel
  * position. Will return 0 if there is no channel at the position
  * specified. You can check if a channel map includes a specific
  * position by calling pa_channel_map_has_position(). \since 0.9.16 */
-pa_volume_t pa_cvolume_get_position(pa_cvolume *cv, const pa_channel_map *map, pa_channel_position_t t) PA_GCC_PURE;
+pa_volume_t pa_cvolume_get_position(const pa_cvolume *cv, const pa_channel_map *map, pa_channel_position_t t) PA_GCC_PURE;
 
 /** This goes through all channels in a and b and sets the
  * corresponding channel in dest to the greater volume of both. a, b
- * and dest may point to the same structure. \since 0.9.16 */
+ * and dest may point to the same structure. Returns \a dest, or NULL
+ * on error. \since 0.9.16 */
 pa_cvolume* pa_cvolume_merge(pa_cvolume *dest, const pa_cvolume *a, const pa_cvolume *b);
 
 /** Increase the volume passed in by 'inc', but not exceeding 'limit'.
- * The proportions between the channels are kept. \since 0.9.19 */
+ * The proportions between the channels are kept.
+ * Returns \a v, or NULL on error. \since 0.9.19 */
 pa_cvolume* pa_cvolume_inc_clamp(pa_cvolume *v, pa_volume_t inc, pa_volume_t limit);
 
 /** Increase the volume passed in by 'inc'. The proportions between
- * the channels are kept. \since 0.9.16 */
+ * the channels are kept. Returns \a v, or NULL on error. \since 0.9.16 */
 pa_cvolume* pa_cvolume_inc(pa_cvolume *v, pa_volume_t inc);
 
 /** Decrease the volume passed in by 'dec'. The proportions between
- * the channels are kept. \since 0.9.16 */
+ * the channels are kept. Returns \a v, or NULL on error. \since 0.9.16 */
 pa_cvolume* pa_cvolume_dec(pa_cvolume *v, pa_volume_t dec);
 
 PA_C_DECL_END

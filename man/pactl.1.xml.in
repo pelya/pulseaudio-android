@@ -62,6 +62,10 @@ License along with PulseAudio; if not, see <http://www.gnu.org/licenses/>.
   </options>
 
   <section name="Commands">
+    <p>
+        When supplied as arguments to the commands below, the special names \@DEFAULT_SINK@, \@DEFAULT_SOURCE@ and \@DEFAULT_MONITOR@ 
+        can be used to specify the default sink, source and monitor respectively.
+    </p>
 
     <option>
       <p><opt>stat</opt></p>
@@ -129,27 +133,27 @@ License along with PulseAudio; if not, see <http://www.gnu.org/licenses/>.
     </option>
 
     <option>
-      <p><opt>suspend-sink</opt> <arg>SINK</arg> <arg>1|0</arg></p>
-      <optdesc><p>Suspend or resume the specified sink (which my be
-      specified either by its symbolic name, or by its numeric index),
-      depending whether 1 (suspend) or 0 (resume) is passed as last
-      argument. Suspending a sink will pause all playback. Depending
-      on the module implementing the sink this might have the effect
-      that the underlying device is closed, making it available for
-      other applications to use. The exact behaviour depends on the
-      module.</p></optdesc>
+      <p><opt>suspend-sink</opt> <arg>SINK</arg> <arg>true|false</arg></p>
+      <optdesc><p>Suspend or resume the specified sink (which may be
+        specified either by its name or index), depending whether true
+        (suspend) or false (resume) is passed as last argument. Suspending
+        a sink will pause all playback. Depending on the module implementing
+        the sink this might have the effect that the underlying device is
+        closed, making it available for other applications to use. The exact
+        behaviour depends on the module.
+      </p></optdesc>
     </option>
 
     <option>
-      <p><opt>suspend-source</opt> <arg>SOURCE</arg> <arg>1|0</arg></p>
-      <optdesc><p>Suspend or resume the specified source (which my be
-      specified either by its symbolic name, or by its numeric index),
-      depending whether 1 (suspend) or 0 (resume) is passed as last
-      argument. Suspending a source will pause all
-      capturing. Depending on the module implementing the source this
-      might have the effect that the underlying device is closed,
-      making it available for other applications to use. The exact
-      behaviour depends on the module.</p></optdesc>
+      <p><opt>suspend-source</opt> <arg>SOURCE</arg> <arg>true|false</arg></p>
+      <optdesc><p>Suspend or resume the specified source (which may be
+        specified either by its name or index), depending whether true
+        (suspend) or false (resume) is passed as last argument. Suspending
+        a source will pause all capturing. Depending on the module implementing
+        the source this might have the effect that the underlying device is
+        closed, making it available for other applications to use. The exact
+        behaviour depends on the module.
+      </p></optdesc>
     </option>
 
     <option>
@@ -233,7 +237,7 @@ License along with PulseAudio; if not, see <http://www.gnu.org/licenses/>.
     </option>
 
     <option>
-      <p><opt>set-source-output-mute</opt> <arg>INPUT</arg> <arg>1|0|toggle</arg></p>
+      <p><opt>set-source-output-mute</opt> <arg>OUTPUT</arg> <arg>1|0|toggle</arg></p>
       <optdesc><p>Set the mute status of the specified source output (identified by its numerical index).</p></optdesc>
     </option>
 

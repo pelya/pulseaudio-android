@@ -71,7 +71,6 @@
 #endif
 
 #include "oss-util.h"
-#include "module-oss-symdef.h"
 
 PA_MODULE_AUTHOR("Lennart Poettering");
 PA_MODULE_DESCRIPTION("OSS Sink/Source");
@@ -155,20 +154,23 @@ static const char* const valid_modargs[] = {
     NULL
 };
 
-static int trigger(struct userdata *u, bool quick) {
+/* Sink and source states are passed as arguments, because this is called
+ * during state changes, and we need the new state, but thread_info.state
+ * has not yet been updated. */
+static void trigger(struct userdata *u, pa_sink_state_t sink_state, pa_source_state_t source_state, bool quick) {
     int enable_bits = 0, zero = 0;
 
     pa_assert(u);
 
     if (u->fd < 0)
-        return 0;
+        return;
 
     pa_log_debug("trigger");
 
-    if (u->source && PA_SOURCE_IS_OPENED(u->source->thread_info.state))
+    if (u->source && PA_SOURCE_IS_OPENED(source_state))
         enable_bits |= PCM_ENABLE_INPUT;
 
-    if (u->sink && PA_SINK_IS_OPENED(u->sink->thread_info.state))
+    if (u->sink && PA_SINK_IS_OPENED(sink_state))
         enable_bits |= PCM_ENABLE_OUTPUT;
 
     pa_log_debug("trigger: %i", enable_bits);
@@ -205,21 +207,20 @@ static int trigger(struct userdata *u, bool quick) {
              * register the fd as ready.
              */
 
-            if (u->source && PA_SOURCE_IS_OPENED(u->source->thread_info.state)) {
+            if (u->source && PA_SOURCE_IS_OPENED(source_state)) {
                 uint8_t *buf = pa_xnew(uint8_t, u->in_fragment_size);
 
-                if (pa_read(u->fd, buf, u->in_fragment_size, NULL) < 0) {
+                /* XXX: Shouldn't this be done only when resuming the source?
+                 * Currently this code path is executed also when resuming the
+                 * sink while the source is already running. */
+
+                if (pa_read(u->fd, buf, u->in_fragment_size, NULL) < 0)
                     pa_log("pa_read() failed: %s", pa_cstrerror(errno));
-                    pa_xfree(buf);
-                    return -1;
-                }
 
                 pa_xfree(buf);
             }
         }
     }
-
-    return 0;
 }
 
 static void mmap_fill_memblocks(struct userdata *u, unsigned n) {
@@ -486,7 +487,7 @@ static void build_pollfd(struct userdata *u) {
 }
 
 /* Called from IO context */
-static int suspend(struct userdata *u) {
+static void suspend(struct userdata *u) {
     pa_assert(u);
     pa_assert(u->fd >= 0);
 
@@ -531,8 +532,6 @@ static int suspend(struct userdata *u) {
     }
 
     pa_log_info("Device suspended...");
-
-    return 0;
 }
 
 /* Called from IO context */
@@ -644,8 +643,6 @@ fail:
 /* Called from IO context */
 static int sink_process_msg(pa_msgobject *o, int code, void *data, int64_t offset, pa_memchunk *chunk) {
     struct userdata *u = PA_SINK(o)->userdata;
-    int ret;
-    bool do_trigger = false, quick = true;
 
     switch (code) {
 
@@ -659,78 +656,82 @@ static int sink_process_msg(pa_msgobject *o, int code, void *data, int64_t offse
                     r = io_sink_get_latency(u);
             }
 
-            *((pa_usec_t*) data) = r;
+            *((int64_t*) data) = (int64_t)r;
 
             return 0;
         }
+    }
 
-        case PA_SINK_MESSAGE_SET_STATE:
+    return pa_sink_process_msg(o, code, data, offset, chunk);
+}
 
-            switch ((pa_sink_state_t) PA_PTR_TO_UINT(data)) {
+/* Called from the IO thread. */
+static int sink_set_state_in_io_thread_cb(pa_sink *s, pa_sink_state_t new_state, pa_suspend_cause_t new_suspend_cause) {
+    struct userdata *u;
+    bool do_trigger = false;
+    bool quick = true;
 
-                case PA_SINK_SUSPENDED:
-                    pa_assert(PA_SINK_IS_OPENED(u->sink->thread_info.state));
+    pa_assert(s);
+    pa_assert_se(u = s->userdata);
 
-                    if (!u->source || u->source_suspended) {
-                        if (suspend(u) < 0)
-                            return -1;
-                    }
+    /* It may be that only the suspend cause is changing, in which case there's
+     * nothing to do. */
+    if (new_state == s->thread_info.state)
+        return 0;
 
-                    do_trigger = true;
+    switch (new_state) {
 
-                    u->sink_suspended = true;
-                    break;
+        case PA_SINK_SUSPENDED:
+            pa_assert(PA_SINK_IS_OPENED(s->thread_info.state));
 
-                case PA_SINK_IDLE:
-                case PA_SINK_RUNNING:
+            if (!u->source || u->source_suspended)
+                suspend(u);
 
-                    if (u->sink->thread_info.state == PA_SINK_INIT) {
-                        do_trigger = true;
-                        quick = u->source && PA_SOURCE_IS_OPENED(u->source->thread_info.state);
-                    }
+            do_trigger = true;
 
-                    if (u->sink->thread_info.state == PA_SINK_SUSPENDED) {
+            u->sink_suspended = true;
+            break;
 
-                        if (!u->source || u->source_suspended) {
-                            if (unsuspend(u) < 0)
-                                return -1;
-                            quick = false;
-                        }
+        case PA_SINK_IDLE:
+        case PA_SINK_RUNNING:
 
-                        do_trigger = true;
+            if (s->thread_info.state == PA_SINK_INIT) {
+                do_trigger = true;
+                quick = u->source && PA_SOURCE_IS_OPENED(u->source->thread_info.state);
+            }
 
-                        u->out_mmap_current = 0;
-                        u->out_mmap_saved_nfrags = 0;
+            if (s->thread_info.state == PA_SINK_SUSPENDED) {
 
-                        u->sink_suspended = false;
-                    }
+                if (!u->source || u->source_suspended) {
+                    if (unsuspend(u) < 0)
+                        return -1;
+                    quick = false;
+                }
 
-                    break;
+                do_trigger = true;
 
-                case PA_SINK_INVALID_STATE:
-                case PA_SINK_UNLINKED:
-                case PA_SINK_INIT:
-                    ;
+                u->out_mmap_current = 0;
+                u->out_mmap_saved_nfrags = 0;
+
+                u->sink_suspended = false;
             }
 
             break;
 
+        case PA_SINK_INVALID_STATE:
+        case PA_SINK_UNLINKED:
+        case PA_SINK_INIT:
+            ;
     }
 
-    ret = pa_sink_process_msg(o, code, data, offset, chunk);
+    if (do_trigger)
+        trigger(u, new_state, u->source ? u->source->thread_info.state : PA_SOURCE_INVALID_STATE, quick);
 
-    if (ret >= 0 && do_trigger) {
-        if (trigger(u, quick) < 0)
-            return -1;
-    }
-
-    return ret;
+    return 0;
 }
 
 static int source_process_msg(pa_msgobject *o, int code, void *data, int64_t offset, pa_memchunk *chunk) {
     struct userdata *u = PA_SOURCE(o)->userdata;
-    int ret;
-    int do_trigger = false, quick = true;
 
     switch (code) {
 
@@ -744,69 +745,76 @@ static int source_process_msg(pa_msgobject *o, int code, void *data, int64_t off
                     r = io_source_get_latency(u);
             }
 
-            *((pa_usec_t*) data) = r;
+            *((int64_t*) data) = (int64_t)r;
             return 0;
         }
+    }
 
-        case PA_SOURCE_MESSAGE_SET_STATE:
+    return pa_source_process_msg(o, code, data, offset, chunk);
+}
 
-            switch ((pa_source_state_t) PA_PTR_TO_UINT(data)) {
-                case PA_SOURCE_SUSPENDED:
-                    pa_assert(PA_SOURCE_IS_OPENED(u->source->thread_info.state));
+/* Called from the IO thread. */
+static int source_set_state_in_io_thread_cb(pa_source *s, pa_source_state_t new_state, pa_suspend_cause_t new_suspend_cause) {
+    struct userdata *u;
+    bool do_trigger = false;
+    bool quick = true;
 
-                    if (!u->sink || u->sink_suspended) {
-                        if (suspend(u) < 0)
-                            return -1;
-                    }
+    pa_assert(s);
+    pa_assert_se(u = s->userdata);
 
-                    do_trigger = true;
+    /* It may be that only the suspend cause is changing, in which case there's
+     * nothing to do. */
+    if (new_state == s->thread_info.state)
+        return 0;
 
-                    u->source_suspended = true;
-                    break;
+    switch (new_state) {
 
-                case PA_SOURCE_IDLE:
-                case PA_SOURCE_RUNNING:
+        case PA_SOURCE_SUSPENDED:
+            pa_assert(PA_SOURCE_IS_OPENED(s->thread_info.state));
 
-                    if (u->source->thread_info.state == PA_SOURCE_INIT) {
-                        do_trigger = true;
-                        quick = u->sink && PA_SINK_IS_OPENED(u->sink->thread_info.state);
-                    }
+            if (!u->sink || u->sink_suspended)
+                suspend(u);
 
-                    if (u->source->thread_info.state == PA_SOURCE_SUSPENDED) {
+            do_trigger = true;
 
-                        if (!u->sink || u->sink_suspended) {
-                            if (unsuspend(u) < 0)
-                                return -1;
-                            quick = false;
-                        }
+            u->source_suspended = true;
+            break;
 
-                        do_trigger = true;
+        case PA_SOURCE_IDLE:
+        case PA_SOURCE_RUNNING:
 
-                        u->in_mmap_current = 0;
-                        u->in_mmap_saved_nfrags = 0;
+            if (s->thread_info.state == PA_SOURCE_INIT) {
+                do_trigger = true;
+                quick = u->sink && PA_SINK_IS_OPENED(u->sink->thread_info.state);
+            }
 
-                        u->source_suspended = false;
-                    }
-                    break;
+            if (s->thread_info.state == PA_SOURCE_SUSPENDED) {
 
-                case PA_SOURCE_UNLINKED:
-                case PA_SOURCE_INIT:
-                case PA_SOURCE_INVALID_STATE:
-                    ;
+                if (!u->sink || u->sink_suspended) {
+                    if (unsuspend(u) < 0)
+                        return -1;
+                    quick = false;
+                }
 
+                do_trigger = true;
+
+                u->in_mmap_current = 0;
+                u->in_mmap_saved_nfrags = 0;
+
+                u->source_suspended = false;
             }
             break;
 
+        case PA_SOURCE_UNLINKED:
+        case PA_SOURCE_INIT:
+        case PA_SOURCE_INVALID_STATE:
+            ;
     }
 
-    ret = pa_source_process_msg(o, code, data, offset, chunk);
+    if (do_trigger)
+        trigger(u, u->sink ? u->sink->thread_info.state : PA_SINK_INVALID_STATE, new_state, quick);
 
-    if (ret >= 0 && do_trigger) {
-        if (trigger(u, quick) < 0)
-            return -1;
-    }
-
-    return ret;
+    return 0;
 }
 
 static void sink_get_volume(pa_sink *s) {
@@ -891,7 +899,7 @@ static void thread_func(void *userdata) {
     pa_log_debug("Thread starting up");
 
     if (u->core->realtime_scheduling)
-        pa_make_realtime(u->core->realtime_priority);
+        pa_thread_make_realtime(u->core->realtime_priority);
 
     pa_thread_mq_install(&u->thread_mq);
 
@@ -1195,7 +1203,7 @@ int pa__init(pa_module*m) {
         goto fail;
     }
 
-    mode = (playback && record) ? O_RDWR : (playback ? O_WRONLY : (record ? O_RDONLY : 0));
+    mode = (playback && record) ? O_RDWR : (playback ? O_WRONLY : O_RDONLY);
 
     ss = m->core->default_sample_spec;
     map = m->core->default_channel_map;
@@ -1270,7 +1278,12 @@ int pa__init(pa_module*m) {
     u->orig_frag_size = orig_frag_size;
     u->use_mmap = use_mmap;
     u->rtpoll = pa_rtpoll_new();
-    pa_thread_mq_init(&u->thread_mq, m->core->mainloop, u->rtpoll);
+
+    if (pa_thread_mq_init(&u->thread_mq, m->core->mainloop, u->rtpoll) < 0) {
+        pa_log("pa_thread_mq_init() failed.");
+        goto fail;
+    }
+
     u->rtpoll_item = NULL;
     build_pollfd(u);
 
@@ -1341,6 +1354,7 @@ int pa__init(pa_module*m) {
         }
 
         u->source->parent.process_msg = source_process_msg;
+        u->source->set_state_in_io_thread = source_set_state_in_io_thread_cb;
         u->source->userdata = u;
 
         pa_source_set_asyncmsgq(u->source, u->thread_mq.inq);
@@ -1410,6 +1424,7 @@ int pa__init(pa_module*m) {
         }
 
         u->sink->parent.process_msg = sink_process_msg;
+        u->sink->set_state_in_io_thread = sink_set_state_in_io_thread_cb;
         u->sink->userdata = u;
 
         pa_sink_set_asyncmsgq(u->sink, u->thread_mq.inq);

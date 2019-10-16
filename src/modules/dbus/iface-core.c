@@ -721,7 +721,7 @@ static void handle_set_fallback_sink(DBusConnection *conn, DBusMessage *msg, DBu
         return;
     }
 
-    pa_namereg_set_default_sink(c->core, pa_dbusiface_device_get_sink(fallback_sink));
+    pa_core_set_configured_default_sink(c->core, pa_dbusiface_device_get_sink(fallback_sink)->name);
 
     pa_dbus_send_empty_reply(conn, msg);
 }
@@ -809,7 +809,7 @@ static void handle_set_fallback_source(DBusConnection *conn, DBusMessage *msg, D
         return;
     }
 
-    pa_namereg_set_default_source(c->core, pa_dbusiface_device_get_source(fallback_source));
+    pa_core_set_configured_default_source(c->core, pa_dbusiface_device_get_source(fallback_source)->name);
 
     pa_dbus_send_empty_reply(conn, msg);
 }
@@ -1442,7 +1442,7 @@ static bool contains_space(const char *string) {
     pa_assert(string);
 
     for (p = string; *p; ++p) {
-        if (isspace(*p))
+        if (isspace((unsigned char)*p))
             return true;
     }
 
@@ -1506,14 +1506,13 @@ static void handle_load_module(DBusConnection *conn, DBusMessage *msg, void *use
 
     arg_string = pa_strbuf_to_string(arg_buffer);
 
-    if (!(module = pa_module_load(c->core, name, arg_string))) {
+    if (pa_module_load(&module, c->core, name, arg_string) < 0) {
         pa_dbus_send_error(conn, msg, DBUS_ERROR_FAILED, "Failed to load module.");
         goto finish;
     }
 
-    dbus_module = pa_dbusiface_module_new(module);
-    pa_hashmap_put(c->modules, PA_UINT32_TO_PTR(module->index), dbus_module);
-
+    /* This is created during module loading in module_new_cb() */
+    dbus_module = pa_hashmap_get(c->modules, PA_UINT32_TO_PTR(module->index));
     object_path = pa_dbusiface_module_get_path(dbus_module);
 
     pa_dbus_send_basic_value_reply(conn, msg, DBUS_TYPE_OBJECT_PATH, &object_path);
@@ -1589,20 +1588,26 @@ static pa_hook_result_t module_new_cb(void *hook_data, void *call_data, void *sl
     pa_assert(c);
     pa_assert(module);
 
-    if (!(module_iface = pa_hashmap_get(c->modules, PA_UINT32_TO_PTR(module->index)))) {
-        module_iface = pa_dbusiface_module_new(module);
-        pa_assert_se(pa_hashmap_put(c->modules, PA_UINT32_TO_PTR(module->index), module_iface) >= 0);
-
-        object_path = pa_dbusiface_module_get_path(module_iface);
-
-        pa_assert_se((signal_msg = dbus_message_new_signal(PA_DBUS_CORE_OBJECT_PATH,
-                                                           PA_DBUS_CORE_INTERFACE,
-                                                           signals[SIGNAL_NEW_MODULE].name)));
-        pa_assert_se(dbus_message_append_args(signal_msg, DBUS_TYPE_OBJECT_PATH, &object_path, DBUS_TYPE_INVALID));
-
-        pa_dbus_protocol_send_signal(c->dbus_protocol, signal_msg);
-        dbus_message_unref(signal_msg);
+    if (pa_streq(module->name, "module-dbus-protocol")) {
+        /* module-dbus-protocol can only be loaded once, and will be accounted
+         * for while iterating core->modules in pa_dbusiface_core_new(). As it
+         * happens, we will also see it here when the hook is called after the
+         * module is initialised, so we ignore it. */
+        return PA_HOOK_OK;
     }
+
+    module_iface = pa_dbusiface_module_new(module);
+    pa_assert_se(pa_hashmap_put(c->modules, PA_UINT32_TO_PTR(module->index), module_iface) >= 0);
+
+    object_path = pa_dbusiface_module_get_path(module_iface);
+
+    pa_assert_se((signal_msg = dbus_message_new_signal(PA_DBUS_CORE_OBJECT_PATH,
+                                                       PA_DBUS_CORE_INTERFACE,
+                                                       signals[SIGNAL_NEW_MODULE].name)));
+    pa_assert_se(dbus_message_append_args(signal_msg, DBUS_TYPE_OBJECT_PATH, &object_path, DBUS_TYPE_INVALID));
+
+    pa_dbus_protocol_send_signal(c->dbus_protocol, signal_msg);
+    dbus_message_unref(signal_msg);
 
     return PA_HOOK_OK;
 }
@@ -1687,6 +1692,28 @@ static pa_hook_result_t sample_cache_removed_cb(void *hook_data, void *call_data
     return PA_HOOK_OK;
 }
 
+static pa_dbusiface_device *create_dbus_object_for_sink(pa_dbusiface_core *c, pa_sink *s) {
+    pa_dbusiface_device *d;
+    const char *object_path;
+    DBusMessage *signal_msg;
+
+    d = pa_dbusiface_device_new_sink(c, s);
+    object_path = pa_dbusiface_device_get_path(d);
+
+    pa_assert_se(pa_hashmap_put(c->sinks_by_index, PA_UINT32_TO_PTR(s->index), d) >= 0);
+    pa_assert_se(pa_hashmap_put(c->sinks_by_path, (char *) object_path, d) >= 0);
+
+    pa_assert_se((signal_msg = dbus_message_new_signal(PA_DBUS_CORE_OBJECT_PATH,
+                                                       PA_DBUS_CORE_INTERFACE,
+                                                       signals[SIGNAL_NEW_SINK].name)));
+    pa_assert_se(dbus_message_append_args(signal_msg, DBUS_TYPE_OBJECT_PATH, &object_path, DBUS_TYPE_INVALID));
+
+    pa_dbus_protocol_send_signal(c->dbus_protocol, signal_msg);
+    dbus_message_unref(signal_msg);
+
+    return d;
+}
+
 static pa_hook_result_t default_sink_changed_cb(void *hook_data, void *call_data, void *slot_data) {
     pa_dbusiface_core *c = slot_data;
     pa_sink *new_fallback_sink = call_data;
@@ -1702,7 +1729,15 @@ static pa_hook_result_t default_sink_changed_cb(void *hook_data, void *call_data
         c->fallback_sink = new_fallback_sink ? pa_sink_ref(new_fallback_sink) : NULL;
 
         if (c->fallback_sink) {
-            pa_assert_se((device_iface = pa_hashmap_get(c->sinks_by_index, PA_UINT32_TO_PTR(c->fallback_sink->index))));
+            device_iface = pa_hashmap_get(c->sinks_by_index, PA_UINT32_TO_PTR(c->fallback_sink->index));
+
+            /* It's possible that we haven't created a dbus object for the
+             * source yet, because if a new source immediately becomes the
+             * default source, the default source change hook is fired before
+             * the put hook. */
+            if (!device_iface)
+                device_iface = create_dbus_object_for_sink(c, c->fallback_sink);
+
             object_path = pa_dbusiface_device_get_path(device_iface);
 
             pa_assert_se((signal_msg = dbus_message_new_signal(PA_DBUS_CORE_OBJECT_PATH,
@@ -1725,6 +1760,28 @@ static pa_hook_result_t default_sink_changed_cb(void *hook_data, void *call_data
     return PA_HOOK_OK;
 }
 
+static pa_dbusiface_device *create_dbus_object_for_source(pa_dbusiface_core *c, pa_source *s) {
+    pa_dbusiface_device *d;
+    const char *object_path;
+    DBusMessage *signal_msg;
+
+    d = pa_dbusiface_device_new_source(c, s);
+    object_path = pa_dbusiface_device_get_path(d);
+
+    pa_assert_se(pa_hashmap_put(c->sources_by_index, PA_UINT32_TO_PTR(s->index), d) >= 0);
+    pa_assert_se(pa_hashmap_put(c->sources_by_path, (char *) object_path, d) >= 0);
+
+    pa_assert_se((signal_msg = dbus_message_new_signal(PA_DBUS_CORE_OBJECT_PATH,
+                                                       PA_DBUS_CORE_INTERFACE,
+                                                       signals[SIGNAL_NEW_SOURCE].name)));
+    pa_assert_se(dbus_message_append_args(signal_msg, DBUS_TYPE_OBJECT_PATH, &object_path, DBUS_TYPE_INVALID));
+
+    pa_dbus_protocol_send_signal(c->dbus_protocol, signal_msg);
+    dbus_message_unref(signal_msg);
+
+    return d;
+}
+
 static pa_hook_result_t default_source_changed_cb(void *hook_data, void *call_data, void *slot_data) {
     pa_dbusiface_core *c = slot_data;
     pa_source *new_fallback_source = call_data;
@@ -1740,7 +1797,15 @@ static pa_hook_result_t default_source_changed_cb(void *hook_data, void *call_da
         c->fallback_source = new_fallback_source ? pa_source_ref(new_fallback_source) : NULL;
 
         if (c->fallback_source) {
-            pa_assert_se((device_iface = pa_hashmap_get(c->sources_by_index, PA_UINT32_TO_PTR(c->fallback_source->index))));
+            device_iface = pa_hashmap_get(c->sources_by_index, PA_UINT32_TO_PTR(c->fallback_source->index));
+
+            /* It's possible that we haven't created a dbus object for the
+             * source yet, because if a new source immediately becomes the
+             * default source, the default source change hook is fired before
+             * the put hook. */
+            if (!device_iface)
+                device_iface = create_dbus_object_for_source(c, c->fallback_source);
+
             object_path = pa_dbusiface_device_get_path(device_iface);
 
             pa_assert_se((signal_msg = dbus_message_new_signal(PA_DBUS_CORE_OBJECT_PATH,
@@ -1978,26 +2043,17 @@ static pa_hook_result_t client_unlink_cb(void *hook_data, void *call_data, void 
 static pa_hook_result_t sink_put_cb(void *hook_data, void *call_data, void *slot_data) {
     pa_dbusiface_core *c = slot_data;
     pa_sink *s = call_data;
-    pa_dbusiface_device *d = NULL;
-    const char *object_path = NULL;
-    DBusMessage *signal_msg = NULL;
 
     pa_assert(c);
     pa_assert(s);
 
-    d = pa_dbusiface_device_new_sink(c, s);
-    object_path = pa_dbusiface_device_get_path(d);
+    /* We may have alredy encountered this sink, because if the new sink was
+     * chosen as the default sink, the default sink change hook was fired
+     * first, and we saw the sink in default_sink_changed_cb(). */
+    if (pa_hashmap_get(c->sinks_by_index, PA_UINT32_TO_PTR(s->index)))
+        return PA_HOOK_OK;
 
-    pa_assert_se(pa_hashmap_put(c->sinks_by_index, PA_UINT32_TO_PTR(s->index), d) >= 0);
-    pa_assert_se(pa_hashmap_put(c->sinks_by_path, (char *) object_path, d) >= 0);
-
-    pa_assert_se(signal_msg = dbus_message_new_signal(PA_DBUS_CORE_OBJECT_PATH,
-                                                      PA_DBUS_CORE_INTERFACE,
-                                                      signals[SIGNAL_NEW_SINK].name));
-    pa_assert_se(dbus_message_append_args(signal_msg, DBUS_TYPE_OBJECT_PATH, &object_path, DBUS_TYPE_INVALID));
-
-    pa_dbus_protocol_send_signal(c->dbus_protocol, signal_msg);
-    dbus_message_unref(signal_msg);
+    create_dbus_object_for_sink(c, s);
 
     return PA_HOOK_OK;
 }
@@ -2032,26 +2088,17 @@ static pa_hook_result_t sink_unlink_cb(void *hook_data, void *call_data, void *s
 static pa_hook_result_t source_put_cb(void *hook_data, void *call_data, void *slot_data) {
     pa_dbusiface_core *c = slot_data;
     pa_source *s = call_data;
-    pa_dbusiface_device *d = NULL;
-    const char *object_path = NULL;
-    DBusMessage *signal_msg = NULL;
 
     pa_assert(c);
     pa_assert(s);
 
-    d = pa_dbusiface_device_new_source(c, s);
-    object_path = pa_dbusiface_device_get_path(d);
+    /* We may have alredy encountered this source, because if the new source
+     * was chosen as the default source, the default source change hook was
+     * fired first, and we saw the source in default_source_changed_cb(). */
+    if (pa_hashmap_get(c->sources_by_index, PA_UINT32_TO_PTR(s->index)))
+        return PA_HOOK_OK;
 
-    pa_assert_se(pa_hashmap_put(c->sources_by_index, PA_UINT32_TO_PTR(s->index), d) >= 0);
-    pa_assert_se(pa_hashmap_put(c->sources_by_path, (char *) object_path, d) >= 0);
-
-    pa_assert_se((signal_msg = dbus_message_new_signal(PA_DBUS_CORE_OBJECT_PATH,
-                                                       PA_DBUS_CORE_INTERFACE,
-                                                       signals[SIGNAL_NEW_SOURCE].name)));
-    pa_assert_se(dbus_message_append_args(signal_msg, DBUS_TYPE_OBJECT_PATH, &object_path, DBUS_TYPE_INVALID));
-
-    pa_dbus_protocol_send_signal(c->dbus_protocol, signal_msg);
-    dbus_message_unref(signal_msg);
+    create_dbus_object_for_source(c, s);
 
     return PA_HOOK_OK;
 }
@@ -2153,8 +2200,8 @@ pa_dbusiface_core *pa_dbusiface_core_new(pa_core *core) {
     c->samples = pa_hashmap_new_full(pa_idxset_trivial_hash_func, pa_idxset_trivial_compare_func, NULL, (pa_free_cb_t) pa_dbusiface_sample_free);
     c->modules = pa_hashmap_new_full(pa_idxset_trivial_hash_func, pa_idxset_trivial_compare_func, NULL, (pa_free_cb_t) pa_dbusiface_module_free);
     c->clients = pa_hashmap_new_full(pa_idxset_trivial_hash_func, pa_idxset_trivial_compare_func, NULL, (pa_free_cb_t) pa_dbusiface_client_free);
-    c->fallback_sink = pa_namereg_get_default_sink(core);
-    c->fallback_source = pa_namereg_get_default_source(core);
+    c->fallback_sink = core->default_sink;
+    c->fallback_source = core->default_source;
     c->default_sink_changed_slot = pa_hook_connect(&core->hooks[PA_CORE_HOOK_DEFAULT_SINK_CHANGED],
                                                    PA_HOOK_NORMAL, default_sink_changed_cb, c);
     c->default_source_changed_slot = pa_hook_connect(&core->hooks[PA_CORE_HOOK_DEFAULT_SOURCE_CHANGED],

@@ -2,6 +2,7 @@
   This file is part of PulseAudio.
 
   Copyright 2008-2013 João Paulo Rechi Vita
+  Copyrigth 2018-2019 Pali Rohár <pali.rohar@gmail.com>
 
   PulseAudio is free software; you can redistribute it and/or modify
   it under the terms of the GNU Lesser General Public License as
@@ -21,6 +22,8 @@
 #include <config.h>
 #endif
 
+#include <pulse/rtclock.h>
+#include <pulse/timeval.h>
 #include <pulse/xmalloc.h>
 
 #include <pulsecore/core.h>
@@ -31,9 +34,12 @@
 #include <pulsecore/refcnt.h>
 #include <pulsecore/shared.h>
 
+#include "a2dp-codec-util.h"
 #include "a2dp-codecs.h"
 
 #include "bluez5-util.h"
+
+#define WAIT_FOR_PROFILES_TIMEOUT_USEC (3 * PA_USEC_PER_SEC)
 
 #define BLUEZ_SERVICE "org.bluez"
 #define BLUEZ_ADAPTER_INTERFACE BLUEZ_SERVICE ".Adapter1"
@@ -164,8 +170,101 @@ static const char *transport_state_to_string(pa_bluetooth_transport_state_t stat
     return "invalid";
 }
 
+static bool device_supports_profile(pa_bluetooth_device *device, pa_bluetooth_profile_t profile) {
+    switch (profile) {
+        case PA_BLUETOOTH_PROFILE_A2DP_SINK:
+            return !!pa_hashmap_get(device->uuids, PA_BLUETOOTH_UUID_A2DP_SINK);
+        case PA_BLUETOOTH_PROFILE_A2DP_SOURCE:
+            return !!pa_hashmap_get(device->uuids, PA_BLUETOOTH_UUID_A2DP_SOURCE);
+        case PA_BLUETOOTH_PROFILE_HEADSET_HEAD_UNIT:
+            return !!pa_hashmap_get(device->uuids, PA_BLUETOOTH_UUID_HSP_HS)
+                || !!pa_hashmap_get(device->uuids, PA_BLUETOOTH_UUID_HSP_HS_ALT)
+                || !!pa_hashmap_get(device->uuids, PA_BLUETOOTH_UUID_HFP_HF);
+        case PA_BLUETOOTH_PROFILE_HEADSET_AUDIO_GATEWAY:
+            return !!pa_hashmap_get(device->uuids, PA_BLUETOOTH_UUID_HSP_AG)
+                || !!pa_hashmap_get(device->uuids, PA_BLUETOOTH_UUID_HFP_AG);
+        case PA_BLUETOOTH_PROFILE_OFF:
+            pa_assert_not_reached();
+    }
+
+    pa_assert_not_reached();
+}
+
+static bool device_is_profile_connected(pa_bluetooth_device *device, pa_bluetooth_profile_t profile) {
+    if (device->transports[profile] && device->transports[profile]->state != PA_BLUETOOTH_TRANSPORT_STATE_DISCONNECTED)
+        return true;
+    else
+        return false;
+}
+
+static unsigned device_count_disconnected_profiles(pa_bluetooth_device *device) {
+    pa_bluetooth_profile_t profile;
+    unsigned count = 0;
+
+    for (profile = 0; profile < PA_BLUETOOTH_PROFILE_COUNT; profile++) {
+        if (!device_supports_profile(device, profile))
+            continue;
+
+        if (!device_is_profile_connected(device, profile))
+            count++;
+    }
+
+    return count;
+}
+
+static void device_stop_waiting_for_profiles(pa_bluetooth_device *device) {
+    if (!device->wait_for_profiles_timer)
+        return;
+
+    device->discovery->core->mainloop->time_free(device->wait_for_profiles_timer);
+    device->wait_for_profiles_timer = NULL;
+}
+
+static void wait_for_profiles_cb(pa_mainloop_api *api, pa_time_event* event, const struct timeval *tv, void *userdata) {
+    pa_bluetooth_device *device = userdata;
+    pa_strbuf *buf;
+    pa_bluetooth_profile_t profile;
+    bool first = true;
+    char *profiles_str;
+
+    device_stop_waiting_for_profiles(device);
+
+    buf = pa_strbuf_new();
+
+    for (profile = 0; profile < PA_BLUETOOTH_PROFILE_COUNT; profile++) {
+        if (device_is_profile_connected(device, profile))
+            continue;
+
+        if (!device_supports_profile(device, profile))
+            continue;
+
+        if (first)
+            first = false;
+        else
+            pa_strbuf_puts(buf, ", ");
+
+        pa_strbuf_puts(buf, pa_bluetooth_profile_to_string(profile));
+    }
+
+    profiles_str = pa_strbuf_to_string_free(buf);
+    pa_log_debug("Timeout expired, and device %s still has disconnected profiles: %s",
+                 device->path, profiles_str);
+    pa_xfree(profiles_str);
+    pa_hook_fire(&device->discovery->hooks[PA_BLUETOOTH_HOOK_DEVICE_CONNECTION_CHANGED], device);
+}
+
+static void device_start_waiting_for_profiles(pa_bluetooth_device *device) {
+    pa_assert(!device->wait_for_profiles_timer);
+    device->wait_for_profiles_timer = pa_core_rttime_new(device->discovery->core,
+                                                         pa_rtclock_now() + WAIT_FOR_PROFILES_TIMEOUT_USEC,
+                                                         wait_for_profiles_cb, device);
+}
+
 void pa_bluetooth_transport_set_state(pa_bluetooth_transport *t, pa_bluetooth_transport_state_t state) {
     bool old_any_connected;
+    unsigned n_disconnected_profiles;
+    bool new_device_appeared;
+    bool device_disconnected;
 
     pa_assert(t);
 
@@ -174,15 +273,52 @@ void pa_bluetooth_transport_set_state(pa_bluetooth_transport *t, pa_bluetooth_tr
 
     old_any_connected = pa_bluetooth_device_any_transport_connected(t->device);
 
-    pa_log_debug("Transport %s state changed from %s to %s",
+    pa_log_debug("Transport %s state: %s -> %s",
                  t->path, transport_state_to_string(t->state), transport_state_to_string(state));
 
     t->state = state;
 
     pa_hook_fire(&t->device->discovery->hooks[PA_BLUETOOTH_HOOK_TRANSPORT_STATE_CHANGED], t);
 
-    if (old_any_connected != pa_bluetooth_device_any_transport_connected(t->device))
+    /* If there are profiles that are expected to get connected soon (based
+     * on the UUID list), we wait for a bit before announcing the new
+     * device, so that all profiles have time to get connected before the
+     * card object is created. If we didn't wait, the card would always
+     * have only one profile marked as available in the initial state,
+     * which would prevent module-card-restore from restoring the initial
+     * profile properly. */
+
+    n_disconnected_profiles = device_count_disconnected_profiles(t->device);
+
+    new_device_appeared = !old_any_connected && pa_bluetooth_device_any_transport_connected(t->device);
+    device_disconnected = old_any_connected && !pa_bluetooth_device_any_transport_connected(t->device);
+
+    if (new_device_appeared) {
+        if (n_disconnected_profiles > 0)
+            device_start_waiting_for_profiles(t->device);
+        else
+            pa_hook_fire(&t->device->discovery->hooks[PA_BLUETOOTH_HOOK_DEVICE_CONNECTION_CHANGED], t->device);
+        return;
+    }
+
+    if (device_disconnected) {
+        if (t->device->wait_for_profiles_timer) {
+            /* If the timer is still running when the device disconnects, we
+             * never sent the notification of the device getting connected, so
+             * we don't need to send a notification about the disconnection
+             * either. Let's just stop the timer. */
+            device_stop_waiting_for_profiles(t->device);
+        } else
+            pa_hook_fire(&t->device->discovery->hooks[PA_BLUETOOTH_HOOK_DEVICE_CONNECTION_CHANGED], t->device);
+        return;
+    }
+
+    if (n_disconnected_profiles == 0 && t->device->wait_for_profiles_timer) {
+        /* All profiles are now connected, so we can stop the wait timer and
+         * send a notification of the new device. */
+        device_stop_waiting_for_profiles(t->device);
         pa_hook_fire(&t->device->discovery->hooks[PA_BLUETOOTH_HOOK_DEVICE_CONNECTION_CHANGED], t->device);
+    }
 }
 
 void pa_bluetooth_transport_put(pa_bluetooth_transport *t) {
@@ -230,6 +366,8 @@ static int bluez5_transport_acquire_cb(pa_bluetooth_transport *t, bool optional,
     dbus_error_init(&err);
 
     r = dbus_connection_send_with_reply_and_block(pa_dbus_connection_get(t->device->discovery->connection), m, -1, &err);
+    dbus_message_unref(m);
+    m = NULL;
     if (!r) {
         if (optional && pa_streq(err.name, "org.bluez.Error.NotAvailable"))
             pa_log_info("Failed optional acquire of unavailable transport %s", t->path);
@@ -260,7 +398,7 @@ finish:
 }
 
 static void bluez5_transport_release_cb(pa_bluetooth_transport *t) {
-    DBusMessage *m;
+    DBusMessage *m, *r;
     DBusError err;
 
     pa_assert(t);
@@ -275,7 +413,13 @@ static void bluez5_transport_release_cb(pa_bluetooth_transport *t) {
     }
 
     pa_assert_se(m = dbus_message_new_method_call(t->owner, t->path, BLUEZ_MEDIA_TRANSPORT_INTERFACE, "Release"));
-    dbus_connection_send_with_reply_and_block(pa_dbus_connection_get(t->device->discovery->connection), m, -1, &err);
+    r = dbus_connection_send_with_reply_and_block(pa_dbus_connection_get(t->device->discovery->connection), m, -1, &err);
+    dbus_message_unref(m);
+    m = NULL;
+    if (r) {
+        dbus_message_unref(r);
+        r = NULL;
+    }
 
     if (dbus_error_is_set(&err)) {
         pa_log_error("Failed to release transport %s: %s", t->path, err.message);
@@ -415,6 +559,10 @@ static void device_free(pa_bluetooth_device *d) {
     unsigned i;
 
     pa_assert(d);
+
+    device_stop_waiting_for_profiles(d);
+
+    pa_hook_fire(&d->discovery->hooks[PA_BLUETOOTH_HOOK_DEVICE_UNLINK], d);
 
     for (i = 0; i < PA_BLUETOOTH_PROFILE_COUNT; i++) {
         pa_bluetooth_transport *t;
@@ -618,8 +766,8 @@ static void parse_device_property(pa_bluetooth_device *d, DBusMessageIter *i) {
             dbus_message_iter_recurse(&variant_i, &ai);
 
             if (dbus_message_iter_get_arg_type(&ai) == DBUS_TYPE_STRING && pa_streq(key, "UUIDs")) {
-                /* bluetoothd never removes UUIDs from a device object so there
-                 * is no need to handle it here. */
+                /* bluetoothd never removes UUIDs from a device object so we
+                 * don't need to check for disappeared UUIDs here. */
                 while (dbus_message_iter_get_arg_type(&ai) != DBUS_TYPE_INVALID) {
                     const char *value;
                     char *uuid;
@@ -659,6 +807,7 @@ static void parse_device_properties(pa_bluetooth_device *d, DBusMessageIter *i) 
 
     if (!d->properties_received) {
         d->properties_received = true;
+        device_update_valid(d);
 
         if (!d->address || !d->adapter_path || !d->alias)
             pa_log_error("Non-optional information missing for device %s", d->path);
@@ -740,37 +889,28 @@ finish:
     pa_xfree(endpoint);
 }
 
-static void register_endpoint(pa_bluetooth_discovery *y, const char *path, const char *endpoint, const char *uuid) {
+static void register_endpoint(pa_bluetooth_discovery *y, const pa_a2dp_codec *a2dp_codec, const char *path, const char *endpoint, const char *uuid) {
     DBusMessage *m;
     DBusMessageIter i, d;
-    uint8_t codec = 0;
+    uint8_t capabilities[MAX_A2DP_CAPS_SIZE];
+    size_t capabilities_size;
+    uint8_t codec_id;
 
     pa_log_debug("Registering %s on adapter %s", endpoint, path);
+
+    codec_id = a2dp_codec->id.codec_id;
+    capabilities_size = a2dp_codec->fill_capabilities(capabilities);
+    pa_assert(capabilities_size != 0);
 
     pa_assert_se(m = dbus_message_new_method_call(BLUEZ_SERVICE, path, BLUEZ_MEDIA_INTERFACE, "RegisterEndpoint"));
 
     dbus_message_iter_init_append(m, &i);
-    dbus_message_iter_append_basic(&i, DBUS_TYPE_OBJECT_PATH, &endpoint);
+    pa_assert_se(dbus_message_iter_append_basic(&i, DBUS_TYPE_OBJECT_PATH, &endpoint));
     dbus_message_iter_open_container(&i, DBUS_TYPE_ARRAY, DBUS_DICT_ENTRY_BEGIN_CHAR_AS_STRING DBUS_TYPE_STRING_AS_STRING
                                          DBUS_TYPE_VARIANT_AS_STRING DBUS_DICT_ENTRY_END_CHAR_AS_STRING, &d);
     pa_dbus_append_basic_variant_dict_entry(&d, "UUID", DBUS_TYPE_STRING, &uuid);
-    pa_dbus_append_basic_variant_dict_entry(&d, "Codec", DBUS_TYPE_BYTE, &codec);
-
-    if (pa_streq(uuid, PA_BLUETOOTH_UUID_A2DP_SOURCE) || pa_streq(uuid, PA_BLUETOOTH_UUID_A2DP_SINK)) {
-        a2dp_sbc_t capabilities;
-
-        capabilities.channel_mode = SBC_CHANNEL_MODE_MONO | SBC_CHANNEL_MODE_DUAL_CHANNEL | SBC_CHANNEL_MODE_STEREO |
-                                    SBC_CHANNEL_MODE_JOINT_STEREO;
-        capabilities.frequency = SBC_SAMPLING_FREQ_16000 | SBC_SAMPLING_FREQ_32000 | SBC_SAMPLING_FREQ_44100 |
-                                 SBC_SAMPLING_FREQ_48000;
-        capabilities.allocation_method = SBC_ALLOCATION_SNR | SBC_ALLOCATION_LOUDNESS;
-        capabilities.subbands = SBC_SUBBANDS_4 | SBC_SUBBANDS_8;
-        capabilities.block_length = SBC_BLOCK_LENGTH_4 | SBC_BLOCK_LENGTH_8 | SBC_BLOCK_LENGTH_12 | SBC_BLOCK_LENGTH_16;
-        capabilities.min_bitpool = MIN_BITPOOL;
-        capabilities.max_bitpool = MAX_BITPOOL;
-
-        pa_dbus_append_basic_array_variant_dict_entry(&d, "Capabilities", DBUS_TYPE_BYTE, &capabilities, sizeof(capabilities));
-    }
+    pa_dbus_append_basic_variant_dict_entry(&d, "Codec", DBUS_TYPE_BYTE, &codec_id);
+    pa_dbus_append_basic_array_variant_dict_entry(&d, "Capabilities", DBUS_TYPE_BYTE, &capabilities, capabilities_size);
 
     dbus_message_iter_close_container(&i, &d);
 
@@ -805,6 +945,7 @@ static void parse_interfaces_and_properties(pa_bluetooth_discovery *y, DBusMessa
 
         if (pa_streq(interface, BLUEZ_ADAPTER_INTERFACE)) {
             pa_bluetooth_adapter *a;
+            unsigned a2dp_codec_i;
 
             if ((a = pa_hashmap_get(y->adapters, path))) {
                 pa_log_error("Found duplicated D-Bus path for adapter %s", path);
@@ -819,8 +960,20 @@ static void parse_interfaces_and_properties(pa_bluetooth_discovery *y, DBusMessa
             if (!a->valid)
                 return;
 
-            register_endpoint(y, path, A2DP_SOURCE_ENDPOINT, PA_BLUETOOTH_UUID_A2DP_SOURCE);
-            register_endpoint(y, path, A2DP_SINK_ENDPOINT, PA_BLUETOOTH_UUID_A2DP_SINK);
+            /* Order is important. bluez prefers endpoints registered earlier.
+             * And codec with higher number has higher priority. So iterate in reverse order. */
+            for (a2dp_codec_i = pa_bluetooth_a2dp_codec_count(); a2dp_codec_i > 0; a2dp_codec_i--) {
+                const pa_a2dp_codec *a2dp_codec = pa_bluetooth_a2dp_codec_iter(a2dp_codec_i-1);
+                char *endpoint;
+
+                endpoint = pa_sprintf_malloc("%s/%s", A2DP_SINK_ENDPOINT, a2dp_codec->name);
+                register_endpoint(y, a2dp_codec, path, endpoint, PA_BLUETOOTH_UUID_A2DP_SINK);
+                pa_xfree(endpoint);
+
+                endpoint = pa_sprintf_malloc("%s/%s", A2DP_SOURCE_ENDPOINT, a2dp_codec->name);
+                register_endpoint(y, a2dp_codec, path, endpoint, PA_BLUETOOTH_UUID_A2DP_SOURCE);
+                pa_xfree(endpoint);
+            }
 
         } else if (pa_streq(interface, BLUEZ_DEVICE_INTERFACE)) {
 
@@ -867,12 +1020,25 @@ void pa_bluetooth_discovery_set_ofono_running(pa_bluetooth_discovery *y, bool is
     if (y->headset_backend != HEADSET_BACKEND_AUTO)
         return;
 
-    if (is_running && y->native_backend) {
-        pa_bluetooth_native_backend_free(y->native_backend);
-        y->native_backend = NULL;
+    /* If ofono starts running, all devices that might be connected to the HS role
+     * need to be disconnected, so that the devices can be handled by ofono */
+    if (is_running) {
+        void *state;
+        pa_bluetooth_device *d;
+
+        PA_HASHMAP_FOREACH(d, y->devices, state) {
+            if (device_supports_profile(d, PA_BLUETOOTH_PROFILE_HEADSET_AUDIO_GATEWAY)) {
+                DBusMessage *m;
+
+                pa_assert_se(m = dbus_message_new_method_call(BLUEZ_SERVICE, d->path, "org.bluez.Device1", "Disconnect"));
+                dbus_message_set_no_reply(m, true);
+                pa_assert_se(dbus_connection_send(pa_dbus_connection_get(y->connection), m, NULL));
+                dbus_message_unref(m);
+            }
+        }
     }
-    else if (!is_running && !y->native_backend)
-        y->native_backend = pa_bluetooth_native_backend_new(y->core, y);
+
+    pa_bluetooth_native_backend_enable_hs_role(y->native_backend, !is_running);
 }
 
 static void get_managed_objects_reply(DBusPendingCall *pending, void *userdata) {
@@ -913,10 +1079,10 @@ static void get_managed_objects_reply(DBusPendingCall *pending, void *userdata) 
 
     y->objects_listed = true;
 
+    if (!y->native_backend && y->headset_backend != HEADSET_BACKEND_OFONO)
+        y->native_backend = pa_bluetooth_native_backend_new(y->core, y, (y->headset_backend == HEADSET_BACKEND_NATIVE));
     if (!y->ofono_backend && y->headset_backend != HEADSET_BACKEND_NATIVE)
         y->ofono_backend = pa_bluetooth_ofono_backend_new(y->core, y);
-    if (!y->ofono_backend && !y->native_backend && y->headset_backend != HEADSET_BACKEND_OFONO)
-        y->native_backend = pa_bluetooth_native_backend_new(y->core, y);
 
 finish:
     dbus_message_unref(r);
@@ -1099,48 +1265,6 @@ fail:
     return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
 }
 
-static uint8_t a2dp_default_bitpool(uint8_t freq, uint8_t mode) {
-    /* These bitpool values were chosen based on the A2DP spec recommendation */
-    switch (freq) {
-        case SBC_SAMPLING_FREQ_16000:
-        case SBC_SAMPLING_FREQ_32000:
-            return 53;
-
-        case SBC_SAMPLING_FREQ_44100:
-
-            switch (mode) {
-                case SBC_CHANNEL_MODE_MONO:
-                case SBC_CHANNEL_MODE_DUAL_CHANNEL:
-                    return 31;
-
-                case SBC_CHANNEL_MODE_STEREO:
-                case SBC_CHANNEL_MODE_JOINT_STEREO:
-                    return 53;
-            }
-
-            pa_log_warn("Invalid channel mode %u", mode);
-            return 53;
-
-        case SBC_SAMPLING_FREQ_48000:
-
-            switch (mode) {
-                case SBC_CHANNEL_MODE_MONO:
-                case SBC_CHANNEL_MODE_DUAL_CHANNEL:
-                    return 29;
-
-                case SBC_CHANNEL_MODE_STEREO:
-                case SBC_CHANNEL_MODE_JOINT_STEREO:
-                    return 51;
-            }
-
-            pa_log_warn("Invalid channel mode %u", mode);
-            return 51;
-    }
-
-    pa_log_warn("Invalid sampling freq %u", freq);
-    return 53;
-}
-
 const char *pa_bluetooth_profile_to_string(pa_bluetooth_profile_t profile) {
     switch(profile) {
         case PA_BLUETOOTH_PROFILE_A2DP_SINK:
@@ -1158,10 +1282,24 @@ const char *pa_bluetooth_profile_to_string(pa_bluetooth_profile_t profile) {
     return NULL;
 }
 
+static const pa_a2dp_codec *a2dp_endpoint_to_a2dp_codec(const char *endpoint) {
+    const char *codec_name;
+
+    if (pa_startswith(endpoint, A2DP_SINK_ENDPOINT "/"))
+        codec_name = endpoint + strlen(A2DP_SINK_ENDPOINT "/");
+    else if (pa_startswith(endpoint, A2DP_SOURCE_ENDPOINT "/"))
+        codec_name = endpoint + strlen(A2DP_SOURCE_ENDPOINT "/");
+    else
+        return NULL;
+
+    return pa_bluetooth_get_a2dp_codec(codec_name);
+}
+
 static DBusMessage *endpoint_set_configuration(DBusConnection *conn, DBusMessage *m, void *userdata) {
     pa_bluetooth_discovery *y = userdata;
     pa_bluetooth_device *d;
     pa_bluetooth_transport *t;
+    const pa_a2dp_codec *a2dp_codec = NULL;
     const char *sender, *path, *endpoint_path, *dev_path = NULL, *uuid = NULL;
     const uint8_t *config = NULL;
     int size = 0;
@@ -1187,6 +1325,8 @@ static DBusMessage *endpoint_set_configuration(DBusConnection *conn, DBusMessage
     if (dbus_message_iter_get_arg_type(&props) != DBUS_TYPE_DICT_ENTRY)
         goto fail;
 
+    endpoint_path = dbus_message_get_path(m);
+
     /* Read transport properties */
     while (dbus_message_iter_get_arg_type(&props) == DBUS_TYPE_DICT_ENTRY) {
         const char *key;
@@ -1209,16 +1349,13 @@ static DBusMessage *endpoint_set_configuration(DBusConnection *conn, DBusMessage
 
             dbus_message_iter_get_basic(&value, &uuid);
 
-            endpoint_path = dbus_message_get_path(m);
-            if (pa_streq(endpoint_path, A2DP_SOURCE_ENDPOINT)) {
-                if (pa_streq(uuid, PA_BLUETOOTH_UUID_A2DP_SOURCE))
-                    p = PA_BLUETOOTH_PROFILE_A2DP_SINK;
-            } else if (pa_streq(endpoint_path, A2DP_SINK_ENDPOINT)) {
-                if (pa_streq(uuid, PA_BLUETOOTH_UUID_A2DP_SINK))
-                    p = PA_BLUETOOTH_PROFILE_A2DP_SOURCE;
-            }
+            if (pa_startswith(endpoint_path, A2DP_SINK_ENDPOINT "/"))
+                p = PA_BLUETOOTH_PROFILE_A2DP_SOURCE;
+            else if (pa_startswith(endpoint_path, A2DP_SOURCE_ENDPOINT "/"))
+                p = PA_BLUETOOTH_PROFILE_A2DP_SINK;
 
-            if (p == PA_BLUETOOTH_PROFILE_OFF) {
+            if ((pa_streq(uuid, PA_BLUETOOTH_UUID_A2DP_SOURCE) && p != PA_BLUETOOTH_PROFILE_A2DP_SINK) ||
+                (pa_streq(uuid, PA_BLUETOOTH_UUID_A2DP_SINK) && p != PA_BLUETOOTH_PROFILE_A2DP_SOURCE)) {
                 pa_log_error("UUID %s of transport %s incompatible with endpoint %s", uuid, path, endpoint_path);
                 goto fail;
             }
@@ -1231,7 +1368,6 @@ static DBusMessage *endpoint_set_configuration(DBusConnection *conn, DBusMessage
             dbus_message_iter_get_basic(&value, &dev_path);
         } else if (pa_streq(key, "Configuration")) {
             DBusMessageIter array;
-            a2dp_sbc_t *c;
 
             if (var != DBUS_TYPE_ARRAY) {
                 pa_log_error("Property %s of wrong type %c", key, (char)var);
@@ -1246,44 +1382,19 @@ static DBusMessage *endpoint_set_configuration(DBusConnection *conn, DBusMessage
             }
 
             dbus_message_iter_get_fixed_array(&array, &config, &size);
-            if (size != sizeof(a2dp_sbc_t)) {
-                pa_log_error("Configuration array of invalid size");
-                goto fail;
-            }
 
-            c = (a2dp_sbc_t *) config;
+            a2dp_codec = a2dp_endpoint_to_a2dp_codec(endpoint_path);
+            pa_assert(a2dp_codec);
 
-            if (c->frequency != SBC_SAMPLING_FREQ_16000 && c->frequency != SBC_SAMPLING_FREQ_32000 &&
-                c->frequency != SBC_SAMPLING_FREQ_44100 && c->frequency != SBC_SAMPLING_FREQ_48000) {
-                pa_log_error("Invalid sampling frequency in configuration");
+            if (!a2dp_codec->is_configuration_valid(config, size))
                 goto fail;
-            }
-
-            if (c->channel_mode != SBC_CHANNEL_MODE_MONO && c->channel_mode != SBC_CHANNEL_MODE_DUAL_CHANNEL &&
-                c->channel_mode != SBC_CHANNEL_MODE_STEREO && c->channel_mode != SBC_CHANNEL_MODE_JOINT_STEREO) {
-                pa_log_error("Invalid channel mode in configuration");
-                goto fail;
-            }
-
-            if (c->allocation_method != SBC_ALLOCATION_SNR && c->allocation_method != SBC_ALLOCATION_LOUDNESS) {
-                pa_log_error("Invalid allocation method in configuration");
-                goto fail;
-            }
-
-            if (c->subbands != SBC_SUBBANDS_4 && c->subbands != SBC_SUBBANDS_8) {
-                pa_log_error("Invalid SBC subbands in configuration");
-                goto fail;
-            }
-
-            if (c->block_length != SBC_BLOCK_LENGTH_4 && c->block_length != SBC_BLOCK_LENGTH_8 &&
-                c->block_length != SBC_BLOCK_LENGTH_12 && c->block_length != SBC_BLOCK_LENGTH_16) {
-                pa_log_error("Invalid block length in configuration");
-                goto fail;
-            }
         }
 
         dbus_message_iter_next(&props);
     }
+
+    if (!a2dp_codec)
+        goto fail2;
 
     if ((d = pa_hashmap_get(y->devices, dev_path))) {
         if (!d->valid) {
@@ -1308,6 +1419,7 @@ static DBusMessage *endpoint_set_configuration(DBusConnection *conn, DBusMessage
     dbus_message_unref(r);
 
     t = pa_bluetooth_transport_new(d, sender, path, p, config, size);
+    t->a2dp_codec = a2dp_codec;
     t->acquire = bluez5_transport_acquire_cb;
     t->release = bluez5_transport_release_cb;
     pa_bluetooth_transport_put(t);
@@ -1326,21 +1438,17 @@ fail2:
 
 static DBusMessage *endpoint_select_configuration(DBusConnection *conn, DBusMessage *m, void *userdata) {
     pa_bluetooth_discovery *y = userdata;
-    a2dp_sbc_t *cap, config;
-    uint8_t *pconf = (uint8_t *) &config;
-    int i, size;
+    const char *endpoint_path;
+    uint8_t *cap;
+    int size;
+    const pa_a2dp_codec *a2dp_codec;
+    uint8_t config[MAX_A2DP_CAPS_SIZE];
+    uint8_t *config_ptr = config;
+    size_t config_size;
     DBusMessage *r;
     DBusError err;
 
-    static const struct {
-        uint32_t rate;
-        uint8_t cap;
-    } freq_table[] = {
-        { 16000U, SBC_SAMPLING_FREQ_16000 },
-        { 32000U, SBC_SAMPLING_FREQ_32000 },
-        { 44100U, SBC_SAMPLING_FREQ_44100 },
-        { 48000U, SBC_SAMPLING_FREQ_48000 }
-    };
+    endpoint_path = dbus_message_get_path(m);
 
     dbus_error_init(&err);
 
@@ -1350,101 +1458,15 @@ static DBusMessage *endpoint_select_configuration(DBusConnection *conn, DBusMess
         goto fail;
     }
 
-    if (size != sizeof(config)) {
-        pa_log_error("Capabilities array has invalid size");
-        goto fail;
-    }
+    a2dp_codec = a2dp_endpoint_to_a2dp_codec(endpoint_path);
+    pa_assert(a2dp_codec);
 
-    pa_zero(config);
-
-    /* Find the lowest freq that is at least as high as the requested sampling rate */
-    for (i = 0; (unsigned) i < PA_ELEMENTSOF(freq_table); i++)
-        if (freq_table[i].rate >= y->core->default_sample_spec.rate && (cap->frequency & freq_table[i].cap)) {
-            config.frequency = freq_table[i].cap;
-            break;
-        }
-
-    if ((unsigned) i == PA_ELEMENTSOF(freq_table)) {
-        for (--i; i >= 0; i--) {
-            if (cap->frequency & freq_table[i].cap) {
-                config.frequency = freq_table[i].cap;
-                break;
-            }
-        }
-
-        if (i < 0) {
-            pa_log_error("Not suitable sample rate");
-            goto fail;
-        }
-    }
-
-    pa_assert((unsigned) i < PA_ELEMENTSOF(freq_table));
-
-    if (y->core->default_sample_spec.channels <= 1) {
-        if (cap->channel_mode & SBC_CHANNEL_MODE_MONO)
-            config.channel_mode = SBC_CHANNEL_MODE_MONO;
-        else if (cap->channel_mode & SBC_CHANNEL_MODE_JOINT_STEREO)
-            config.channel_mode = SBC_CHANNEL_MODE_JOINT_STEREO;
-        else if (cap->channel_mode & SBC_CHANNEL_MODE_STEREO)
-            config.channel_mode = SBC_CHANNEL_MODE_STEREO;
-        else if (cap->channel_mode & SBC_CHANNEL_MODE_DUAL_CHANNEL)
-            config.channel_mode = SBC_CHANNEL_MODE_DUAL_CHANNEL;
-        else {
-            pa_log_error("No supported channel modes");
-            goto fail;
-        }
-    }
-
-    if (y->core->default_sample_spec.channels >= 2) {
-        if (cap->channel_mode & SBC_CHANNEL_MODE_JOINT_STEREO)
-            config.channel_mode = SBC_CHANNEL_MODE_JOINT_STEREO;
-        else if (cap->channel_mode & SBC_CHANNEL_MODE_STEREO)
-            config.channel_mode = SBC_CHANNEL_MODE_STEREO;
-        else if (cap->channel_mode & SBC_CHANNEL_MODE_DUAL_CHANNEL)
-            config.channel_mode = SBC_CHANNEL_MODE_DUAL_CHANNEL;
-        else if (cap->channel_mode & SBC_CHANNEL_MODE_MONO)
-            config.channel_mode = SBC_CHANNEL_MODE_MONO;
-        else {
-            pa_log_error("No supported channel modes");
-            goto fail;
-        }
-    }
-
-    if (cap->block_length & SBC_BLOCK_LENGTH_16)
-        config.block_length = SBC_BLOCK_LENGTH_16;
-    else if (cap->block_length & SBC_BLOCK_LENGTH_12)
-        config.block_length = SBC_BLOCK_LENGTH_12;
-    else if (cap->block_length & SBC_BLOCK_LENGTH_8)
-        config.block_length = SBC_BLOCK_LENGTH_8;
-    else if (cap->block_length & SBC_BLOCK_LENGTH_4)
-        config.block_length = SBC_BLOCK_LENGTH_4;
-    else {
-        pa_log_error("No supported block lengths");
-        goto fail;
-    }
-
-    if (cap->subbands & SBC_SUBBANDS_8)
-        config.subbands = SBC_SUBBANDS_8;
-    else if (cap->subbands & SBC_SUBBANDS_4)
-        config.subbands = SBC_SUBBANDS_4;
-    else {
-        pa_log_error("No supported subbands");
-        goto fail;
-    }
-
-    if (cap->allocation_method & SBC_ALLOCATION_LOUDNESS)
-        config.allocation_method = SBC_ALLOCATION_LOUDNESS;
-    else if (cap->allocation_method & SBC_ALLOCATION_SNR)
-        config.allocation_method = SBC_ALLOCATION_SNR;
-
-    config.min_bitpool = (uint8_t) PA_MAX(MIN_BITPOOL, cap->min_bitpool);
-    config.max_bitpool = (uint8_t) PA_MIN(a2dp_default_bitpool(config.frequency, config.channel_mode), cap->max_bitpool);
-
-    if (config.min_bitpool > config.max_bitpool)
+    config_size = a2dp_codec->fill_preferred_configuration(&y->core->default_sample_spec, cap, size, config);
+    if (config_size == 0)
         goto fail;
 
     pa_assert_se(r = dbus_message_new_method_return(m));
-    pa_assert_se(dbus_message_append_args(r, DBUS_TYPE_ARRAY, DBUS_TYPE_BYTE, &pconf, size, DBUS_TYPE_INVALID));
+    pa_assert_se(dbus_message_append_args(r, DBUS_TYPE_ARRAY, DBUS_TYPE_BYTE, &config_ptr, config_size, DBUS_TYPE_INVALID));
 
     return r;
 
@@ -1483,10 +1505,25 @@ fail:
 }
 
 static DBusMessage *endpoint_release(DBusConnection *conn, DBusMessage *m, void *userdata) {
-    DBusMessage *r;
+    DBusMessage *r = NULL;
 
-    pa_assert_se(r = dbus_message_new_error(m, BLUEZ_MEDIA_ENDPOINT_INTERFACE ".Error.NotImplemented",
-                                            "Method not implemented"));
+    /* From doc/media-api.txt in bluez:
+     *
+     *    This method gets called when the service daemon
+     *    unregisters the endpoint. An endpoint can use it to do
+     *    cleanup tasks. There is no need to unregister the
+     *    endpoint, because when this method gets called it has
+     *    already been unregistered.
+     *
+     * We don't have any cleanup to do. */
+
+    /* Reply only if requested. Generally bluetoothd doesn't request a reply
+     * to the Release() call. Sending replies when not requested on the system
+     * bus tends to cause errors in syslog from dbus-daemon, because it
+     * doesn't let unexpected replies through, so it's important to have this
+     * check here. */
+    if (!dbus_message_get_no_reply(m))
+        pa_assert_se(r = dbus_message_new_method_return(m));
 
     return r;
 }
@@ -1504,7 +1541,7 @@ static DBusHandlerResult endpoint_handler(DBusConnection *c, DBusMessage *m, voi
 
     pa_log_debug("dbus: path=%s, interface=%s, member=%s", path, interface, member);
 
-    if (!pa_streq(path, A2DP_SOURCE_ENDPOINT) && !pa_streq(path, A2DP_SINK_ENDPOINT))
+    if (!a2dp_endpoint_to_a2dp_codec(path))
         return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
 
     if (dbus_message_is_method_call(m, "org.freedesktop.DBus.Introspectable", "Introspect")) {
@@ -1532,49 +1569,32 @@ static DBusHandlerResult endpoint_handler(DBusConnection *c, DBusMessage *m, voi
     return DBUS_HANDLER_RESULT_HANDLED;
 }
 
-static void endpoint_init(pa_bluetooth_discovery *y, pa_bluetooth_profile_t profile) {
+static void endpoint_init(pa_bluetooth_discovery *y, const char *endpoint) {
     static const DBusObjectPathVTable vtable_endpoint = {
         .message_function = endpoint_handler,
     };
 
     pa_assert(y);
+    pa_assert(endpoint);
 
-    switch(profile) {
-        case PA_BLUETOOTH_PROFILE_A2DP_SINK:
-            pa_assert_se(dbus_connection_register_object_path(pa_dbus_connection_get(y->connection), A2DP_SOURCE_ENDPOINT,
-                                                              &vtable_endpoint, y));
-            break;
-        case PA_BLUETOOTH_PROFILE_A2DP_SOURCE:
-            pa_assert_se(dbus_connection_register_object_path(pa_dbus_connection_get(y->connection), A2DP_SINK_ENDPOINT,
-                                                              &vtable_endpoint, y));
-            break;
-        default:
-            pa_assert_not_reached();
-            break;
-    }
+    pa_assert_se(dbus_connection_register_object_path(pa_dbus_connection_get(y->connection), endpoint,
+                                                      &vtable_endpoint, y));
 }
 
-static void endpoint_done(pa_bluetooth_discovery *y, pa_bluetooth_profile_t profile) {
+static void endpoint_done(pa_bluetooth_discovery *y, const char *endpoint) {
     pa_assert(y);
+    pa_assert(endpoint);
 
-    switch(profile) {
-        case PA_BLUETOOTH_PROFILE_A2DP_SINK:
-            dbus_connection_unregister_object_path(pa_dbus_connection_get(y->connection), A2DP_SOURCE_ENDPOINT);
-            break;
-        case PA_BLUETOOTH_PROFILE_A2DP_SOURCE:
-            dbus_connection_unregister_object_path(pa_dbus_connection_get(y->connection), A2DP_SINK_ENDPOINT);
-            break;
-        default:
-            pa_assert_not_reached();
-            break;
-    }
+    dbus_connection_unregister_object_path(pa_dbus_connection_get(y->connection), endpoint);
 }
 
 pa_bluetooth_discovery* pa_bluetooth_discovery_get(pa_core *c, int headset_backend) {
     pa_bluetooth_discovery *y;
     DBusError err;
     DBusConnection *conn;
-    unsigned i;
+    unsigned i, count;
+    const pa_a2dp_codec *a2dp_codec;
+    char *endpoint;
 
     y = pa_xnew0(pa_bluetooth_discovery, 1);
     PA_REFCNT_INIT(y);
@@ -1626,8 +1646,18 @@ pa_bluetooth_discovery* pa_bluetooth_discovery_get(pa_core *c, int headset_backe
     }
     y->matches_added = true;
 
-    endpoint_init(y, PA_BLUETOOTH_PROFILE_A2DP_SINK);
-    endpoint_init(y, PA_BLUETOOTH_PROFILE_A2DP_SOURCE);
+    count = pa_bluetooth_a2dp_codec_count();
+    for (i = 0; i < count; i++) {
+        a2dp_codec = pa_bluetooth_a2dp_codec_iter(i);
+
+        endpoint = pa_sprintf_malloc("%s/%s", A2DP_SINK_ENDPOINT, a2dp_codec->name);
+        endpoint_init(y, endpoint);
+        pa_xfree(endpoint);
+
+        endpoint = pa_sprintf_malloc("%s/%s", A2DP_SOURCE_ENDPOINT, a2dp_codec->name);
+        endpoint_init(y, endpoint);
+        pa_xfree(endpoint);
+    }
 
     get_managed_objects(y);
 
@@ -1650,6 +1680,10 @@ pa_bluetooth_discovery* pa_bluetooth_discovery_ref(pa_bluetooth_discovery *y) {
 }
 
 void pa_bluetooth_discovery_unref(pa_bluetooth_discovery *y) {
+    unsigned i, count;
+    const pa_a2dp_codec *a2dp_codec;
+    char *endpoint;
+
     pa_assert(y);
     pa_assert(PA_REFCNT_VALUE(y) > 0);
 
@@ -1657,6 +1691,11 @@ void pa_bluetooth_discovery_unref(pa_bluetooth_discovery *y) {
         return;
 
     pa_dbus_free_pending_list(&y->pending);
+
+    if (y->ofono_backend)
+        pa_bluetooth_ofono_backend_free(y->ofono_backend);
+    if (y->native_backend)
+        pa_bluetooth_native_backend_free(y->native_backend);
 
     if (y->adapters)
         pa_hashmap_free(y->adapters);
@@ -1668,11 +1707,6 @@ void pa_bluetooth_discovery_unref(pa_bluetooth_discovery *y) {
         pa_assert(pa_hashmap_isempty(y->transports));
         pa_hashmap_free(y->transports);
     }
-
-    if (y->ofono_backend)
-        pa_bluetooth_ofono_backend_free(y->ofono_backend);
-    if (y->native_backend)
-        pa_bluetooth_native_backend_free(y->native_backend);
 
     if (y->connection) {
 
@@ -1695,8 +1729,18 @@ void pa_bluetooth_discovery_unref(pa_bluetooth_discovery *y) {
         if (y->filter_added)
             dbus_connection_remove_filter(pa_dbus_connection_get(y->connection), filter_cb, y);
 
-        endpoint_done(y, PA_BLUETOOTH_PROFILE_A2DP_SINK);
-        endpoint_done(y, PA_BLUETOOTH_PROFILE_A2DP_SOURCE);
+        count = pa_bluetooth_a2dp_codec_count();
+        for (i = 0; i < count; i++) {
+            a2dp_codec = pa_bluetooth_a2dp_codec_iter(i);
+
+            endpoint = pa_sprintf_malloc("%s/%s", A2DP_SINK_ENDPOINT, a2dp_codec->name);
+            endpoint_done(y, endpoint);
+            pa_xfree(endpoint);
+
+            endpoint = pa_sprintf_malloc("%s/%s", A2DP_SOURCE_ENDPOINT, a2dp_codec->name);
+            endpoint_done(y, endpoint);
+            pa_xfree(endpoint);
+        }
 
         pa_dbus_connection_unref(y->connection);
     }

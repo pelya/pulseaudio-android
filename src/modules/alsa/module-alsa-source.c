@@ -24,7 +24,7 @@
 
 #include <stdio.h>
 
-#include <asoundlib.h>
+#include <alsa/asoundlib.h>
 
 #ifdef HAVE_VALGRIND_MEMCHECK_H
 #include <valgrind/memcheck.h>
@@ -37,7 +37,6 @@
 
 #include "alsa-util.h"
 #include "alsa-source.h"
-#include "module-alsa-source-symdef.h"
 
 PA_MODULE_AUTHOR("Lennart Poettering");
 PA_MODULE_DESCRIPTION("ALSA Source");

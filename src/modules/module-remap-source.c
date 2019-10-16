@@ -38,8 +38,6 @@
 #include <pulsecore/ltdl-helper.h>
 #include <pulsecore/mix.h>
 
-#include "module-remap-source-symdef.h"
-
 PA_MODULE_AUTHOR("Stefan Huber");
 PA_MODULE_DESCRIPTION("Virtual channel remapping source");
 PA_MODULE_VERSION(PACKAGE_VERSION);
@@ -92,14 +90,14 @@ static int source_process_msg_cb(pa_msgobject *o, int code, void *data, int64_t 
              * source output is first shut down, the source second. */
             if (!PA_SOURCE_IS_LINKED(u->source->thread_info.state) ||
                 !PA_SOURCE_OUTPUT_IS_LINKED(u->source_output->thread_info.state)) {
-                *((pa_usec_t*) data) = 0;
+                *((int64_t*) data) = 0;
                 return 0;
             }
 
-            *((pa_usec_t*) data) =
+            *((int64_t*) data) =
 
                 /* Get the latency of the master source */
-                pa_source_get_latency_within_thread(u->source_output->source) +
+                pa_source_get_latency_within_thread(u->source_output->source, true) +
                 /* Add the latency internal to our source output on top */
                 pa_bytes_to_usec(pa_memblockq_get_length(u->source_output->thread_info.delay_memblockq), &u->source_output->source->sample_spec);
 
@@ -110,14 +108,14 @@ static int source_process_msg_cb(pa_msgobject *o, int code, void *data, int64_t 
 }
 
 /* Called from main context */
-static int source_set_state_cb(pa_source *s, pa_source_state_t state) {
+static int source_set_state_in_main_thread_cb(pa_source *s, pa_source_state_t state, pa_suspend_cause_t suspend_cause) {
     struct userdata *u;
 
     pa_source_assert_ref(s);
     pa_assert_se(u = s->userdata);
 
     if (!PA_SOURCE_IS_LINKED(state) ||
-        !PA_SOURCE_OUTPUT_IS_LINKED(pa_source_output_get_state(u->source_output)))
+        !PA_SOURCE_OUTPUT_IS_LINKED(u->source_output->state))
         return 0;
 
     pa_source_output_cork(u->source_output, state == PA_SOURCE_SUSPENDED);
@@ -151,7 +149,10 @@ static void source_output_push_cb(pa_source_output *o, const pa_memchunk *chunk)
     pa_source_output_assert_io_context(o);
     pa_assert_se(u = o->userdata);
 
-    if (!PA_SOURCE_OUTPUT_IS_LINKED(pa_source_output_get_state(u->source_output))) {
+    if (!PA_SOURCE_IS_LINKED(u->source->thread_info.state))
+        return;
+
+    if (!PA_SOURCE_OUTPUT_IS_LINKED(u->source_output->thread_info.state)) {
         pa_log("push when no link?");
         return;
     }
@@ -167,7 +168,20 @@ static void source_output_process_rewind_cb(pa_source_output *o, size_t nbytes) 
     pa_source_output_assert_io_context(o);
     pa_assert_se(u = o->userdata);
 
-    pa_source_process_rewind(u->source, nbytes);
+    /* If the source is not yet linked, there is nothing to rewind */
+    if (PA_SOURCE_IS_LINKED(u->source->thread_info.state))
+        pa_source_process_rewind(u->source, nbytes);
+}
+
+/* Called from output thread context */
+static void source_output_update_max_rewind_cb(pa_source_output *o, size_t nbytes) {
+    struct userdata *u;
+
+    pa_source_output_assert_ref(o);
+    pa_source_output_assert_io_context(o);
+    pa_assert_se(u = o->userdata);
+
+    pa_source_set_max_rewind_within_thread(u->source, nbytes);
 }
 
 /* Called from output thread context */
@@ -178,7 +192,8 @@ static void source_output_detach_cb(pa_source_output *o) {
     pa_source_output_assert_io_context(o);
     pa_assert_se(u = o->userdata);
 
-    pa_source_detach_within_thread(u->source);
+    if (PA_SOURCE_IS_LINKED(u->source->thread_info.state))
+        pa_source_detach_within_thread(u->source);
 
     pa_source_set_rtpoll(u->source, NULL);
 }
@@ -196,7 +211,8 @@ static void source_output_attach_cb(pa_source_output *o) {
     pa_source_set_fixed_latency_within_thread(u->source, o->source->thread_info.fixed_latency);
     pa_source_set_max_rewind_within_thread(u->source, pa_source_output_get_max_rewind(o));
 
-    pa_source_attach_within_thread(u->source);
+    if (PA_SOURCE_IS_LINKED(u->source->thread_info.state))
+        pa_source_attach_within_thread(u->source);
 }
 
 /* Called from main thread */
@@ -207,11 +223,12 @@ static void source_output_kill_cb(pa_source_output *o) {
     pa_assert_ctl_context();
     pa_assert_se(u = o->userdata);
 
-    /* The order here matters! We first kill the source output, followed
-     * by the source. That means the source callbacks must be protected
-     * against an unconnected source output! */
-    pa_source_output_unlink(u->source_output);
+    /* The order here matters! We first kill the source so that streams
+     * can properly be moved away while the source output is still connected
+     * to the master. */
+    pa_source_output_cork(u->source_output, true);
     pa_source_unlink(u->source);
+    pa_source_output_unlink(u->source_output);
 
     pa_source_output_unref(u->source_output);
     u->source_output = NULL;
@@ -222,12 +239,11 @@ static void source_output_kill_cb(pa_source_output *o) {
     pa_module_unload_request(u->module, true);
 }
 
-/* Called from output thread context */
+/* Called from output thread context except when cork() is called without valid source. */
 static void source_output_state_change_cb(pa_source_output *o, pa_source_output_state_t state) {
     struct userdata *u;
 
     pa_source_output_assert_ref(o);
-    pa_source_output_assert_io_context(o);
     pa_assert_se(u = o->userdata);
 
     pa_log_debug("Source output %d state %d.", o->index, state);
@@ -351,7 +367,7 @@ int pa__init(pa_module*m) {
     }
 
     u->source->parent.process_msg = source_process_msg_cb;
-    u->source->set_state = source_set_state_cb;
+    u->source->set_state_in_main_thread = source_set_state_in_main_thread_cb;
     u->source->update_requested_latency = source_update_requested_latency_cb;
 
     u->source->userdata = u;
@@ -362,14 +378,14 @@ int pa__init(pa_module*m) {
     pa_source_output_new_data_init(&source_output_data);
     source_output_data.driver = __FILE__;
     source_output_data.module = m;
-    pa_source_output_new_data_set_source(&source_output_data, master, false);
+    pa_source_output_new_data_set_source(&source_output_data, master, false, true);
     source_output_data.destination_source = u->source;
 
     pa_proplist_sets(source_output_data.proplist, PA_PROP_MEDIA_NAME, "Remapped Stream");
     pa_proplist_sets(source_output_data.proplist, PA_PROP_MEDIA_ROLE, "filter");
     pa_source_output_new_data_set_sample_spec(&source_output_data, &ss);
     pa_source_output_new_data_set_channel_map(&source_output_data, &stream_map);
-    source_output_data.flags = remix ? 0 : PA_SOURCE_OUTPUT_NO_REMIX;
+    source_output_data.flags = (remix ? 0 : PA_SOURCE_OUTPUT_NO_REMIX) | PA_SOURCE_OUTPUT_START_CORKED;
     source_output_data.resample_method = resample_method;
 
     pa_source_output_new(&u->source_output, m->core, &source_output_data);
@@ -380,6 +396,7 @@ int pa__init(pa_module*m) {
 
     u->source_output->push = source_output_push_cb;
     u->source_output->process_rewind = source_output_process_rewind_cb;
+    u->source_output->update_max_rewind = source_output_update_max_rewind_cb;
     u->source_output->kill = source_output_kill_cb;
     u->source_output->attach = source_output_attach_cb;
     u->source_output->detach = source_output_detach_cb;
@@ -389,8 +406,12 @@ int pa__init(pa_module*m) {
 
     u->source->output_from_master = u->source_output;
 
-    pa_source_put(u->source);
+    /* The order here is important. The output must be put first,
+     * otherwise streams might attach to the source before the
+     * source output is attached to the master. */
     pa_source_output_put(u->source_output);
+    pa_source_put(u->source);
+    pa_source_output_cork(u->source_output, false);
 
     pa_modargs_free(ma);
 
@@ -426,13 +447,15 @@ void pa__done(pa_module*m) {
      * destruction order! */
 
     if (u->source_output)
-        pa_source_output_unlink(u->source_output);
+        pa_source_output_cork(u->source_output, true);
 
     if (u->source)
         pa_source_unlink(u->source);
 
-    if (u->source_output)
+    if (u->source_output) {
+        pa_source_output_unlink(u->source_output);
         pa_source_output_unref(u->source_output);
+    }
 
     if (u->source)
         pa_source_unref(u->source);

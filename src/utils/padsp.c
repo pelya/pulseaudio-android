@@ -52,6 +52,7 @@
 #include <pulse/gccmacro.h>
 #include <pulsecore/llist.h>
 #include <pulsecore/core-util.h>
+#include <pulsecore/sample-util.h>
 
 /* On some systems SIOCINQ isn't defined, but FIONREAD is just an alias */
 #if !defined(SIOCINQ) && defined(FIONREAD)
@@ -92,6 +93,7 @@ struct fd_info {
     pa_io_event_flags_t io_flags;
 
     void *buf;
+    size_t leftover;
     size_t rec_offset;
 
     int operation_success;
@@ -641,6 +643,7 @@ static fd_info* fd_info_new(fd_info_type_t type, int *_errno) {
     pthread_mutex_init(&i->mutex, NULL);
     i->ref = 1;
     i->buf = NULL;
+    i->leftover = 0;
     i->rec_offset = 0;
     i->unusable = 0;
     pa_cvolume_reset(&i->sink_volume, 2);
@@ -866,15 +869,18 @@ static int fd_info_copy_data(fd_info *i, int force) {
 
         while (n >= i->fragment_size || force) {
             ssize_t r;
+            size_t to_write;
 
             if (!i->buf) {
                 if (!(i->buf = malloc(i->fragment_size))) {
                     debug(DEBUG_LEVEL_NORMAL, __FILE__": malloc() failed.\n");
                     return -1;
                 }
+
+                i->leftover = 0;
             }
 
-            if ((r = read(i->thread_fd, i->buf, i->fragment_size)) <= 0) {
+            if ((r = read(i->thread_fd, ((uint8_t *) i->buf) + i->leftover, i->fragment_size - i->leftover)) <= 0) {
 
                 if (errno == EAGAIN)
                     break;
@@ -883,15 +889,19 @@ static int fd_info_copy_data(fd_info *i, int force) {
                 return -1;
             }
 
-            if (pa_stream_write(i->play_stream, i->buf, (size_t) r, free, 0LL, PA_SEEK_RELATIVE) < 0) {
+            to_write = pa_frame_align(r + i->leftover, &i->sample_spec);
+
+            if (pa_stream_write(i->play_stream, i->buf, to_write, NULL, 0LL, PA_SEEK_RELATIVE) < 0) {
                 debug(DEBUG_LEVEL_NORMAL, __FILE__": pa_stream_write(): %s\n", pa_strerror(pa_context_errno(i->context)));
                 return -1;
             }
 
-            i->buf = NULL;
+            i->leftover += r - to_write;
+            if (i->leftover)
+                memmove(i->buf, ((uint8_t *) i->buf) + to_write, i->leftover);
 
-            assert(n >= (size_t) r);
-            n -= (size_t) r;
+            assert(n >= (size_t) to_write);
+            n -= (size_t) to_write;
         }
 
         if (n >= i->fragment_size)
@@ -1768,11 +1778,18 @@ static int dsp_flush_fd(int fd) {
     while (l > 0) {
         char buf[1024];
         size_t k;
+        ssize_t r;
 
         k = (size_t) l > sizeof(buf) ? sizeof(buf) : (size_t) l;
-        if (read(fd, buf, k) < 0)
+        r = read(fd, buf, k);
+        if (r < 0) {
+            if (errno == EAGAIN)
+                break;
             debug(DEBUG_LEVEL_NORMAL, __FILE__": read(): %s\n", strerror(errno));
-        l -= k;
+            return -1;
+        } else if (r == 0)
+            break;
+        l -= r;
     }
 
     return 0;
@@ -2278,6 +2295,7 @@ static int dsp_ioctl(fd_info *i, unsigned long request, void*argp, int *_errno) 
             break;
         }
 
+#ifdef HAVE_DECL_SOUND_PCM_READ_RATE
         case SOUND_PCM_READ_RATE:
             debug(DEBUG_LEVEL_NORMAL, __FILE__": SOUND_PCM_READ_RATE\n");
 
@@ -2285,7 +2303,9 @@ static int dsp_ioctl(fd_info *i, unsigned long request, void*argp, int *_errno) 
             *(int*) argp = i->sample_spec.rate;
             pa_threaded_mainloop_unlock(i->mainloop);
             break;
+#endif
 
+#ifdef HAVE_DECL_SOUND_PCM_READ_CHANNELS
         case SOUND_PCM_READ_CHANNELS:
             debug(DEBUG_LEVEL_NORMAL, __FILE__": SOUND_PCM_READ_CHANNELS\n");
 
@@ -2293,7 +2313,9 @@ static int dsp_ioctl(fd_info *i, unsigned long request, void*argp, int *_errno) 
             *(int*) argp = i->sample_spec.channels;
             pa_threaded_mainloop_unlock(i->mainloop);
             break;
+#endif
 
+#ifdef HAVE_DECL_SOUND_PCM_READ_BITS
         case SOUND_PCM_READ_BITS:
             debug(DEBUG_LEVEL_NORMAL, __FILE__": SOUND_PCM_READ_BITS\n");
 
@@ -2301,6 +2323,7 @@ static int dsp_ioctl(fd_info *i, unsigned long request, void*argp, int *_errno) 
             *(int*) argp = pa_sample_size(&i->sample_spec)*8;
             pa_threaded_mainloop_unlock(i->mainloop);
             break;
+#endif
 
         case SNDCTL_DSP_GETOPTR: {
             count_info *info;
@@ -2371,7 +2394,7 @@ fail:
     return ret;
 }
 
-#ifdef sun
+#ifndef __GLIBC__
 int ioctl(int fd, int request, ...) {
 #else
 int ioctl(int fd, unsigned long request, ...) {
@@ -2511,10 +2534,13 @@ int stat(const char *pathname, struct stat *buf) {
 
     return 0;
 }
-
 #ifdef HAVE_OPEN64
-
+#undef stat64
+#ifdef __GLIBC__
 int stat64(const char *pathname, struct stat64 *buf) {
+#else
+int stat64(const char *pathname, struct stat *buf) {
+#endif
     struct stat oldbuf;
     int ret;
 
@@ -2547,7 +2573,7 @@ int stat64(const char *pathname, struct stat64 *buf) {
 
     return 0;
 }
-
+#undef open64
 int open64(const char *filename, int flags, ...) {
     va_list args;
     mode_t mode = 0;
@@ -2673,8 +2699,8 @@ FILE* fopen(const char *filename, const char *mode) {
 }
 
 #ifdef HAVE_OPEN64
-
-FILE *fopen64(const char *filename, const char *mode) {
+#undef fopen64
+FILE *fopen64(const char *__restrict filename, const char *__restrict mode) {
 
     debug(DEBUG_LEVEL_VERBOSE, __FILE__": fopen64(%s)\n", filename?filename:"NULL");
 

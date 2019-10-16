@@ -63,7 +63,8 @@ static const pa_sample_spec sample_spec = {
 
 static void context_state_callback(pa_context *c, void *userdata);
 
-static void connect(const char *name, int *try) {
+/* Note: don't conflict with connect(2) declaration */
+static void _connect(const char *name, int *try) {
     int ret;
     pa_mainloop_api *api;
 
@@ -80,14 +81,14 @@ static void connect(const char *name, int *try) {
     /* Connect the context */
     if (pa_context_connect(context, NULL, 0, NULL) < 0) {
         fprintf(stderr, "pa_context_connect() failed.\n");
-        fail();
+        ck_abort();
     }
 
     ret = pa_threaded_mainloop_start(mainloop);
     fail_unless(ret == 0);
 }
 
-static void disconnect(void) {
+static void _disconnect(void) {
     int i;
 
     fail_unless(mainloop != NULL);
@@ -144,7 +145,7 @@ static void stream_state_callback(pa_stream *s, void *userdata) {
         default:
         case PA_STREAM_FAILED:
             fprintf(stderr, "Stream error: %s\n", pa_strerror(pa_context_errno(pa_stream_get_context(s))));
-            fail();
+            ck_abort();
     }
 }
 
@@ -190,7 +191,7 @@ static void context_state_callback(pa_context *c, void *userdata) {
         case PA_CONTEXT_FAILED:
         default:
             fprintf(stderr, "Context error: %s\n", pa_strerror(pa_context_errno(c)));
-            fail();
+            ck_abort();
     }
 }
 
@@ -201,9 +202,9 @@ START_TEST (connect_stress_test) {
         streams[i] = NULL;
 
     for (i = 0; i < NTESTS; i++) {
-        connect(bname, &i);
+        _connect(bname, &i);
         usleep(rand() % 500000);
-        disconnect();
+        _disconnect();
         usleep(rand() % 500000);
     }
 

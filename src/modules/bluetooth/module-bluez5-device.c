@@ -3,6 +3,7 @@
 
   Copyright 2008-2013 João Paulo Rechi Vita
   Copyright 2011-2013 BMW Car IT GmbH.
+  Copyright 2018-2019 Pali Rohár <pali.rohar@gmail.com>
 
   PulseAudio is free software; you can redistribute it and/or modify
   it under the terms of the GNU Lesser General Public License as
@@ -25,10 +26,11 @@
 #include <errno.h>
 
 #include <arpa/inet.h>
-#include <sbc/sbc.h>
 
 #include <pulse/rtclock.h>
 #include <pulse/timeval.h>
+#include <pulse/utf8.h>
+#include <pulse/util.h>
 
 #include <pulsecore/core-error.h>
 #include <pulsecore/core-rtclock.h>
@@ -45,36 +47,42 @@
 #include <pulsecore/time-smoother.h>
 
 #include "a2dp-codecs.h"
+#include "a2dp-codec-util.h"
 #include "bluez5-util.h"
-#include "rtp.h"
-
-#include "module-bluez5-device-symdef.h"
 
 PA_MODULE_AUTHOR("João Paulo Rechi Vita");
 PA_MODULE_DESCRIPTION("BlueZ 5 Bluetooth audio sink and source");
 PA_MODULE_VERSION(PACKAGE_VERSION);
 PA_MODULE_LOAD_ONCE(false);
-PA_MODULE_USAGE("path=<device object path>");
+PA_MODULE_USAGE("path=<device object path>"
+                "autodetect_mtu=<boolean>");
 
-#define MAX_PLAYBACK_CATCH_UP_USEC (100 * PA_USEC_PER_MSEC)
 #define FIXED_LATENCY_PLAYBACK_A2DP (25 * PA_USEC_PER_MSEC)
-#define FIXED_LATENCY_PLAYBACK_SCO (125 * PA_USEC_PER_MSEC)
+#define FIXED_LATENCY_PLAYBACK_SCO  (25 * PA_USEC_PER_MSEC)
 #define FIXED_LATENCY_RECORD_A2DP   (25 * PA_USEC_PER_MSEC)
 #define FIXED_LATENCY_RECORD_SCO    (25 * PA_USEC_PER_MSEC)
 
-#define BITPOOL_DEC_LIMIT 32
-#define BITPOOL_DEC_STEP 5
 #define HSP_MAX_GAIN 15
 
 static const char* const valid_modargs[] = {
     "path",
+    "autodetect_mtu",
     NULL
 };
 
 enum {
     BLUETOOTH_MESSAGE_IO_THREAD_FAILED,
     BLUETOOTH_MESSAGE_STREAM_FD_HUP,
+    BLUETOOTH_MESSAGE_SET_TRANSPORT_PLAYING,
     BLUETOOTH_MESSAGE_MAX
+};
+
+enum {
+    PA_SOURCE_MESSAGE_SETUP_STREAM = PA_SOURCE_MESSAGE_MAX,
+};
+
+enum {
+    PA_SINK_MESSAGE_SETUP_STREAM = PA_SINK_MESSAGE_MAX,
 };
 
 typedef struct bluetooth_msg {
@@ -83,18 +91,6 @@ typedef struct bluetooth_msg {
 } bluetooth_msg;
 PA_DEFINE_PRIVATE_CLASS(bluetooth_msg, pa_msgobject);
 #define BLUETOOTH_MSG(o) (bluetooth_msg_cast(o))
-
-typedef struct sbc_info {
-    sbc_t sbc;                           /* Codec data */
-    bool sbc_initialized;                /* Keep track if the encoder is initialized */
-    size_t codesize, frame_length;       /* SBC Codesize, frame_length. We simply cache those values here */
-    uint16_t seq_num;                    /* Cumulative packet sequence */
-    uint8_t min_bitpool;
-    uint8_t max_bitpool;
-
-    void* buffer;                        /* Codec transfer buffer */
-    size_t buffer_size;                  /* Size of the buffer */
-} sbc_info_t;
 
 struct userdata {
     pa_module *module;
@@ -109,6 +105,7 @@ struct userdata {
     pa_bluetooth_device *device;
     pa_bluetooth_transport *transport;
     bool transport_acquired;
+    bool stream_setup_done;
 
     pa_card *card;
     pa_sink *sink;
@@ -134,8 +131,18 @@ struct userdata {
     pa_usec_t started_at;
     pa_smoother *read_smoother;
     pa_memchunk write_memchunk;
-    pa_sample_spec sample_spec;
-    struct sbc_info sbc_info;
+
+    const pa_a2dp_codec *a2dp_codec;
+
+    void *encoder_info;
+    pa_sample_spec encoder_sample_spec;
+    void *encoder_buffer;                        /* Codec transfer buffer */
+    size_t encoder_buffer_size;                  /* Size of the buffer */
+
+    void *decoder_info;
+    pa_sample_spec decoder_sample_spec;
+    void *decoder_buffer;                        /* Codec transfer buffer */
+    size_t decoder_buffer_size;                  /* Size of the buffer */
 };
 
 typedef enum pa_bluetooth_form_factor {
@@ -243,6 +250,7 @@ static void connect_ports(struct userdata *u, void *new_data, pa_direction_t dir
 static int sco_process_render(struct userdata *u) {
     ssize_t l;
     pa_memchunk memchunk;
+    int saved_errno;
 
     pa_assert(u);
     pa_assert(u->profile == PA_BLUETOOTH_PROFILE_HEADSET_HEAD_UNIT ||
@@ -269,14 +277,22 @@ static int sco_process_render(struct userdata *u) {
         if (l > 0)
             break;
 
-        if (errno == EINTR)
+        saved_errno = errno;
+
+        if (saved_errno == EINTR)
             /* Retry right away if we got interrupted */
             continue;
-        else if (errno == EAGAIN)
-            /* Hmm, apparently the socket was not writable, give up for now */
-            return 0;
 
-        pa_log_error("Failed to write data to SCO socket: %s", pa_cstrerror(errno));
+        pa_memblock_unref(memchunk.memblock);
+
+        if (saved_errno == EAGAIN) {
+            /* Hmm, apparently the socket was not writable, give up for now.
+             * Because the data was already rendered, let's discard the block. */
+            pa_log_debug("Got EAGAIN on write() after POLLOUT, probably there is a temporary connection loss.");
+            return 1;
+        }
+
+        pa_log_error("Failed to write data to SCO socket: %s", pa_cstrerror(saved_errno));
         return -1;
     }
 
@@ -286,6 +302,8 @@ static int sco_process_render(struct userdata *u) {
         pa_log_error("Wrote memory block to socket only partially! %llu written, wanted to write %llu.",
                     (unsigned long long) l,
                     (unsigned long long) memchunk.length);
+
+        pa_memblock_unref(memchunk.memblock);
         return -1;
     }
 
@@ -358,7 +376,7 @@ static int sco_process_push(struct userdata *u) {
      * issues in our Bluetooth adapter. In these cases, in order to avoid
      * an assertion failure due to unaligned data, just discard the whole
      * packet */
-    if (!pa_frame_aligned(l, &u->sample_spec)) {
+    if (!pa_frame_aligned(l, &u->decoder_sample_spec)) {
         pa_log_warn("SCO packet received of unaligned size: %zu", l);
         pa_memblock_unref(memchunk.memblock);
         return -1;
@@ -381,7 +399,7 @@ static int sco_process_push(struct userdata *u) {
         tstamp = pa_rtclock_now();
     }
 
-    pa_smoother_put(u->read_smoother, tstamp, pa_bytes_to_usec(u->read_index, &u->sample_spec));
+    pa_smoother_put(u->read_smoother, tstamp, pa_bytes_to_usec(u->read_index, &u->decoder_sample_spec));
     pa_smoother_resume(u->read_smoother, tstamp, true);
 
     pa_source_post(u->source, &memchunk);
@@ -391,110 +409,52 @@ static int sco_process_push(struct userdata *u) {
 }
 
 /* Run from IO thread */
-static void a2dp_prepare_buffer(struct userdata *u) {
-    size_t min_buffer_size = PA_MAX(u->read_link_mtu, u->write_link_mtu);
-
+static void a2dp_prepare_encoder_buffer(struct userdata *u) {
     pa_assert(u);
 
-    if (u->sbc_info.buffer_size >= min_buffer_size)
-        return;
+    if (u->encoder_buffer_size < u->write_link_mtu) {
+        pa_xfree(u->encoder_buffer);
+        u->encoder_buffer = pa_xmalloc(u->write_link_mtu);
+    }
 
-    u->sbc_info.buffer_size = 2 * min_buffer_size;
-    pa_xfree(u->sbc_info.buffer);
-    u->sbc_info.buffer = pa_xmalloc(u->sbc_info.buffer_size);
+    /* Encoder buffer cannot be larger then link MTU, otherwise
+     * encode method would produce larger packets then link MTU */
+    u->encoder_buffer_size = u->write_link_mtu;
 }
 
 /* Run from IO thread */
-static int a2dp_process_render(struct userdata *u) {
-    struct sbc_info *sbc_info;
-    struct rtp_header *header;
-    struct rtp_payload *payload;
-    size_t nbytes;
-    void *d;
-    const void *p;
-    size_t to_write, to_encode;
-    unsigned frame_count;
-    int ret = 0;
-
+static void a2dp_prepare_decoder_buffer(struct userdata *u) {
     pa_assert(u);
-    pa_assert(u->profile == PA_BLUETOOTH_PROFILE_A2DP_SINK);
-    pa_assert(u->sink);
 
-    /* First, render some data */
-    if (!u->write_memchunk.memblock)
-        pa_sink_render_full(u->sink, u->write_block_size, &u->write_memchunk);
-
-    pa_assert(u->write_memchunk.length == u->write_block_size);
-
-    a2dp_prepare_buffer(u);
-
-    sbc_info = &u->sbc_info;
-    header = sbc_info->buffer;
-    payload = (struct rtp_payload*) ((uint8_t*) sbc_info->buffer + sizeof(*header));
-
-    frame_count = 0;
-
-    /* Try to create a packet of the full MTU */
-
-    p = (const uint8_t *) pa_memblock_acquire_chunk(&u->write_memchunk);
-    to_encode = u->write_memchunk.length;
-
-    d = (uint8_t*) sbc_info->buffer + sizeof(*header) + sizeof(*payload);
-    to_write = sbc_info->buffer_size - sizeof(*header) - sizeof(*payload);
-
-    while (PA_LIKELY(to_encode > 0 && to_write > 0)) {
-        ssize_t written;
-        ssize_t encoded;
-
-        encoded = sbc_encode(&sbc_info->sbc,
-                             p, to_encode,
-                             d, to_write,
-                             &written);
-
-        if (PA_UNLIKELY(encoded <= 0)) {
-            pa_log_error("SBC encoding error (%li)", (long) encoded);
-            pa_memblock_release(u->write_memchunk.memblock);
-            return -1;
-        }
-
-        pa_assert_fp((size_t) encoded <= to_encode);
-        pa_assert_fp((size_t) encoded == sbc_info->codesize);
-
-        pa_assert_fp((size_t) written <= to_write);
-        pa_assert_fp((size_t) written == sbc_info->frame_length);
-
-        p = (const uint8_t*) p + encoded;
-        to_encode -= encoded;
-
-        d = (uint8_t*) d + written;
-        to_write -= written;
-
-        frame_count++;
+    if (u->decoder_buffer_size < u->read_link_mtu) {
+        pa_xfree(u->decoder_buffer);
+        u->decoder_buffer = pa_xmalloc(u->read_link_mtu);
     }
 
-    pa_memblock_release(u->write_memchunk.memblock);
+    /* Decoder buffer cannot be larger then link MTU, otherwise
+     * decode method would produce larger output then read_block_size */
+    u->decoder_buffer_size = u->read_link_mtu;
+}
 
-    pa_assert(to_encode == 0);
+/* Run from IO thread */
+static int a2dp_write_buffer(struct userdata *u, size_t nbytes) {
+    int ret = 0;
 
-    PA_ONCE_BEGIN {
-        pa_log_debug("Using SBC encoder implementation: %s", pa_strnull(sbc_get_implementation_info(&sbc_info->sbc)));
-    } PA_ONCE_END;
-
-    /* write it to the fifo */
-    memset(sbc_info->buffer, 0, sizeof(*header) + sizeof(*payload));
-    header->v = 2;
-    header->pt = 1;
-    header->sequence_number = htons(sbc_info->seq_num++);
-    header->timestamp = htonl(u->write_index / pa_frame_size(&u->sample_spec));
-    header->ssrc = htonl(1);
-    payload->frame_count = frame_count;
-
-    nbytes = (uint8_t*) d - (uint8_t*) sbc_info->buffer;
+    /* Encoder function of A2DP codec may provide empty buffer, in this case do
+     * not post any empty buffer via A2DP socket. It may be because of codec
+     * internal state, e.g. encoder is waiting for more samples so it can
+     * provide encoded data. */
+    if (PA_UNLIKELY(!nbytes)) {
+        u->write_index += (uint64_t) u->write_memchunk.length;
+        pa_memblock_unref(u->write_memchunk.memblock);
+        pa_memchunk_reset(&u->write_memchunk);
+        return 0;
+    }
 
     for (;;) {
         ssize_t l;
 
-        l = pa_write(u->stream_fd, sbc_info->buffer, nbytes, &u->stream_write_type);
+        l = pa_write(u->stream_fd, u->encoder_buffer, nbytes, &u->stream_write_type);
 
         pa_assert(l != 0);
 
@@ -504,9 +464,11 @@ static int a2dp_process_render(struct userdata *u) {
                 /* Retry right away if we got interrupted */
                 continue;
 
-            else if (errno == EAGAIN)
+            else if (errno == EAGAIN) {
                 /* Hmm, apparently the socket was not writable, give up for now */
+                pa_log_debug("Got EAGAIN on write() after POLLOUT, probably there is a temporary connection loss.");
                 break;
+            }
 
             pa_log_error("Failed to write data to socket: %s", pa_cstrerror(errno));
             ret = -1;
@@ -536,6 +498,40 @@ static int a2dp_process_render(struct userdata *u) {
 }
 
 /* Run from IO thread */
+static int a2dp_process_render(struct userdata *u) {
+    const uint8_t *ptr;
+    size_t processed;
+    size_t length;
+
+    pa_assert(u);
+    pa_assert(u->profile == PA_BLUETOOTH_PROFILE_A2DP_SINK);
+    pa_assert(u->sink);
+    pa_assert(u->a2dp_codec);
+
+    /* First, render some data */
+    if (!u->write_memchunk.memblock)
+        pa_sink_render_full(u->sink, u->write_block_size, &u->write_memchunk);
+
+    pa_assert(u->write_memchunk.length == u->write_block_size);
+
+    a2dp_prepare_encoder_buffer(u);
+
+    /* Try to create a packet of the full MTU */
+    ptr = (const uint8_t *) pa_memblock_acquire_chunk(&u->write_memchunk);
+
+    length = u->a2dp_codec->encode_buffer(u->encoder_info, u->write_index / pa_frame_size(&u->encoder_sample_spec), ptr, u->write_memchunk.length, u->encoder_buffer, u->encoder_buffer_size, &processed);
+
+    pa_memblock_release(u->write_memchunk.memblock);
+
+    if (processed != u->write_memchunk.length) {
+        pa_log_error("Encoding error");
+        return -1;
+    }
+
+    return a2dp_write_buffer(u, length);
+}
+
+/* Run from IO thread */
 static int a2dp_process_push(struct userdata *u) {
     int ret = 0;
     pa_memchunk memchunk;
@@ -544,29 +540,21 @@ static int a2dp_process_push(struct userdata *u) {
     pa_assert(u->profile == PA_BLUETOOTH_PROFILE_A2DP_SOURCE);
     pa_assert(u->source);
     pa_assert(u->read_smoother);
+    pa_assert(u->a2dp_codec);
 
     memchunk.memblock = pa_memblock_new(u->core->mempool, u->read_block_size);
     memchunk.index = memchunk.length = 0;
 
+    a2dp_prepare_decoder_buffer(u);
+
     for (;;) {
         bool found_tstamp = false;
         pa_usec_t tstamp;
-        struct sbc_info *sbc_info;
-        struct rtp_header *header;
-        struct rtp_payload *payload;
-        const void *p;
-        void *d;
+        uint8_t *ptr;
         ssize_t l;
-        size_t to_write, to_decode;
-        size_t total_written = 0;
+        size_t processed;
 
-        a2dp_prepare_buffer(u);
-
-        sbc_info = &u->sbc_info;
-        header = sbc_info->buffer;
-        payload = (struct rtp_payload*) ((uint8_t*) sbc_info->buffer + sizeof(*header));
-
-        l = pa_read(u->stream_fd, sbc_info->buffer, sbc_info->buffer_size, &u->stream_write_type);
+        l = pa_read(u->stream_fd, u->decoder_buffer, u->decoder_buffer_size, &u->stream_write_type);
 
         if (l <= 0) {
 
@@ -583,7 +571,7 @@ static int a2dp_process_push(struct userdata *u) {
             break;
         }
 
-        pa_assert((size_t) l <= sbc_info->buffer_size);
+        pa_assert((size_t) l <= u->decoder_buffer_size);
 
         /* TODO: get timestamp from rtp */
         if (!found_tstamp) {
@@ -591,54 +579,28 @@ static int a2dp_process_push(struct userdata *u) {
             tstamp = pa_rtclock_now();
         }
 
-        p = (uint8_t*) sbc_info->buffer + sizeof(*header) + sizeof(*payload);
-        to_decode = l - sizeof(*header) - sizeof(*payload);
+        ptr = pa_memblock_acquire(memchunk.memblock);
+        memchunk.length = pa_memblock_get_length(memchunk.memblock);
 
-        d = pa_memblock_acquire(memchunk.memblock);
-        to_write = memchunk.length = pa_memblock_get_length(memchunk.memblock);
-
-        while (PA_LIKELY(to_decode > 0)) {
-            size_t written;
-            ssize_t decoded;
-
-            decoded = sbc_decode(&sbc_info->sbc,
-                                 p, to_decode,
-                                 d, to_write,
-                                 &written);
-
-            if (PA_UNLIKELY(decoded <= 0)) {
-                pa_log_error("SBC decoding error (%li)", (long) decoded);
-                pa_memblock_release(memchunk.memblock);
-                pa_memblock_unref(memchunk.memblock);
-                return 0;
-            }
-
-            total_written += written;
-
-            /* Reset frame length, it can be changed due to bitpool change */
-            sbc_info->frame_length = sbc_get_frame_length(&sbc_info->sbc);
-
-            pa_assert_fp((size_t) decoded <= to_decode);
-            pa_assert_fp((size_t) decoded == sbc_info->frame_length);
-
-            pa_assert_fp((size_t) written == sbc_info->codesize);
-
-            p = (const uint8_t*) p + decoded;
-            to_decode -= decoded;
-
-            d = (uint8_t*) d + written;
-            to_write -= written;
-        }
-
-        u->read_index += (uint64_t) total_written;
-        pa_smoother_put(u->read_smoother, tstamp, pa_bytes_to_usec(u->read_index, &u->sample_spec));
-        pa_smoother_resume(u->read_smoother, tstamp, true);
-
-        memchunk.length -= to_write;
+        memchunk.length = u->a2dp_codec->decode_buffer(u->decoder_info, u->decoder_buffer, l, ptr, memchunk.length, &processed);
 
         pa_memblock_release(memchunk.memblock);
 
-        pa_source_post(u->source, &memchunk);
+        if (processed != (size_t) l) {
+            pa_log_error("Decoding error");
+            ret = -1;
+            break;
+        }
+
+        u->read_index += (uint64_t) memchunk.length;
+        pa_smoother_put(u->read_smoother, tstamp, pa_bytes_to_usec(u->read_index, &u->decoder_sample_spec));
+        pa_smoother_resume(u->read_smoother, tstamp, true);
+
+        /* Decoding of A2DP codec data may result in empty buffer, in this case
+         * do not post empty audio samples. It may happen due to algorithmic
+         * delay of audio codec. */
+        if (PA_LIKELY(memchunk.length))
+            pa_source_post(u->source, &memchunk);
 
         ret = l;
         break;
@@ -649,61 +611,36 @@ static int a2dp_process_push(struct userdata *u) {
     return ret;
 }
 
-/* Run from I/O thread */
-static void a2dp_set_bitpool(struct userdata *u, uint8_t bitpool) {
-    struct sbc_info *sbc_info;
+static void update_sink_buffer_size(struct userdata *u) {
+    int old_bufsize;
+    socklen_t len = sizeof(int);
+    int ret;
 
-    pa_assert(u);
+    ret = getsockopt(u->stream_fd, SOL_SOCKET, SO_SNDBUF, &old_bufsize, &len);
+    if (ret == -1) {
+        pa_log_warn("Changing bluetooth buffer size: Failed to getsockopt(SO_SNDBUF): %s", pa_cstrerror(errno));
+    } else {
+        int new_bufsize;
 
-    sbc_info = &u->sbc_info;
+        /* Set send buffer size as small as possible. The minimum value is 1024 according to the
+         * socket man page. The data is written to the socket in chunks of write_block_size, so
+         * there should at least be room for two chunks in the buffer. Generally, write_block_size
+         * is larger than 512. If not, use the next multiple of write_block_size which is larger
+         * than 1024. */
+        new_bufsize = 2 * u->write_block_size;
+        if (new_bufsize < 1024)
+            new_bufsize = (1024 / u->write_block_size + 1) * u->write_block_size;
 
-    if (sbc_info->sbc.bitpool == bitpool)
-        return;
-
-    if (bitpool > sbc_info->max_bitpool)
-        bitpool = sbc_info->max_bitpool;
-    else if (bitpool < sbc_info->min_bitpool)
-        bitpool = sbc_info->min_bitpool;
-
-    sbc_info->sbc.bitpool = bitpool;
-
-    sbc_info->codesize = sbc_get_codesize(&sbc_info->sbc);
-    sbc_info->frame_length = sbc_get_frame_length(&sbc_info->sbc);
-
-    pa_log_debug("Bitpool has changed to %u", sbc_info->sbc.bitpool);
-
-    u->read_block_size =
-        (u->read_link_mtu - sizeof(struct rtp_header) - sizeof(struct rtp_payload))
-        / sbc_info->frame_length * sbc_info->codesize;
-
-    u->write_block_size =
-        (u->write_link_mtu - sizeof(struct rtp_header) - sizeof(struct rtp_payload))
-        / sbc_info->frame_length * sbc_info->codesize;
-
-    pa_sink_set_max_request_within_thread(u->sink, u->write_block_size);
-    pa_sink_set_fixed_latency_within_thread(u->sink,
-            FIXED_LATENCY_PLAYBACK_A2DP + pa_bytes_to_usec(u->write_block_size, &u->sample_spec));
-}
-
-/* Run from I/O thread */
-static void a2dp_reduce_bitpool(struct userdata *u) {
-    struct sbc_info *sbc_info;
-    uint8_t bitpool;
-
-    pa_assert(u);
-
-    sbc_info = &u->sbc_info;
-
-    /* Check if bitpool is already at its limit */
-    if (sbc_info->sbc.bitpool <= BITPOOL_DEC_LIMIT)
-        return;
-
-    bitpool = sbc_info->sbc.bitpool - BITPOOL_DEC_STEP;
-
-    if (bitpool < BITPOOL_DEC_LIMIT)
-        bitpool = BITPOOL_DEC_LIMIT;
-
-    a2dp_set_bitpool(u, bitpool);
+        /* The kernel internally doubles the buffer size that was set by setsockopt and getsockopt
+         * returns the doubled value. */
+        if (new_bufsize != old_bufsize / 2) {
+            ret = setsockopt(u->stream_fd, SOL_SOCKET, SO_SNDBUF, &new_bufsize, len);
+            if (ret == -1)
+                pa_log_warn("Changing bluetooth buffer size: Failed to change from %d to %d: %s", old_bufsize / 2, new_bufsize, pa_cstrerror(errno));
+            else
+                pa_log_info("Changing bluetooth buffer size: Changed from %d to %d", old_bufsize / 2, new_bufsize);
+        }
+    }
 }
 
 static void teardown_stream(struct userdata *u) {
@@ -728,6 +665,7 @@ static void teardown_stream(struct userdata *u) {
     }
 
     pa_log_debug("Audio stream torn down");
+    u->stream_setup_done = false;
 }
 
 static int transport_acquire(struct userdata *u, bool optional) {
@@ -740,10 +678,19 @@ static int transport_acquire(struct userdata *u, bool optional) {
 
     u->stream_fd = u->transport->acquire(u->transport, optional, &u->read_link_mtu, &u->write_link_mtu);
     if (u->stream_fd < 0)
-        return -1;
+        return u->stream_fd;
 
+    /* transport_acquired must be set before calling
+     * pa_bluetooth_transport_set_state() */
     u->transport_acquired = true;
     pa_log_info("Transport %s acquired: fd %d", u->transport->path, u->stream_fd);
+
+    if (u->transport->state == PA_BLUETOOTH_TRANSPORT_STATE_IDLE) {
+        if (pa_thread_mq_get() != NULL)
+            pa_asyncmsgq_post(pa_thread_mq_get()->outq, PA_MSGOBJECT(u->msg), BLUETOOTH_MESSAGE_SET_TRANSPORT_PLAYING, NULL, 0, NULL, NULL);
+        else
+            pa_bluetooth_transport_set_state(u->transport, PA_BLUETOOTH_TRANSPORT_STATE_PLAYING);
+    }
 
     return 0;
 }
@@ -762,6 +709,29 @@ static void transport_release(struct userdata *u) {
     u->transport_acquired = false;
 
     teardown_stream(u);
+
+    /* Set transport state to idle if this was not already done by the remote end closing
+     * the file descriptor. Only do this when called from the I/O thread */
+    if (pa_thread_mq_get() != NULL && u->transport->state == PA_BLUETOOTH_TRANSPORT_STATE_PLAYING)
+        pa_asyncmsgq_post(pa_thread_mq_get()->outq, PA_MSGOBJECT(u->msg), BLUETOOTH_MESSAGE_STREAM_FD_HUP, NULL, 0, NULL, NULL);
+}
+
+/* Run from I/O thread */
+static void handle_sink_block_size_change(struct userdata *u) {
+    pa_sink_set_max_request_within_thread(u->sink, u->write_block_size);
+    pa_sink_set_fixed_latency_within_thread(u->sink,
+                                            (u->profile == PA_BLUETOOTH_PROFILE_A2DP_SINK ?
+                                             FIXED_LATENCY_PLAYBACK_A2DP : FIXED_LATENCY_PLAYBACK_SCO) +
+                                            pa_bytes_to_usec(u->write_block_size, &u->encoder_sample_spec));
+
+    /* If there is still data in the memchunk, we have to discard it
+     * because the write_block_size may have changed. */
+    if (u->write_memchunk.memblock) {
+        pa_memblock_unref(u->write_memchunk.memblock);
+        pa_memchunk_reset(&u->write_memchunk);
+    }
+
+    update_sink_buffer_size(u);
 }
 
 /* Run from I/O thread */
@@ -769,37 +739,57 @@ static void transport_config_mtu(struct userdata *u) {
     if (u->profile == PA_BLUETOOTH_PROFILE_HEADSET_HEAD_UNIT || u->profile == PA_BLUETOOTH_PROFILE_HEADSET_AUDIO_GATEWAY) {
         u->read_block_size = u->read_link_mtu;
         u->write_block_size = u->write_link_mtu;
+
+        if (!pa_frame_aligned(u->read_block_size, &u->source->sample_spec)) {
+            pa_log_debug("Got invalid read MTU: %lu, rounding down", u->read_block_size);
+            u->read_block_size = pa_frame_align(u->read_block_size, &u->source->sample_spec);
+        }
+
+        if (!pa_frame_aligned(u->write_block_size, &u->sink->sample_spec)) {
+            pa_log_debug("Got invalid write MTU: %lu, rounding down", u->write_block_size);
+            u->write_block_size = pa_frame_align(u->write_block_size, &u->sink->sample_spec);
+        }
     } else {
-        u->read_block_size =
-            (u->read_link_mtu - sizeof(struct rtp_header) - sizeof(struct rtp_payload))
-            / u->sbc_info.frame_length * u->sbc_info.codesize;
-
-        u->write_block_size =
-            (u->write_link_mtu - sizeof(struct rtp_header) - sizeof(struct rtp_payload))
-            / u->sbc_info.frame_length * u->sbc_info.codesize;
+        pa_assert(u->a2dp_codec);
+        if (u->profile == PA_BLUETOOTH_PROFILE_A2DP_SINK) {
+            u->write_block_size = u->a2dp_codec->get_write_block_size(u->encoder_info, u->write_link_mtu);
+        } else {
+            u->read_block_size = u->a2dp_codec->get_read_block_size(u->decoder_info, u->read_link_mtu);
+        }
     }
 
-    if (u->sink) {
-        pa_sink_set_max_request_within_thread(u->sink, u->write_block_size);
-        pa_sink_set_fixed_latency_within_thread(u->sink,
-                                                (u->profile == PA_BLUETOOTH_PROFILE_A2DP_SINK ?
-                                                 FIXED_LATENCY_PLAYBACK_A2DP : FIXED_LATENCY_PLAYBACK_SCO) +
-                                                pa_bytes_to_usec(u->write_block_size, &u->sample_spec));
-    }
+    if (u->sink)
+        handle_sink_block_size_change(u);
 
     if (u->source)
         pa_source_set_fixed_latency_within_thread(u->source,
                                                   (u->profile == PA_BLUETOOTH_PROFILE_A2DP_SOURCE ?
                                                    FIXED_LATENCY_RECORD_A2DP : FIXED_LATENCY_RECORD_SCO) +
-                                                  pa_bytes_to_usec(u->read_block_size, &u->sample_spec));
+                                                  pa_bytes_to_usec(u->read_block_size, &u->decoder_sample_spec));
 }
 
 /* Run from I/O thread */
-static void setup_stream(struct userdata *u) {
+static int setup_stream(struct userdata *u) {
     struct pollfd *pollfd;
     int one;
 
+    pa_assert(u->stream_fd >= 0);
+
+    /* return if stream is already set up */
+    if (u->stream_setup_done)
+        return 0;
+
     pa_log_info("Transport %s resuming", u->transport->path);
+
+    if (u->profile == PA_BLUETOOTH_PROFILE_A2DP_SINK) {
+        pa_assert(u->a2dp_codec);
+        if (u->a2dp_codec->reset(u->encoder_info) < 0)
+            return -1;
+    } else if (u->profile == PA_BLUETOOTH_PROFILE_A2DP_SOURCE) {
+        pa_assert(u->a2dp_codec);
+        if (u->a2dp_codec->reset(u->decoder_info) < 0)
+            return -1;
+    }
 
     transport_config_mtu(u);
 
@@ -812,9 +802,6 @@ static void setup_stream(struct userdata *u) {
 
     pa_log_debug("Stream properly set up, we're ready to roll!");
 
-    if (u->profile == PA_BLUETOOTH_PROFILE_A2DP_SINK)
-        a2dp_set_bitpool(u, u->sbc_info.max_bitpool);
-
     u->rtpoll_item = pa_rtpoll_item_new(u->rtpoll, PA_RTPOLL_NEVER, 1);
     pollfd = pa_rtpoll_item_get_pollfd(u->rtpoll_item, NULL);
     pollfd->fd = u->stream_fd;
@@ -822,85 +809,117 @@ static void setup_stream(struct userdata *u) {
 
     u->read_index = u->write_index = 0;
     u->started_at = 0;
+    u->stream_setup_done = true;
 
     if (u->source)
         u->read_smoother = pa_smoother_new(PA_USEC_PER_SEC, 2*PA_USEC_PER_SEC, true, true, 10, pa_rtclock_now(), true);
+
+    return 0;
+}
+
+/* Called from I/O thread, returns true if the transport was acquired or
+ * a connection was requested successfully. */
+static bool setup_transport_and_stream(struct userdata *u) {
+    int transport_error;
+
+    transport_error = transport_acquire(u, false);
+    if (transport_error < 0) {
+        if (transport_error != -EAGAIN)
+            return false;
+    } else {
+        if (setup_stream(u) < 0)
+            return false;
+    }
+    return true;
 }
 
 /* Run from IO thread */
 static int source_process_msg(pa_msgobject *o, int code, void *data, int64_t offset, pa_memchunk *chunk) {
     struct userdata *u = PA_SOURCE(o)->userdata;
-    bool failed = false;
-    int r;
 
     pa_assert(u->source == PA_SOURCE(o));
     pa_assert(u->transport);
 
     switch (code) {
 
-        case PA_SOURCE_MESSAGE_SET_STATE:
-
-            switch ((pa_source_state_t) PA_PTR_TO_UINT(data)) {
-
-                case PA_SOURCE_SUSPENDED:
-                    /* Ignore if transition is PA_SOURCE_INIT->PA_SOURCE_SUSPENDED */
-                    if (!PA_SOURCE_IS_OPENED(u->source->thread_info.state))
-                        break;
-
-                    /* Stop the device if the sink is suspended as well */
-                    if (!u->sink || u->sink->state == PA_SINK_SUSPENDED)
-                        transport_release(u);
-
-                    if (u->read_smoother)
-                        pa_smoother_pause(u->read_smoother, pa_rtclock_now());
-
-                    break;
-
-                case PA_SOURCE_IDLE:
-                case PA_SOURCE_RUNNING:
-                    if (u->source->thread_info.state != PA_SOURCE_SUSPENDED)
-                        break;
-
-                    /* Resume the device if the sink was suspended as well */
-                    if (!u->sink || !PA_SINK_IS_OPENED(u->sink->thread_info.state)) {
-                        if (transport_acquire(u, false) < 0)
-                            failed = true;
-                        else
-                            setup_stream(u);
-                    }
-
-                    /* We don't resume the smoother here. Instead we
-                     * wait until the first packet arrives */
-
-                    break;
-
-                case PA_SOURCE_UNLINKED:
-                case PA_SOURCE_INIT:
-                case PA_SOURCE_INVALID_STATE:
-                    break;
-            }
-
-            break;
-
         case PA_SOURCE_MESSAGE_GET_LATENCY: {
-            pa_usec_t wi, ri;
+            int64_t wi, ri;
 
             if (u->read_smoother) {
                 wi = pa_smoother_get(u->read_smoother, pa_rtclock_now());
-                ri = pa_bytes_to_usec(u->read_index, &u->sample_spec);
+                ri = pa_bytes_to_usec(u->read_index, &u->decoder_sample_spec);
 
-                *((pa_usec_t*) data) = FIXED_LATENCY_RECORD_A2DP + wi > ri ? FIXED_LATENCY_RECORD_A2DP + wi - ri : 0;
+                *((int64_t*) data) = u->source->thread_info.fixed_latency + wi - ri;
             } else
-                *((pa_usec_t*) data) = 0;
+                *((int64_t*) data) = 0;
 
             return 0;
         }
 
+        case PA_SOURCE_MESSAGE_SETUP_STREAM:
+            /* Skip stream setup if stream_fd has been invalidated.
+               This can occur if the stream has already been set up and
+               then immediately received POLLHUP. If the stream has
+               already been set up earlier, then this setup_stream()
+               call is redundant anyway, but currently the code
+               is such that this kind of unnecessary setup_stream()
+               calls can happen. */
+            if (u->stream_fd < 0)
+                pa_log_debug("Skip source stream setup while closing");
+            else
+                setup_stream(u);
+            return 0;
+
     }
 
-    r = pa_source_process_msg(o, code, data, offset, chunk);
+    return pa_source_process_msg(o, code, data, offset, chunk);
+}
 
-    return (r < 0 || !failed) ? r : -1;
+/* Called from the IO thread. */
+static int source_set_state_in_io_thread_cb(pa_source *s, pa_source_state_t new_state, pa_suspend_cause_t new_suspend_cause) {
+    struct userdata *u;
+
+    pa_assert(s);
+    pa_assert_se(u = s->userdata);
+
+    switch (new_state) {
+
+        case PA_SOURCE_SUSPENDED:
+            /* Ignore if transition is PA_SOURCE_INIT->PA_SOURCE_SUSPENDED */
+            if (!PA_SOURCE_IS_OPENED(s->thread_info.state))
+                break;
+
+            /* Stop the device if the sink is suspended as well */
+            if (!u->sink || u->sink->state == PA_SINK_SUSPENDED)
+                transport_release(u);
+
+            if (u->read_smoother)
+                pa_smoother_pause(u->read_smoother, pa_rtclock_now());
+
+            break;
+
+        case PA_SOURCE_IDLE:
+        case PA_SOURCE_RUNNING:
+            if (s->thread_info.state != PA_SOURCE_SUSPENDED)
+                break;
+
+            /* Resume the device if the sink was suspended as well */
+            if (!u->sink || !PA_SINK_IS_OPENED(u->sink->thread_info.state))
+                if (!setup_transport_and_stream(u))
+                    return -1;
+
+            /* We don't resume the smoother here. Instead we
+             * wait until the first packet arrives */
+
+            break;
+
+        case PA_SOURCE_UNLINKED:
+        case PA_SOURCE_INIT:
+        case PA_SOURCE_INVALID_STATE:
+            break;
+    }
+
+    return 0;
 }
 
 /* Run from main thread */
@@ -916,7 +935,6 @@ static void source_set_volume_cb(pa_source *s) {
 
     pa_assert(u);
     pa_assert(u->source == s);
-    pa_assert(u->profile == PA_BLUETOOTH_PROFILE_HEADSET_HEAD_UNIT);
 
     if (u->transport->set_microphone_gain == NULL)
       return;
@@ -932,8 +950,15 @@ static void source_set_volume_cb(pa_source *s) {
     if (volume < PA_VOLUME_NORM)
         volume++;
 
-    pa_cvolume_set(&s->real_volume, u->sample_spec.channels, volume);
+    pa_cvolume_set(&s->real_volume, u->decoder_sample_spec.channels, volume);
 
+    /* Set soft volume when in headset role */
+    if (u->profile == PA_BLUETOOTH_PROFILE_HEADSET_AUDIO_GATEWAY)
+        pa_cvolume_set(&s->soft_volume, u->decoder_sample_spec.channels, volume);
+
+    /* If we are in the AG role, we send a command to the head set to change
+     * the microphone gain. In the HS role, source and sink are swapped, so
+     * in this case we notify the AG that the speaker gain has changed */
     u->transport->set_microphone_gain(u->transport, gain);
 }
 
@@ -947,10 +972,10 @@ static int add_source(struct userdata *u) {
     data.module = u->module;
     data.card = u->card;
     data.driver = __FILE__;
-    data.name = pa_sprintf_malloc("bluez_source.%s", u->device->address);
+    data.name = pa_sprintf_malloc("bluez_source.%s.%s", u->device->address, pa_bluetooth_profile_to_string(u->profile));
     data.namereg_fail = false;
     pa_proplist_sets(data.proplist, "bluetooth.protocol", pa_bluetooth_profile_to_string(u->profile));
-    pa_source_new_data_set_sample_spec(&data, &u->sample_spec);
+    pa_source_new_data_set_sample_spec(&data, &u->decoder_sample_spec);
     if (u->profile == PA_BLUETOOTH_PROFILE_HEADSET_HEAD_UNIT)
         pa_proplist_sets(data.proplist, PA_PROP_DEVICE_INTENDED_ROLES, "phone");
 
@@ -962,8 +987,15 @@ static int add_source(struct userdata *u) {
             case PA_BLUETOOTH_PROFILE_HEADSET_AUDIO_GATEWAY:
                 data.suspend_cause = PA_SUSPEND_USER;
                 break;
-            case PA_BLUETOOTH_PROFILE_A2DP_SINK:
             case PA_BLUETOOTH_PROFILE_HEADSET_HEAD_UNIT:
+                /* u->stream_fd contains the error returned by the last transport_acquire()
+                 * EAGAIN means we are waiting for a NewConnection signal */
+                if (u->stream_fd == -EAGAIN)
+                    data.suspend_cause = PA_SUSPEND_USER;
+                else
+                    pa_assert_not_reached();
+                break;
+            case PA_BLUETOOTH_PROFILE_A2DP_SINK:
             case PA_BLUETOOTH_PROFILE_OFF:
                 pa_assert_not_reached();
                 break;
@@ -978,8 +1010,9 @@ static int add_source(struct userdata *u) {
 
     u->source->userdata = u;
     u->source->parent.process_msg = source_process_msg;
+    u->source->set_state_in_io_thread = source_set_state_in_io_thread_cb;
 
-    if (u->profile == PA_BLUETOOTH_PROFILE_HEADSET_HEAD_UNIT) {
+    if (u->profile == PA_BLUETOOTH_PROFILE_HEADSET_HEAD_UNIT || u->profile == PA_BLUETOOTH_PROFILE_HEADSET_AUDIO_GATEWAY) {
         pa_source_set_set_volume_callback(u->source, source_set_volume_cb);
         u->source->n_volume_steps = 16;
     }
@@ -989,75 +1022,88 @@ static int add_source(struct userdata *u) {
 /* Run from IO thread */
 static int sink_process_msg(pa_msgobject *o, int code, void *data, int64_t offset, pa_memchunk *chunk) {
     struct userdata *u = PA_SINK(o)->userdata;
-    bool failed = false;
-    int r;
 
     pa_assert(u->sink == PA_SINK(o));
     pa_assert(u->transport);
 
     switch (code) {
 
-        case PA_SINK_MESSAGE_SET_STATE:
-
-            switch ((pa_sink_state_t) PA_PTR_TO_UINT(data)) {
-
-                case PA_SINK_SUSPENDED:
-                    /* Ignore if transition is PA_SINK_INIT->PA_SINK_SUSPENDED */
-                    if (!PA_SINK_IS_OPENED(u->sink->thread_info.state))
-                        break;
-
-                    /* Stop the device if the source is suspended as well */
-                    if (!u->source || u->source->state == PA_SOURCE_SUSPENDED)
-                        /* We deliberately ignore whether stopping
-                         * actually worked. Since the stream_fd is
-                         * closed it doesn't really matter */
-                        transport_release(u);
-
-                    break;
-
-                case PA_SINK_IDLE:
-                case PA_SINK_RUNNING:
-                    if (u->sink->thread_info.state != PA_SINK_SUSPENDED)
-                        break;
-
-                    /* Resume the device if the source was suspended as well */
-                    if (!u->source || !PA_SOURCE_IS_OPENED(u->source->thread_info.state)) {
-                        if (transport_acquire(u, false) < 0)
-                            failed = true;
-                        else
-                            setup_stream(u);
-                    }
-
-                    break;
-
-                case PA_SINK_UNLINKED:
-                case PA_SINK_INIT:
-                case PA_SINK_INVALID_STATE:
-                    break;
-            }
-
-            break;
-
         case PA_SINK_MESSAGE_GET_LATENCY: {
-            pa_usec_t wi, ri;
+            int64_t wi = 0, ri = 0;
 
             if (u->read_smoother) {
                 ri = pa_smoother_get(u->read_smoother, pa_rtclock_now());
-                wi = pa_bytes_to_usec(u->write_index + u->write_block_size, &u->sample_spec);
-            } else {
+                wi = pa_bytes_to_usec(u->write_index + u->write_block_size, &u->encoder_sample_spec);
+            } else if (u->started_at) {
                 ri = pa_rtclock_now() - u->started_at;
-                wi = pa_bytes_to_usec(u->write_index, &u->sample_spec);
+                wi = pa_bytes_to_usec(u->write_index, &u->encoder_sample_spec);
             }
 
-            *((pa_usec_t*) data) = FIXED_LATENCY_PLAYBACK_A2DP + wi > ri ? FIXED_LATENCY_PLAYBACK_A2DP + wi - ri : 0;
+            *((int64_t*) data) = u->sink->thread_info.fixed_latency + wi - ri;
 
             return 0;
         }
+
+        case PA_SINK_MESSAGE_SETUP_STREAM:
+            /* Skip stream setup if stream_fd has been invalidated.
+               This can occur if the stream has already been set up and
+               then immediately received POLLHUP. If the stream has
+               already been set up earlier, then this setup_stream()
+               call is redundant anyway, but currently the code
+               is such that this kind of unnecessary setup_stream()
+               calls can happen. */
+            if (u->stream_fd < 0)
+                pa_log_debug("Skip sink stream setup while closing");
+            else
+                setup_stream(u);
+            return 0;
     }
 
-    r = pa_sink_process_msg(o, code, data, offset, chunk);
+    return pa_sink_process_msg(o, code, data, offset, chunk);
+}
 
-    return (r < 0 || !failed) ? r : -1;
+/* Called from the IO thread. */
+static int sink_set_state_in_io_thread_cb(pa_sink *s, pa_sink_state_t new_state, pa_suspend_cause_t new_suspend_cause) {
+    struct userdata *u;
+
+    pa_assert(s);
+    pa_assert_se(u = s->userdata);
+
+    switch (new_state) {
+
+        case PA_SINK_SUSPENDED:
+            /* Ignore if transition is PA_SINK_INIT->PA_SINK_SUSPENDED */
+            if (!PA_SINK_IS_OPENED(s->thread_info.state))
+                break;
+
+            /* Stop the device if the source is suspended as well */
+            if (!u->source || u->source->state == PA_SOURCE_SUSPENDED)
+                /* We deliberately ignore whether stopping
+                 * actually worked. Since the stream_fd is
+                 * closed it doesn't really matter */
+                transport_release(u);
+
+            break;
+
+        case PA_SINK_IDLE:
+        case PA_SINK_RUNNING:
+            if (s->thread_info.state != PA_SINK_SUSPENDED)
+                break;
+
+            /* Resume the device if the source was suspended as well */
+            if (!u->source || !PA_SOURCE_IS_OPENED(u->source->thread_info.state))
+                if (!setup_transport_and_stream(u))
+                    return -1;
+
+            break;
+
+        case PA_SINK_UNLINKED:
+        case PA_SINK_INIT:
+        case PA_SINK_INVALID_STATE:
+            break;
+    }
+
+    return 0;
 }
 
 /* Run from main thread */
@@ -1073,7 +1119,6 @@ static void sink_set_volume_cb(pa_sink *s) {
 
     pa_assert(u);
     pa_assert(u->sink == s);
-    pa_assert(u->profile == PA_BLUETOOTH_PROFILE_HEADSET_HEAD_UNIT);
 
     if (u->transport->set_speaker_gain == NULL)
       return;
@@ -1089,8 +1134,15 @@ static void sink_set_volume_cb(pa_sink *s) {
     if (volume < PA_VOLUME_NORM)
         volume++;
 
-    pa_cvolume_set(&s->real_volume, u->sample_spec.channels, volume);
+    pa_cvolume_set(&s->real_volume, u->encoder_sample_spec.channels, volume);
 
+    /* Set soft volume when in headset role */
+    if (u->profile == PA_BLUETOOTH_PROFILE_HEADSET_AUDIO_GATEWAY)
+        pa_cvolume_set(&s->soft_volume, u->encoder_sample_spec.channels, volume);
+
+    /* If we are in the AG role, we send a command to the head set to change
+     * the speaker gain. In the HS role, source and sink are swapped, so
+     * in this case we notify the AG that the microphone gain has changed */
     u->transport->set_speaker_gain(u->transport, gain);
 }
 
@@ -1104,10 +1156,10 @@ static int add_sink(struct userdata *u) {
     data.module = u->module;
     data.card = u->card;
     data.driver = __FILE__;
-    data.name = pa_sprintf_malloc("bluez_sink.%s", u->device->address);
+    data.name = pa_sprintf_malloc("bluez_sink.%s.%s", u->device->address, pa_bluetooth_profile_to_string(u->profile));
     data.namereg_fail = false;
     pa_proplist_sets(data.proplist, "bluetooth.protocol", pa_bluetooth_profile_to_string(u->profile));
-    pa_sink_new_data_set_sample_spec(&data, &u->sample_spec);
+    pa_sink_new_data_set_sample_spec(&data, &u->encoder_sample_spec);
     if (u->profile == PA_BLUETOOTH_PROFILE_HEADSET_HEAD_UNIT)
         pa_proplist_sets(data.proplist, PA_PROP_DEVICE_INTENDED_ROLES, "phone");
 
@@ -1118,10 +1170,17 @@ static int add_sink(struct userdata *u) {
             case PA_BLUETOOTH_PROFILE_HEADSET_AUDIO_GATEWAY:
                 data.suspend_cause = PA_SUSPEND_USER;
                 break;
+            case PA_BLUETOOTH_PROFILE_HEADSET_HEAD_UNIT:
+                /* u->stream_fd contains the error returned by the last transport_acquire()
+                 * EAGAIN means we are waiting for a NewConnection signal */
+                if (u->stream_fd == -EAGAIN)
+                    data.suspend_cause = PA_SUSPEND_USER;
+                else
+                    pa_assert_not_reached();
+                break;
             case PA_BLUETOOTH_PROFILE_A2DP_SINK:
                 /* Profile switch should have failed */
             case PA_BLUETOOTH_PROFILE_A2DP_SOURCE:
-            case PA_BLUETOOTH_PROFILE_HEADSET_HEAD_UNIT:
             case PA_BLUETOOTH_PROFILE_OFF:
                 pa_assert_not_reached();
                 break;
@@ -1136,8 +1195,9 @@ static int add_sink(struct userdata *u) {
 
     u->sink->userdata = u;
     u->sink->parent.process_msg = sink_process_msg;
+    u->sink->set_state_in_io_thread = sink_set_state_in_io_thread_cb;
 
-    if (u->profile == PA_BLUETOOTH_PROFILE_HEADSET_HEAD_UNIT) {
+    if (u->profile == PA_BLUETOOTH_PROFILE_HEADSET_HEAD_UNIT || u->profile == PA_BLUETOOTH_PROFILE_HEADSET_AUDIO_GATEWAY) {
         pa_sink_set_set_volume_callback(u->sink, sink_set_volume_cb);
         u->sink->n_volume_steps = 16;
     }
@@ -1145,117 +1205,38 @@ static int add_sink(struct userdata *u) {
 }
 
 /* Run from main thread */
-static void transport_config(struct userdata *u) {
+static int transport_config(struct userdata *u) {
     if (u->profile == PA_BLUETOOTH_PROFILE_HEADSET_HEAD_UNIT || u->profile == PA_BLUETOOTH_PROFILE_HEADSET_AUDIO_GATEWAY) {
-        u->sample_spec.format = PA_SAMPLE_S16LE;
-        u->sample_spec.channels = 1;
-        u->sample_spec.rate = 8000;
+        u->encoder_sample_spec.format = PA_SAMPLE_S16LE;
+        u->encoder_sample_spec.channels = 1;
+        u->encoder_sample_spec.rate = 8000;
+        u->decoder_sample_spec.format = PA_SAMPLE_S16LE;
+        u->decoder_sample_spec.channels = 1;
+        u->decoder_sample_spec.rate = 8000;
+        return 0;
     } else {
-        sbc_info_t *sbc_info = &u->sbc_info;
-        a2dp_sbc_t *config;
+        bool is_a2dp_sink = u->profile == PA_BLUETOOTH_PROFILE_A2DP_SINK;
+        void *info;
 
         pa_assert(u->transport);
 
-        u->sample_spec.format = PA_SAMPLE_S16LE;
-        config = (a2dp_sbc_t *) u->transport->config;
+        pa_assert(!u->a2dp_codec);
+        pa_assert(!u->encoder_info);
+        pa_assert(!u->decoder_info);
 
-        if (sbc_info->sbc_initialized)
-            sbc_reinit(&sbc_info->sbc, 0);
+        u->a2dp_codec = u->transport->a2dp_codec;
+        pa_assert(u->a2dp_codec);
+
+        info = u->a2dp_codec->init(is_a2dp_sink, false, u->transport->config, u->transport->config_size, is_a2dp_sink ? &u->encoder_sample_spec : &u->decoder_sample_spec);
+        if (is_a2dp_sink)
+            u->encoder_info = info;
         else
-            sbc_init(&sbc_info->sbc, 0);
-        sbc_info->sbc_initialized = true;
+            u->decoder_info = info;
 
-        switch (config->frequency) {
-            case SBC_SAMPLING_FREQ_16000:
-                sbc_info->sbc.frequency = SBC_FREQ_16000;
-                u->sample_spec.rate = 16000U;
-                break;
-            case SBC_SAMPLING_FREQ_32000:
-                sbc_info->sbc.frequency = SBC_FREQ_32000;
-                u->sample_spec.rate = 32000U;
-                break;
-            case SBC_SAMPLING_FREQ_44100:
-                sbc_info->sbc.frequency = SBC_FREQ_44100;
-                u->sample_spec.rate = 44100U;
-                break;
-            case SBC_SAMPLING_FREQ_48000:
-                sbc_info->sbc.frequency = SBC_FREQ_48000;
-                u->sample_spec.rate = 48000U;
-                break;
-            default:
-                pa_assert_not_reached();
-        }
+        if (!info)
+            return -1;
 
-        switch (config->channel_mode) {
-            case SBC_CHANNEL_MODE_MONO:
-                sbc_info->sbc.mode = SBC_MODE_MONO;
-                u->sample_spec.channels = 1;
-                break;
-            case SBC_CHANNEL_MODE_DUAL_CHANNEL:
-                sbc_info->sbc.mode = SBC_MODE_DUAL_CHANNEL;
-                u->sample_spec.channels = 2;
-                break;
-            case SBC_CHANNEL_MODE_STEREO:
-                sbc_info->sbc.mode = SBC_MODE_STEREO;
-                u->sample_spec.channels = 2;
-                break;
-            case SBC_CHANNEL_MODE_JOINT_STEREO:
-                sbc_info->sbc.mode = SBC_MODE_JOINT_STEREO;
-                u->sample_spec.channels = 2;
-                break;
-            default:
-                pa_assert_not_reached();
-        }
-
-        switch (config->allocation_method) {
-            case SBC_ALLOCATION_SNR:
-                sbc_info->sbc.allocation = SBC_AM_SNR;
-                break;
-            case SBC_ALLOCATION_LOUDNESS:
-                sbc_info->sbc.allocation = SBC_AM_LOUDNESS;
-                break;
-            default:
-                pa_assert_not_reached();
-        }
-
-        switch (config->subbands) {
-            case SBC_SUBBANDS_4:
-                sbc_info->sbc.subbands = SBC_SB_4;
-                break;
-            case SBC_SUBBANDS_8:
-                sbc_info->sbc.subbands = SBC_SB_8;
-                break;
-            default:
-                pa_assert_not_reached();
-        }
-
-        switch (config->block_length) {
-            case SBC_BLOCK_LENGTH_4:
-                sbc_info->sbc.blocks = SBC_BLK_4;
-                break;
-            case SBC_BLOCK_LENGTH_8:
-                sbc_info->sbc.blocks = SBC_BLK_8;
-                break;
-            case SBC_BLOCK_LENGTH_12:
-                sbc_info->sbc.blocks = SBC_BLK_12;
-                break;
-            case SBC_BLOCK_LENGTH_16:
-                sbc_info->sbc.blocks = SBC_BLK_16;
-                break;
-            default:
-                pa_assert_not_reached();
-        }
-
-        sbc_info->min_bitpool = config->min_bitpool;
-        sbc_info->max_bitpool = config->max_bitpool;
-
-        /* Set minimum bitpool for source to get the maximum possible block_size */
-        sbc_info->sbc.bitpool = u->profile == PA_BLUETOOTH_PROFILE_A2DP_SINK ? sbc_info->max_bitpool : sbc_info->min_bitpool;
-        sbc_info->codesize = sbc_get_codesize(&sbc_info->sbc);
-        sbc_info->frame_length = sbc_get_frame_length(&sbc_info->sbc);
-
-        pa_log_info("SBC parameters: allocation=%u, subbands=%u, blocks=%u, bitpool=%u",
-                    sbc_info->sbc.allocation, sbc_info->sbc.subbands, sbc_info->sbc.blocks, sbc_info->sbc.bitpool);
+        return 0;
     }
 }
 
@@ -1270,7 +1251,7 @@ static int setup_transport(struct userdata *u) {
     /* check if profile has a transport */
     t = u->device->transports[u->profile];
     if (!t || t->state <= PA_BLUETOOTH_TRANSPORT_STATE_DISCONNECTED) {
-        pa_log_warn("Profile has no transport");
+        pa_log_warn("Profile %s has no transport", pa_bluetooth_profile_to_string(u->profile));
         return -1;
     }
 
@@ -1278,12 +1259,15 @@ static int setup_transport(struct userdata *u) {
 
     if (u->profile == PA_BLUETOOTH_PROFILE_A2DP_SOURCE || u->profile == PA_BLUETOOTH_PROFILE_HEADSET_AUDIO_GATEWAY)
         transport_acquire(u, true); /* In case of error, the sink/sources will be created suspended */
-    else if (transport_acquire(u, false) < 0)
-        return -1; /* We need to fail here until the interactions with module-suspend-on-idle and alike get improved */
+    else {
+        int transport_error;
 
-    transport_config(u);
+        transport_error = transport_acquire(u, false);
+        if (transport_error < 0 && transport_error != -EAGAIN)
+            return -1; /* We need to fail here until the interactions with module-suspend-on-idle and alike get improved */
+    }
 
-    return 0;
+    return transport_config(u);
 }
 
 /* Run from main thread */
@@ -1321,12 +1305,29 @@ static int init_profile(struct userdata *u) {
     return r;
 }
 
+static int write_block(struct userdata *u) {
+    int n_written;
+
+    if (u->write_index <= 0)
+        u->started_at = pa_rtclock_now();
+
+    if (u->profile == PA_BLUETOOTH_PROFILE_A2DP_SINK) {
+        if ((n_written = a2dp_process_render(u)) < 0)
+            return -1;
+    } else {
+        if ((n_written = sco_process_render(u)) < 0)
+            return -1;
+    }
+
+    return n_written;
+}
+
+
 /* I/O thread function */
 static void thread_func(void *userdata) {
     struct userdata *u = userdata;
-    unsigned do_write = 0;
-    unsigned pending_read_bytes = 0;
-    bool writable = false;
+    unsigned blocks_to_write = 0;
+    unsigned bytes_to_write = 0;
 
     pa_assert(u);
     pa_assert(u->transport);
@@ -1334,7 +1335,7 @@ static void thread_func(void *userdata) {
     pa_log_debug("IO Thread starting up");
 
     if (u->core->realtime_scheduling)
-        pa_make_realtime(u->core->realtime_priority);
+        pa_thread_make_realtime(u->core->realtime_priority);
 
     pa_thread_mq_install(&u->thread_mq);
 
@@ -1346,9 +1347,13 @@ static void thread_func(void *userdata) {
         struct pollfd *pollfd;
         int ret;
         bool disable_timer = true;
+        bool writable = false;
+        bool have_source = u->source ? PA_SOURCE_IS_LINKED(u->source->thread_info.state) : false;
+        bool have_sink = u->sink ? PA_SINK_IS_LINKED(u->sink->thread_info.state) : false;
 
         pollfd = u->rtpoll_item ? pa_rtpoll_item_get_pollfd(u->rtpoll_item, NULL) : NULL;
 
+        /* Check for stream error or close */
         if (pollfd && (pollfd->revents & ~(POLLOUT|POLLIN))) {
             pa_log_info("FD error: %s%s%s%s",
                         pollfd->revents & POLLERR ? "POLLERR " :"",
@@ -1359,147 +1364,190 @@ static void thread_func(void *userdata) {
             if (pollfd->revents & POLLHUP) {
                 pollfd = NULL;
                 teardown_stream(u);
-                do_write = 0;
-                pending_read_bytes = 0;
-                writable = false;
+                blocks_to_write = 0;
+                bytes_to_write = 0;
                 pa_asyncmsgq_post(pa_thread_mq_get()->outq, PA_MSGOBJECT(u->msg), BLUETOOTH_MESSAGE_STREAM_FD_HUP, NULL, 0, NULL, NULL);
             } else
                 goto fail;
         }
 
-        if (u->source && PA_SOURCE_IS_LINKED(u->source->thread_info.state)) {
+        /* If there is a pollfd, the stream is set up and we need to do something */
+        if (pollfd) {
 
-            /* We should send two blocks to the device before we expect
-             * a response. */
+            /* Handle source if present */
+            if (have_source) {
 
-            if (u->write_index == 0 && u->read_index <= 0)
-                do_write = 2;
+                /* We should send two blocks to the device before we expect a response. */
+                if (have_sink && u->write_index == 0 && u->read_index <= 0)
+                    blocks_to_write = 2;
 
-            if (pollfd && (pollfd->revents & POLLIN)) {
-                int n_read;
+                /* If we got woken up by POLLIN let's do some reading */
+                if (pollfd->revents & POLLIN) {
+                    int n_read;
 
-                if (u->profile == PA_BLUETOOTH_PROFILE_A2DP_SOURCE)
-                    n_read = a2dp_process_push(u);
-                else
-                    n_read = sco_process_push(u);
+                    if (u->profile == PA_BLUETOOTH_PROFILE_A2DP_SOURCE)
+                        n_read = a2dp_process_push(u);
+                    else
+                        n_read = sco_process_push(u);
 
-                if (n_read < 0)
-                    goto fail;
+                    if (n_read < 0)
+                        goto fail;
 
-                if (n_read > 0) {
-                    /* We just read something, so we are supposed to write something, too */
-                    pending_read_bytes += n_read;
-                    do_write += pending_read_bytes / u->write_block_size;
-                    pending_read_bytes = pending_read_bytes % u->write_block_size;
+                    if (have_sink && n_read > 0) {
+                        /* We just read something, so we are supposed to write something, too */
+                        bytes_to_write += n_read;
+                        blocks_to_write += bytes_to_write / u->write_block_size;
+                        bytes_to_write = bytes_to_write % u->write_block_size;
+                    }
                 }
             }
-        }
 
-        if (u->sink && PA_SINK_IS_LINKED(u->sink->thread_info.state)) {
+            /* Handle sink if present */
+            if (have_sink) {
 
-            if (PA_UNLIKELY(u->sink->thread_info.rewind_requested))
-                pa_sink_process_rewind(u->sink, 0);
+                /* Process rewinds */
+                if (PA_UNLIKELY(u->sink->thread_info.rewind_requested))
+                    pa_sink_process_rewind(u->sink, 0);
 
-            if (pollfd) {
+                /* Test if the stream is writable */
                 if (pollfd->revents & POLLOUT)
                     writable = true;
 
-                if ((!u->source || !PA_SOURCE_IS_LINKED(u->source->thread_info.state)) && do_write <= 0 && writable) {
-                    pa_usec_t time_passed;
-                    pa_usec_t audio_sent;
+                /* If we have a source, we let the source determine the timing
+                 * for the sink */
+                if (have_source) {
 
-                    /* Hmm, there is no input stream we could synchronize
-                     * to. So let's do things by time */
+                    if (writable && blocks_to_write > 0) {
+                        int result;
 
-                    time_passed = pa_rtclock_now() - u->started_at;
-                    audio_sent = pa_bytes_to_usec(u->write_index, &u->sample_spec);
+                        if ((result = write_block(u)) < 0)
+                            goto fail;
 
+                        blocks_to_write -= result;
+
+                        /* writable controls whether we set POLLOUT when polling - we set it to
+                         * false to enable POLLOUT. If there are more blocks to write, we want to
+                         * be woken up immediately when the socket becomes writable. If there
+                         * aren't currently any more blocks to write, then we'll have to wait
+                         * until we've received more data, so in that case we only want to set
+                         * POLLIN. Note that when we are woken up the next time, POLLOUT won't be
+                         * set in revents even if the socket has meanwhile become writable, which
+                         * may seem bad, but in that case we'll set POLLOUT in the subsequent
+                         * poll, and the poll will return immediately, so our writes won't be
+                         * delayed. */
+                        if (blocks_to_write > 0)
+                            writable = false;
+                    }
+
+                /* There is no source, we have to use the system clock for timing */
+                } else {
+                    bool have_written = false;
+                    pa_usec_t time_passed = 0;
+                    pa_usec_t audio_sent = 0;
+
+                    if (u->started_at) {
+                        time_passed = pa_rtclock_now() - u->started_at;
+                        audio_sent = pa_bytes_to_usec(u->write_index, &u->encoder_sample_spec);
+                    }
+
+                    /* A new block needs to be sent. */
                     if (audio_sent <= time_passed) {
-                        pa_usec_t audio_to_send = time_passed - audio_sent;
+                        size_t bytes_to_send = pa_usec_to_bytes(time_passed - audio_sent, &u->encoder_sample_spec);
 
-                        /* Never try to catch up for more than 100ms */
-                        if (u->write_index > 0 && audio_to_send > MAX_PLAYBACK_CATCH_UP_USEC) {
-                            pa_usec_t skip_usec;
+                        /* There are more than two blocks that need to be written. It seems that
+                         * the socket has not been accepting data fast enough (could be due to
+                         * hiccups in the wireless transmission). We need to discard everything
+                         * older than two block sizes to keep the latency from growing. */
+                        if (bytes_to_send > 2 * u->write_block_size) {
                             uint64_t skip_bytes;
+                            pa_memchunk tmp;
+                            size_t mempool_max_block_size = pa_mempool_block_size_max(u->core->mempool);
+                            pa_usec_t skip_usec;
 
-                            skip_usec = audio_to_send - MAX_PLAYBACK_CATCH_UP_USEC;
-                            skip_bytes = pa_usec_to_bytes(skip_usec, &u->sample_spec);
+                            skip_bytes = bytes_to_send - 2 * u->write_block_size;
+                            skip_usec = pa_bytes_to_usec(skip_bytes, &u->encoder_sample_spec);
 
-                            if (skip_bytes > 0) {
-                                pa_memchunk tmp;
+                            pa_log_debug("Skipping %llu us (= %llu bytes) in audio stream",
+                                        (unsigned long long) skip_usec,
+                                        (unsigned long long) skip_bytes);
 
-                                pa_log_warn("Skipping %llu us (= %llu bytes) in audio stream",
-                                            (unsigned long long) skip_usec,
-                                            (unsigned long long) skip_bytes);
+                            while (skip_bytes > 0) {
+                                size_t bytes_to_render;
 
-                                pa_sink_render_full(u->sink, skip_bytes, &tmp);
+                                if (skip_bytes > mempool_max_block_size)
+                                    bytes_to_render = mempool_max_block_size;
+                                else
+                                    bytes_to_render = skip_bytes;
+
+                                pa_sink_render_full(u->sink, bytes_to_render, &tmp);
                                 pa_memblock_unref(tmp.memblock);
-                                u->write_index += skip_bytes;
+                                u->write_index += bytes_to_render;
+                                skip_bytes -= bytes_to_render;
+                            }
 
-                                if (u->profile == PA_BLUETOOTH_PROFILE_A2DP_SINK)
-                                    a2dp_reduce_bitpool(u);
+                            if (u->write_index > 0 && u->profile == PA_BLUETOOTH_PROFILE_A2DP_SINK) {
+                                size_t new_write_block_size = u->a2dp_codec->reduce_encoder_bitrate(u->encoder_info, u->write_link_mtu);
+                                if (new_write_block_size) {
+                                    u->write_block_size = new_write_block_size;
+                                    handle_sink_block_size_change(u);
+                                }
                             }
                         }
 
-                        do_write = 1;
-                        pending_read_bytes = 0;
-                    }
-                }
-
-                if (writable && do_write > 0) {
-                    int n_written;
-
-                    if (u->write_index <= 0)
-                        u->started_at = pa_rtclock_now();
-
-                    if (u->profile == PA_BLUETOOTH_PROFILE_A2DP_SINK) {
-                        if ((n_written = a2dp_process_render(u)) < 0)
-                            goto fail;
-                    } else {
-                        if ((n_written = sco_process_render(u)) < 0)
-                            goto fail;
+                        blocks_to_write = 1;
                     }
 
-                    if (n_written == 0)
-                        pa_log("Broken kernel: we got EAGAIN on write() after POLLOUT!");
+                    /* If the stream is writable, send some data if necessary */
+                    if (writable && blocks_to_write > 0) {
+                        int result;
 
-                    do_write -= n_written;
-                    writable = false;
-                }
+                        if ((result = write_block(u)) < 0)
+                            goto fail;
 
-                if ((!u->source || !PA_SOURCE_IS_LINKED(u->source->thread_info.state)) && do_write <= 0) {
-                    pa_usec_t sleep_for;
-                    pa_usec_t time_passed, next_write_at;
+                        blocks_to_write -= result;
+                        writable = false;
+                        if (result)
+                            have_written = true;
+                    }
 
-                    if (writable) {
-                        /* Hmm, there is no input stream we could synchronize
-                         * to. So let's estimate when we need to wake up the latest */
-                        time_passed = pa_rtclock_now() - u->started_at;
-                        next_write_at = pa_bytes_to_usec(u->write_index, &u->sample_spec);
-                        sleep_for = time_passed < next_write_at ? next_write_at - time_passed : 0;
-                        /* pa_log("Sleeping for %lu; time passed %lu, next write at %lu", (unsigned long) sleep_for, (unsigned long) time_passed, (unsigned long)next_write_at); */
-                    } else
-                        /* drop stream every 500 ms */
-                        sleep_for = PA_USEC_PER_MSEC * 500;
+                    /* If nothing was written during this iteration, either the stream
+                     * is not writable or there was no write pending. Set up a timer that
+                     * will wake up the thread when the next data needs to be written. */
+                    if (!have_written) {
+                        pa_usec_t sleep_for;
+                        pa_usec_t next_write_at;
 
-                    pa_rtpoll_set_timer_relative(u->rtpoll, sleep_for);
-                    disable_timer = false;
+                        if (writable) {
+                            /* There was no write pending on this iteration of the loop.
+                             * Let's estimate when we need to wake up next */
+                            next_write_at = pa_bytes_to_usec(u->write_index, &u->encoder_sample_spec);
+                            sleep_for = time_passed < next_write_at ? next_write_at - time_passed : 0;
+                            /* pa_log("Sleeping for %lu; time passed %lu, next write at %lu", (unsigned long) sleep_for, (unsigned long) time_passed, (unsigned long)next_write_at); */
+                        } else
+                            /* We could not write because the stream was not ready. Let's try
+                             * again in 500 ms and drop audio if we still can't write. The
+                             * thread will also be woken up when we can write again. */
+                            sleep_for = PA_USEC_PER_MSEC * 500;
+
+                        pa_rtpoll_set_timer_relative(u->rtpoll, sleep_for);
+                        disable_timer = false;
+                    }
                 }
             }
+
+            /* Set events to wake up the thread */
+            pollfd->events = (short) (((have_sink && !writable) ? POLLOUT : 0) | (have_source ? POLLIN : 0));
+
         }
 
         if (disable_timer)
             pa_rtpoll_set_timer_disabled(u->rtpoll);
 
-        /* Hmm, nothing to do. Let's sleep */
-        if (pollfd)
-            pollfd->events = (short) (((u->sink && PA_SINK_IS_LINKED(u->sink->thread_info.state) && !writable) ? POLLOUT : 0) |
-                                      (u->source && PA_SOURCE_IS_LINKED(u->source->thread_info.state) ? POLLIN : 0));
-
         if ((ret = pa_rtpoll_run(u->rtpoll)) < 0) {
             pa_log_debug("pa_rtpoll_run failed with: %d", ret);
             goto fail;
         }
+
         if (ret == 0) {
             pa_log_debug("IO thread shutdown requested, stopping cleanly");
             transport_release(u);
@@ -1525,7 +1573,11 @@ static int start_thread(struct userdata *u) {
     pa_assert(!u->rtpoll_item);
 
     u->rtpoll = pa_rtpoll_new();
-    pa_thread_mq_init(&u->thread_mq, u->core->mainloop, u->rtpoll);
+
+    if (pa_thread_mq_init(&u->thread_mq, u->core->mainloop, u->rtpoll) < 0) {
+        pa_log("pa_thread_mq_init() failed.");
+        return -1;
+    }
 
     if (!(u->thread = pa_thread_new("bluetooth", thread_func, u))) {
         pa_log_error("Failed to create IO thread");
@@ -1535,6 +1587,12 @@ static int start_thread(struct userdata *u) {
     if (u->sink) {
         pa_sink_set_asyncmsgq(u->sink, u->thread_mq.inq);
         pa_sink_set_rtpoll(u->sink, u->rtpoll);
+
+        /* If we are in the headset role, the sink should not become default
+         * unless there is no other sound device available. */
+        if (u->profile == PA_BLUETOOTH_PROFILE_HEADSET_AUDIO_GATEWAY)
+            u->sink->priority = 1500;
+
         pa_sink_put(u->sink);
 
         if (u->sink->set_volume)
@@ -1544,6 +1602,13 @@ static int start_thread(struct userdata *u) {
     if (u->source) {
         pa_source_set_asyncmsgq(u->source, u->thread_mq.inq);
         pa_source_set_rtpoll(u->source, u->rtpoll);
+
+        /* If we are in the headset role or the device is an a2dp source,
+         * the source should not become default unless there is no other
+         * sound device available. */
+        if (u->profile == PA_BLUETOOTH_PROFILE_HEADSET_AUDIO_GATEWAY || u->profile == PA_BLUETOOTH_PROFILE_A2DP_SOURCE)
+            u->source->priority = 1500;
+
         pa_source_put(u->source);
 
         if (u->source->set_volume)
@@ -1599,38 +1664,20 @@ static void stop_thread(struct userdata *u) {
         pa_smoother_free(u->read_smoother);
         u->read_smoother = NULL;
     }
-}
 
-/* Run from main thread */
-static char *cleanup_name(const char *name) {
-    char *t, *s, *d;
-    bool space = false;
-
-    pa_assert(name);
-
-    while ((*name >= 1 && *name <= 32) || *name >= 127)
-        name++;
-
-    t = pa_xstrdup(name);
-
-    for (s = d = t; *s; s++) {
-
-        if (*s <= 32 || *s >= 127 || *s == '_') {
-            space = true;
-            continue;
+    if (u->profile == PA_BLUETOOTH_PROFILE_A2DP_SINK || u->profile == PA_BLUETOOTH_PROFILE_A2DP_SOURCE) {
+        if (u->encoder_info) {
+            u->a2dp_codec->deinit(u->encoder_info);
+            u->encoder_info = NULL;
         }
 
-        if (space) {
-            *(d++) = ' ';
-            space = false;
+        if (u->decoder_info) {
+            u->a2dp_codec->deinit(u->decoder_info);
+            u->decoder_info = NULL;
         }
 
-        *(d++) = *s;
+        u->a2dp_codec = NULL;
     }
-
-    *d = 0;
-
-    return t;
 }
 
 /* Run from main thread */
@@ -1772,8 +1819,9 @@ static void create_card_ports(struct userdata *u, pa_hashmap *ports) {
 }
 
 /* Run from main thread */
-static pa_card_profile *create_card_profile(struct userdata *u, const char *uuid, pa_hashmap *ports) {
+static pa_card_profile *create_card_profile(struct userdata *u, pa_bluetooth_profile_t profile, pa_hashmap *ports) {
     pa_device_port *input_port, *output_port;
+    const char *name;
     pa_card_profile *cp = NULL;
     pa_bluetooth_profile_t *p;
 
@@ -1782,9 +1830,12 @@ static pa_card_profile *create_card_profile(struct userdata *u, const char *uuid
     pa_assert_se(input_port = pa_hashmap_get(ports, u->input_port_name));
     pa_assert_se(output_port = pa_hashmap_get(ports, u->output_port_name));
 
-    if (pa_streq(uuid, PA_BLUETOOTH_UUID_A2DP_SINK)) {
-        cp = pa_card_profile_new("a2dp_sink", _("High Fidelity Playback (A2DP Sink)"), sizeof(pa_bluetooth_profile_t));
-        cp->priority = 10;
+    name = pa_bluetooth_profile_to_string(profile);
+
+    switch (profile) {
+    case PA_BLUETOOTH_PROFILE_A2DP_SINK:
+        cp = pa_card_profile_new(name, _("High Fidelity Playback (A2DP Sink)"), sizeof(pa_bluetooth_profile_t));
+        cp->priority = 40;
         cp->n_sinks = 1;
         cp->n_sources = 0;
         cp->max_sink_channels = 2;
@@ -1792,10 +1843,11 @@ static pa_card_profile *create_card_profile(struct userdata *u, const char *uuid
         pa_hashmap_put(output_port->profiles, cp->name, cp);
 
         p = PA_CARD_PROFILE_DATA(cp);
-        *p = PA_BLUETOOTH_PROFILE_A2DP_SINK;
-    } else if (pa_streq(uuid, PA_BLUETOOTH_UUID_A2DP_SOURCE)) {
-        cp = pa_card_profile_new("a2dp_source", _("High Fidelity Capture (A2DP Source)"), sizeof(pa_bluetooth_profile_t));
-        cp->priority = 10;
+        break;
+
+    case PA_BLUETOOTH_PROFILE_A2DP_SOURCE:
+        cp = pa_card_profile_new(name, _("High Fidelity Capture (A2DP Source)"), sizeof(pa_bluetooth_profile_t));
+        cp->priority = 20;
         cp->n_sinks = 0;
         cp->n_sources = 1;
         cp->max_sink_channels = 0;
@@ -1803,10 +1855,11 @@ static pa_card_profile *create_card_profile(struct userdata *u, const char *uuid
         pa_hashmap_put(input_port->profiles, cp->name, cp);
 
         p = PA_CARD_PROFILE_DATA(cp);
-        *p = PA_BLUETOOTH_PROFILE_A2DP_SOURCE;
-    } else if (pa_streq(uuid, PA_BLUETOOTH_UUID_HSP_HS) || pa_streq(uuid, PA_BLUETOOTH_UUID_HFP_HF)) {
-        cp = pa_card_profile_new("headset_head_unit", _("Headset Head Unit (HSP/HFP)"), sizeof(pa_bluetooth_profile_t));
-        cp->priority = 20;
+        break;
+
+    case PA_BLUETOOTH_PROFILE_HEADSET_HEAD_UNIT:
+        cp = pa_card_profile_new(name, _("Headset Head Unit (HSP/HFP)"), sizeof(pa_bluetooth_profile_t));
+        cp->priority = 30;
         cp->n_sinks = 1;
         cp->n_sources = 1;
         cp->max_sink_channels = 1;
@@ -1815,10 +1868,11 @@ static pa_card_profile *create_card_profile(struct userdata *u, const char *uuid
         pa_hashmap_put(output_port->profiles, cp->name, cp);
 
         p = PA_CARD_PROFILE_DATA(cp);
-        *p = PA_BLUETOOTH_PROFILE_HEADSET_HEAD_UNIT;
-    } else if (pa_streq(uuid, PA_BLUETOOTH_UUID_HSP_AG) || pa_streq(uuid, PA_BLUETOOTH_UUID_HFP_AG)) {
-        cp = pa_card_profile_new("headset_audio_gateway", _("Headset Audio Gateway (HSP/HFP)"), sizeof(pa_bluetooth_profile_t));
-        cp->priority = 20;
+        break;
+
+    case PA_BLUETOOTH_PROFILE_HEADSET_AUDIO_GATEWAY:
+        cp = pa_card_profile_new(name, _("Headset Audio Gateway (HSP/HFP)"), sizeof(pa_bluetooth_profile_t));
+        cp->priority = 10;
         cp->n_sinks = 1;
         cp->n_sources = 1;
         cp->max_sink_channels = 1;
@@ -1827,15 +1881,18 @@ static pa_card_profile *create_card_profile(struct userdata *u, const char *uuid
         pa_hashmap_put(output_port->profiles, cp->name, cp);
 
         p = PA_CARD_PROFILE_DATA(cp);
-        *p = PA_BLUETOOTH_PROFILE_HEADSET_AUDIO_GATEWAY;
+        break;
+
+    case PA_BLUETOOTH_PROFILE_OFF:
+        pa_assert_not_reached();
     }
 
-    if (cp) {
-        if (u->device->transports[*p])
-            cp->available = transport_state_to_availability(u->device->transports[*p]->state);
-        else
-            cp->available = PA_AVAILABLE_NO;
-    }
+    *p = profile;
+
+    if (u->device->transports[*p])
+        cp->available = transport_state_to_availability(u->device->transports[*p]->state);
+    else
+        cp->available = PA_AVAILABLE_NO;
 
     return cp;
 }
@@ -1882,6 +1939,21 @@ off:
     return -PA_ERR_IO;
 }
 
+static int uuid_to_profile(const char *uuid, pa_bluetooth_profile_t *_r) {
+    if (pa_streq(uuid, PA_BLUETOOTH_UUID_A2DP_SINK))
+        *_r = PA_BLUETOOTH_PROFILE_A2DP_SINK;
+    else if (pa_streq(uuid, PA_BLUETOOTH_UUID_A2DP_SOURCE))
+        *_r = PA_BLUETOOTH_PROFILE_A2DP_SOURCE;
+    else if (pa_bluetooth_uuid_is_hsp_hs(uuid) || pa_streq(uuid, PA_BLUETOOTH_UUID_HFP_HF))
+        *_r = PA_BLUETOOTH_PROFILE_HEADSET_HEAD_UNIT;
+    else if (pa_streq(uuid, PA_BLUETOOTH_UUID_HSP_AG) || pa_streq(uuid, PA_BLUETOOTH_UUID_HFP_AG))
+        *_r = PA_BLUETOOTH_PROFILE_HEADSET_AUDIO_GATEWAY;
+    else
+        return -PA_ERR_INVALID;
+
+    return 0;
+}
+
 /* Run from main thread */
 static int add_card(struct userdata *u) {
     const pa_bluetooth_device *d;
@@ -1902,7 +1974,7 @@ static int add_card(struct userdata *u) {
     data.driver = __FILE__;
     data.module = u->module;
 
-    alias = cleanup_name(d->alias);
+    alias = pa_utf8_filter(d->alias);
     pa_proplist_sets(data.proplist, PA_PROP_DEVICE_DESCRIPTION, alias);
     pa_xfree(alias);
 
@@ -1923,16 +1995,15 @@ static int add_card(struct userdata *u) {
     create_card_ports(u, data.ports);
 
     PA_HASHMAP_FOREACH(uuid, d->uuids, state) {
-        cp = create_card_profile(u, uuid, data.ports);
+        pa_bluetooth_profile_t profile;
 
-        if (!cp)
+        if (uuid_to_profile(uuid, &profile) < 0)
             continue;
 
-        if (pa_hashmap_get(data.profiles, cp->name)) {
-            pa_card_profile_free(cp);
+        if (pa_hashmap_get(data.profiles, pa_bluetooth_profile_to_string(profile)))
             continue;
-        }
 
+        cp = create_card_profile(u, profile, data.ports);
         pa_hashmap_put(data.profiles, cp->name, cp);
     }
 
@@ -1953,6 +2024,8 @@ static int add_card(struct userdata *u) {
 
     u->card->userdata = u;
     u->card->set_profile = set_profile_cb;
+    pa_card_choose_initial_profile(u->card);
+    pa_card_put(u->card);
 
     p = PA_CARD_PROFILE_DATA(u->card->active_profile);
     u->profile = *p;
@@ -1989,6 +2062,14 @@ static void handle_transport_state_change(struct userdata *u, struct pa_bluetoot
         if (u->source) {
             pa_log_debug("Resuming source %s because its transport state changed to playing", u->source->name);
 
+            /* When the ofono backend resumes source or sink when in the audio gateway role, the
+             * state of source or sink may already be RUNNING before the transport is acquired via
+             * hf_audio_agent_new_connection(), so the pa_source_suspend() call will not lead to a
+             * state change message. In this case we explicitly need to signal the I/O thread to
+             * set up the stream. */
+            if (PA_SOURCE_IS_OPENED(u->source->state))
+                pa_asyncmsgq_send(u->source->asyncmsgq, PA_MSGOBJECT(u->source), PA_SOURCE_MESSAGE_SETUP_STREAM, NULL, 0, NULL);
+
             /* We remove the IDLE suspend cause, because otherwise
              * module-loopback doesn't uncork its streams. FIXME: Messing with
              * the IDLE suspend cause here is wrong, the correct way to handle
@@ -2001,6 +2082,10 @@ static void handle_transport_state_change(struct userdata *u, struct pa_bluetoot
 
         if (u->sink) {
             pa_log_debug("Resuming sink %s because its transport state changed to playing", u->sink->name);
+
+            /* Same comment as above */
+            if (PA_SINK_IS_OPENED(u->sink->state))
+                pa_asyncmsgq_send(u->sink->asyncmsgq, PA_MSGOBJECT(u->sink), PA_SINK_MESSAGE_SETUP_STREAM, NULL, 0, NULL);
 
             /* FIXME: See the previous comment. */
             pa_sink_suspend(u->sink, false, PA_SUSPEND_IDLE|PA_SUSPEND_USER);
@@ -2035,7 +2120,7 @@ static pa_hook_result_t device_connection_changed_cb(pa_bluetooth_discovery *y, 
         return PA_HOOK_OK;
 
     pa_log_debug("Unloading module for device %s", d->path);
-    pa_module_unload(u->core, u->module, true);
+    pa_module_unload(u->module, true);
 
     return PA_HOOK_OK;
 }
@@ -2072,8 +2157,11 @@ static pa_hook_result_t transport_speaker_gain_changed_cb(pa_bluetooth_discovery
     if (volume < PA_VOLUME_NORM)
         volume++;
 
-    pa_cvolume_set(&v, u->sample_spec.channels, volume);
-    pa_sink_volume_changed(u->sink, &v);
+    pa_cvolume_set(&v, u->encoder_sample_spec.channels, volume);
+    if (t->profile == PA_BLUETOOTH_PROFILE_HEADSET_HEAD_UNIT)
+        pa_sink_volume_changed(u->sink, &v);
+    else
+        pa_sink_set_volume(u->sink, &v, true, true);
 
     return PA_HOOK_OK;
 }
@@ -2096,8 +2184,12 @@ static pa_hook_result_t transport_microphone_gain_changed_cb(pa_bluetooth_discov
     if (volume < PA_VOLUME_NORM)
         volume++;
 
-    pa_cvolume_set(&v, u->sample_spec.channels, volume);
-    pa_source_volume_changed(u->source, &v);
+    pa_cvolume_set(&v, u->decoder_sample_spec.channels, volume);
+
+    if (t->profile == PA_BLUETOOTH_PROFILE_HEADSET_HEAD_UNIT)
+        pa_source_volume_changed(u->source, &v);
+    else
+        pa_source_set_volume(u->source, &v, true, true);
 
     return PA_HOOK_OK;
 }
@@ -2116,7 +2208,18 @@ static int device_process_msg(pa_msgobject *obj, int code, void *data, int64_t o
             pa_assert_se(pa_card_set_profile(m->card, pa_hashmap_get(m->card->profiles, "off"), false) >= 0);
             break;
         case BLUETOOTH_MESSAGE_STREAM_FD_HUP:
-            pa_bluetooth_transport_set_state(u->transport, PA_BLUETOOTH_TRANSPORT_STATE_IDLE);
+            if (u->transport->state > PA_BLUETOOTH_TRANSPORT_STATE_IDLE)
+                pa_bluetooth_transport_set_state(u->transport, PA_BLUETOOTH_TRANSPORT_STATE_IDLE);
+            break;
+        case BLUETOOTH_MESSAGE_SET_TRANSPORT_PLAYING:
+            /* transport_acquired needs to be checked here, because a message could have been
+             * pending when the profile was switched. If the new transport has been acquired
+             * correctly, the call below will have no effect because the transport state is
+             * already PLAYING. If transport_acquire() failed for the new profile, the transport
+             * state should not be changed. If the transport has been released for other reasons
+             * (I/O thread shutdown), transport_acquired will also be false. */
+            if (u->transport_acquired)
+                pa_bluetooth_transport_set_state(u->transport, PA_BLUETOOTH_TRANSPORT_STATE_PLAYING);
             break;
     }
 
@@ -2127,6 +2230,7 @@ int pa__init(pa_module* m) {
     struct userdata *u;
     const char *path;
     pa_modargs *ma;
+    bool autodetect_mtu;
 
     pa_assert(m);
 
@@ -2136,25 +2240,33 @@ int pa__init(pa_module* m) {
 
     if (!(ma = pa_modargs_new(m->argument, valid_modargs))) {
         pa_log_error("Failed to parse module arguments");
-        goto fail;
+        goto fail_free_modargs;
     }
 
     if (!(path = pa_modargs_get_value(ma, "path", NULL))) {
         pa_log_error("Failed to get device path from module arguments");
-        goto fail;
+        goto fail_free_modargs;
     }
 
     if ((u->discovery = pa_shared_get(u->core, "bluetooth-discovery")))
         pa_bluetooth_discovery_ref(u->discovery);
     else {
         pa_log_error("module-bluez5-discover doesn't seem to be loaded, refusing to load module-bluez5-device");
-        goto fail;
+        goto fail_free_modargs;
     }
 
     if (!(u->device = pa_bluetooth_discovery_get_device_by_path(u->discovery, path))) {
         pa_log_error("%s is unknown", path);
-        goto fail;
+        goto fail_free_modargs;
     }
+
+    autodetect_mtu = false;
+    if (pa_modargs_get_value_boolean(ma, "autodetect_mtu", &autodetect_mtu) < 0) {
+        pa_log("Invalid boolean value for autodetect_mtu parameter");
+        goto fail_free_modargs;
+    }
+
+    u->device->autodetect_mtu = autodetect_mtu;
 
     pa_modargs_free(ma);
 
@@ -2172,7 +2284,6 @@ int pa__init(pa_module* m) {
     u->transport_microphone_gain_changed_slot =
         pa_hook_connect(pa_bluetooth_discovery_hook(u->discovery, PA_BLUETOOTH_HOOK_TRANSPORT_MICROPHONE_GAIN_CHANGED), PA_HOOK_NORMAL, (pa_hook_cb_t) transport_microphone_gain_changed_cb, u);
 
-
     if (add_card(u) < 0)
         goto fail;
 
@@ -2181,6 +2292,7 @@ int pa__init(pa_module* m) {
 
     u->msg->parent.process_msg = device_process_msg;
     u->msg->card = u->card;
+    u->stream_setup_done = false;
 
     if (u->profile != PA_BLUETOOTH_PROFILE_OFF)
         if (init_profile(u) < 0)
@@ -2199,10 +2311,12 @@ off:
 
     return 0;
 
-fail:
+fail_free_modargs:
 
     if (ma)
         pa_modargs_free(ma);
+
+fail:
 
     pa__done(m);
 
@@ -2231,11 +2345,11 @@ void pa__done(pa_module *m) {
     if (u->transport_microphone_gain_changed_slot)
         pa_hook_slot_free(u->transport_microphone_gain_changed_slot);
 
-    if (u->sbc_info.buffer)
-        pa_xfree(u->sbc_info.buffer);
+    if (u->encoder_buffer)
+        pa_xfree(u->encoder_buffer);
 
-    if (u->sbc_info.sbc_initialized)
-        sbc_finish(&u->sbc_info.sbc);
+    if (u->decoder_buffer)
+        pa_xfree(u->decoder_buffer);
 
     if (u->msg)
         pa_xfree(u->msg);

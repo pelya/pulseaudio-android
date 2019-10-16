@@ -40,6 +40,7 @@ struct property {
 };
 
 #define MAKE_HASHMAP(p) ((pa_hashmap*) (p))
+#define MAKE_HASHMAP_CONST(p) ((const pa_hashmap*) (p))
 #define MAKE_PROPLIST(p) ((pa_proplist*) (p))
 
 int pa_proplist_key_valid(const char *key) {
@@ -83,7 +84,7 @@ int pa_proplist_sets(pa_proplist *p, const char *key, const char *value) {
     if (!pa_proplist_key_valid(key) || !pa_utf8_valid(value))
         return -1;
 
-    if (!(prop = pa_hashmap_get(MAKE_HASHMAP(p), key))) {
+    if (!(prop = pa_hashmap_get(MAKE_HASHMAP_CONST(p), key))) {
         prop = pa_xnew(struct property, 1);
         prop->key = pa_xstrdup(key);
         add = true;
@@ -118,7 +119,7 @@ static int proplist_setn(pa_proplist *p, const char *key, size_t key_length, con
         return -1;
     }
 
-    if (!(prop = pa_hashmap_get(MAKE_HASHMAP(p), k))) {
+    if (!(prop = pa_hashmap_get(MAKE_HASHMAP_CONST(p), k))) {
         prop = pa_xnew(struct property, 1);
         prop->key = k;
         add = true;
@@ -181,7 +182,7 @@ static int proplist_sethex(pa_proplist *p, const char *key, size_t key_length, c
 
     pa_xfree(v);
 
-    if (!(prop = pa_hashmap_get(MAKE_HASHMAP(p), k))) {
+    if (!(prop = pa_hashmap_get(MAKE_HASHMAP_CONST(p), k))) {
         prop = pa_xnew(struct property, 1);
         prop->key = k;
         add = true;
@@ -221,7 +222,7 @@ int pa_proplist_setf(pa_proplist *p, const char *key, const char *format, ...) {
     if (!pa_utf8_valid(v))
         goto fail;
 
-    if (!(prop = pa_hashmap_get(MAKE_HASHMAP(p), key))) {
+    if (!(prop = pa_hashmap_get(MAKE_HASHMAP_CONST(p), key))) {
         prop = pa_xnew(struct property, 1);
         prop->key = pa_xstrdup(key);
         add = true;
@@ -252,7 +253,7 @@ int pa_proplist_set(pa_proplist *p, const char *key, const void *data, size_t nb
     if (!pa_proplist_key_valid(key))
         return -1;
 
-    if (!(prop = pa_hashmap_get(MAKE_HASHMAP(p), key))) {
+    if (!(prop = pa_hashmap_get(MAKE_HASHMAP_CONST(p), key))) {
         prop = pa_xnew(struct property, 1);
         prop->key = pa_xstrdup(key);
         add = true;
@@ -271,7 +272,7 @@ int pa_proplist_set(pa_proplist *p, const char *key, const void *data, size_t nb
     return 0;
 }
 
-const char *pa_proplist_gets(pa_proplist *p, const char *key) {
+const char *pa_proplist_gets(const pa_proplist *p, const char *key) {
     struct property *prop;
 
     pa_assert(p);
@@ -280,7 +281,7 @@ const char *pa_proplist_gets(pa_proplist *p, const char *key) {
     if (!pa_proplist_key_valid(key))
         return NULL;
 
-    if (!(prop = pa_hashmap_get(MAKE_HASHMAP(p), key)))
+    if (!(prop = pa_hashmap_get(MAKE_HASHMAP_CONST(p), key)))
         return NULL;
 
     if (prop->nbytes <= 0)
@@ -298,7 +299,7 @@ const char *pa_proplist_gets(pa_proplist *p, const char *key) {
     return (char*) prop->value;
 }
 
-int pa_proplist_get(pa_proplist *p, const char *key, const void **data, size_t *nbytes) {
+int pa_proplist_get(const pa_proplist *p, const char *key, const void **data, size_t *nbytes) {
     struct property *prop;
 
     pa_assert(p);
@@ -309,7 +310,7 @@ int pa_proplist_get(pa_proplist *p, const char *key, const void **data, size_t *
     if (!pa_proplist_key_valid(key))
         return -1;
 
-    if (!(prop = pa_hashmap_get(MAKE_HASHMAP(p), key)))
+    if (!(prop = pa_hashmap_get(MAKE_HASHMAP_CONST(p), key)))
         return -1;
 
     *data = prop->value;
@@ -329,9 +330,7 @@ void pa_proplist_update(pa_proplist *p, pa_update_mode_t mode, const pa_proplist
     if (mode == PA_UPDATE_SET)
         pa_proplist_clear(p);
 
-    /* MAKE_HASHMAP turns the const pointer into a non-const pointer, but
-     * that's ok, because we don't modify the hashmap contents. */
-    while ((prop = pa_hashmap_iterate(MAKE_HASHMAP(other), &state, NULL))) {
+    while ((prop = pa_hashmap_iterate(MAKE_HASHMAP_CONST(other), &state, NULL))) {
 
         if (mode == PA_UPDATE_MERGE && pa_proplist_contains(p, prop->key))
             continue;
@@ -371,16 +370,16 @@ int pa_proplist_unset_many(pa_proplist *p, const char * const keys[]) {
     return n;
 }
 
-const char *pa_proplist_iterate(pa_proplist *p, void **state) {
+const char *pa_proplist_iterate(const pa_proplist *p, void **state) {
     struct property *prop;
 
-    if (!(prop = pa_hashmap_iterate(MAKE_HASHMAP(p), state, NULL)))
+    if (!(prop = pa_hashmap_iterate(MAKE_HASHMAP_CONST(p), state, NULL)))
         return NULL;
 
     return prop->key;
 }
 
-char *pa_proplist_to_string_sep(pa_proplist *p, const char *sep) {
+char *pa_proplist_to_string_sep(const pa_proplist *p, const char *sep) {
     const char *key;
     void *state = NULL;
     pa_strbuf *buf;
@@ -438,7 +437,7 @@ char *pa_proplist_to_string_sep(pa_proplist *p, const char *sep) {
     return pa_strbuf_to_string_free(buf);
 }
 
-char *pa_proplist_to_string(pa_proplist *p) {
+char *pa_proplist_to_string(const pa_proplist *p) {
     char *s, *t;
 
     s = pa_proplist_to_string_sep(p, "\n");
@@ -480,7 +479,7 @@ pa_proplist *pa_proplist_from_string(const char *s) {
                     goto success;
                 else if (*p == '=')
                     goto fail;
-                else if (!isspace(*p)) {
+                else if (!isspace((unsigned char)*p)) {
                     key = p;
                     state = KEY;
                     key_len = 1;
@@ -492,7 +491,7 @@ pa_proplist *pa_proplist_from_string(const char *s) {
                     goto fail;
                 else if (*p == '=')
                     state = VALUE_START;
-                else if (isspace(*p))
+                else if (isspace((unsigned char)*p))
                     state = AFTER_KEY;
                 else
                     key_len++;
@@ -503,7 +502,7 @@ pa_proplist *pa_proplist_from_string(const char *s) {
                     goto fail;
                 else if (*p == '=')
                     state = VALUE_START;
-                else if (!isspace(*p))
+                else if (!isspace((unsigned char)*p))
                     goto fail;
                 break;
 
@@ -523,7 +522,7 @@ pa_proplist *pa_proplist_from_string(const char *s) {
                     state = VALUE_DOUBLE_QUOTES;
                     value = p+1;
                     value_len = 0;
-                } else if (!isspace(*p)) {
+                } else if (!isspace((unsigned char)*p)) {
                     state = VALUE_SIMPLE;
                     value = p;
                     value_len = 1;
@@ -531,7 +530,7 @@ pa_proplist *pa_proplist_from_string(const char *s) {
                 break;
 
             case VALUE_SIMPLE:
-                if (*p == 0 || isspace(*p)) {
+                if (*p == 0 || isspace((unsigned char)*p)) {
                     if (proplist_setn(pl, key, key_len, value, value_len) < 0)
                         goto fail;
 
@@ -610,7 +609,7 @@ pa_proplist *pa_proplist_from_string(const char *s) {
                     (*p >= 'A' && *p <= 'F') ||
                     (*p >= 'a' && *p <= 'f')) {
                     value_len++;
-                } else if (*p == 0 || isspace(*p)) {
+                } else if (*p == 0 || isspace((unsigned char)*p)) {
 
                     if (proplist_sethex(pl, key, key_len, value, value_len) < 0)
                         goto fail;
@@ -633,14 +632,14 @@ fail:
     return NULL;
 }
 
-int pa_proplist_contains(pa_proplist *p, const char *key) {
+int pa_proplist_contains(const pa_proplist *p, const char *key) {
     pa_assert(p);
     pa_assert(key);
 
     if (!pa_proplist_key_valid(key))
         return -1;
 
-    if (!(pa_hashmap_get(MAKE_HASHMAP(p), key)))
+    if (!(pa_hashmap_get(MAKE_HASHMAP_CONST(p), key)))
         return 0;
 
     return 1;
@@ -663,19 +662,19 @@ pa_proplist* pa_proplist_copy(const pa_proplist *p) {
     return copy;
 }
 
-unsigned pa_proplist_size(pa_proplist *p) {
+unsigned pa_proplist_size(const pa_proplist *p) {
     pa_assert(p);
 
-    return pa_hashmap_size(MAKE_HASHMAP(p));
+    return pa_hashmap_size(MAKE_HASHMAP_CONST(p));
 }
 
-int pa_proplist_isempty(pa_proplist *p) {
+int pa_proplist_isempty(const pa_proplist *p) {
     pa_assert(p);
 
-    return pa_hashmap_isempty(MAKE_HASHMAP(p));
+    return pa_hashmap_isempty(MAKE_HASHMAP_CONST(p));
 }
 
-int pa_proplist_equal(pa_proplist *a, pa_proplist *b) {
+int pa_proplist_equal(const pa_proplist *a, const pa_proplist *b) {
     const void *key = NULL;
     struct property *a_prop = NULL;
     struct property *b_prop = NULL;
@@ -690,8 +689,8 @@ int pa_proplist_equal(pa_proplist *a, pa_proplist *b) {
     if (pa_proplist_size(a) != pa_proplist_size(b))
         return 0;
 
-    while ((a_prop = pa_hashmap_iterate(MAKE_HASHMAP(a), &state, &key))) {
-        if (!(b_prop = pa_hashmap_get(MAKE_HASHMAP(b), key)))
+    while ((a_prop = pa_hashmap_iterate(MAKE_HASHMAP_CONST(a), &state, &key))) {
+        if (!(b_prop = pa_hashmap_get(MAKE_HASHMAP_CONST(b), key)))
             return 0;
 
         if (a_prop->nbytes != b_prop->nbytes)

@@ -100,11 +100,7 @@ static void handle_io_event(pa_mainloop_api *ea, pa_io_event *e, int fd, pa_io_e
     unsigned int flags = 0;
     DBusWatch *watch = userdata;
 
-#if HAVE_DBUS_WATCH_GET_UNIX_FD
     pa_assert(fd == dbus_watch_get_unix_fd(watch));
-#else
-    pa_assert(fd == dbus_watch_get_fd(watch));
-#endif
 
     if (!dbus_watch_get_enabled(watch)) {
         pa_log_warn("Asked to handle disabled watch: %p %i", (void*) watch, fd);
@@ -153,11 +149,7 @@ static dbus_bool_t add_watch(DBusWatch *watch, void *data) {
 
     ev = c->mainloop->io_new(
             c->mainloop,
-#if HAVE_DBUS_WATCH_GET_UNIX_FD
             dbus_watch_get_unix_fd(watch),
-#else
-            dbus_watch_get_fd(watch),
-#endif
             get_watch_flags(watch), handle_io_event, watch);
 
     dbus_watch_set_data(watch, ev, NULL);
@@ -735,6 +727,7 @@ void pa_dbus_append_proplist_variant_dict_entry(DBusMessageIter *dict_iter, cons
 pa_proplist *pa_dbus_get_proplist_arg(DBusConnection *c, DBusMessage *msg, DBusMessageIter *iter) {
     DBusMessageIter dict_iter;
     DBusMessageIter dict_entry_iter;
+    char *signature;
     pa_proplist *proplist = NULL;
     const char *key = NULL;
     const uint8_t *value = NULL;
@@ -743,7 +736,11 @@ pa_proplist *pa_dbus_get_proplist_arg(DBusConnection *c, DBusMessage *msg, DBusM
     pa_assert(c);
     pa_assert(msg);
     pa_assert(iter);
-    pa_assert(pa_streq(dbus_message_iter_get_signature(iter), "a{say}"));
+
+    pa_assert(signature = dbus_message_iter_get_signature(iter));
+    pa_assert_se(pa_streq(signature, "a{say}"));
+
+    dbus_free(signature);
 
     proplist = pa_proplist_new();
 

@@ -336,11 +336,10 @@ static int sink_input_process_msg(pa_msgobject *o, int code, void *userdata, int
         case PA_SINK_INPUT_MESSAGE_GET_LATENCY: {
             pa_usec_t *r = userdata;
 
+            /* The default handler will add in the extra latency added by the resampler.*/
             *r = pa_bytes_to_usec(pa_memblockq_get_length(c->input_memblockq), &c->sink_input->sample_spec);
-
-            /* Fall through, the default handler will add in the extra
-             * latency added by the resampler */
         }
+        /* Fall through. */
 
         default:
             return pa_sink_input_process_msg(o, code, userdata, offset, chunk);
@@ -534,7 +533,7 @@ void pa_simple_protocol_connect(pa_simple_protocol *p, pa_iochannel *io, pa_simp
         data.driver = __FILE__;
         data.module = o->module;
         data.client = c->client;
-        pa_sink_input_new_data_set_sink(&data, sink, false);
+        pa_sink_input_new_data_set_sink(&data, sink, false, true);
         pa_proplist_update(data.proplist, PA_UPDATE_MERGE, c->client->proplist);
         pa_sink_input_new_data_set_sample_spec(&data, &o->sample_spec);
 
@@ -590,7 +589,7 @@ void pa_simple_protocol_connect(pa_simple_protocol *p, pa_iochannel *io, pa_simp
         data.driver = __FILE__;
         data.module = o->module;
         data.client = c->client;
-        pa_source_output_new_data_set_source(&data, source, false);
+        pa_source_output_new_data_set_source(&data, source, false, true);
         pa_proplist_update(data.proplist, PA_UPDATE_MERGE, c->client->proplist);
         pa_source_output_new_data_set_sample_spec(&data, &o->sample_spec);
 
