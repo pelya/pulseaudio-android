@@ -1,9 +1,9 @@
 #!/bin/sh
 
+BUILD_PARALLEL=false
 NCPU=8
 ARCH_LIST="arm64-v8a x86_64 x86 armeabi-v7a"
-ARCH_LIST="arm64-v8a"
-
+#ARCH_LIST="arm64-v8a"
 
 [ -e libtool-2.4.6.tar.gz ] || wget http://ftpmirror.gnu.org/libtool/libtool-2.4.6.tar.gz || exit 1
 [ -e 12916e229c769da4929f6df7f038ab51cf0cb067.tar.gz ] || wget https://github.com/json-c/json-c/archive/12916e229c769da4929f6df7f038ab51cf0cb067.tar.gz || exit 1
@@ -162,19 +162,19 @@ build() {
 	} || exit 1
 
 	make -j$NCPU V=1
-	$make -j1 V=1
-	#rm src/libpulsecommon-7.0.la
-	#env debug_cmd='set -x' make -j1 V=1 -C src libpulsecommon-7.0.la || exit 1
-	exit 1
 	make install-strip || exit 1
 	cd ..
 }
 
 for ARCH in $ARCH_LIST; do
-	build $ARCH
+	if $BUILD_PARALLEL; then
+		build $ARCH &
+	else
+		build $ARCH
+	fi
 done
 
-#wait
+wait
 
 for ARCH in $ARCH_LIST; do
 	[ -e $ARCH/install/bin/pulseaudio ] || exit 1
