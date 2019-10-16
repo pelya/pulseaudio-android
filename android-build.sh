@@ -1,6 +1,6 @@
 #!/bin/sh
 
-NCPU=4
+NCPU=8
 ARCH_LIST="arm64-v8a x86_64 x86 armeabi-v7a"
 ARCH_LIST="arm64-v8a"
 
@@ -116,6 +116,9 @@ build() {
 		LIBSNDFILE_LIBS="-L`pwd`/libsndfile-1.0.25/install/lib -lsndfile" \
 		ALLOW_UNRESOLVED_SYMBOLS=1 \
 		ac_cv_func_mkfifo=yes \
+		ax_cv_PTHREAD_PRIO_INHERIT=no \
+		ac_cv_header_langinfo_h=no \
+		ac_cv_header_glob_h=no \
 		../setCrossEnvironment-$ARCH.sh \
 		  ../configure            \
 		  --prefix=`pwd`/install  \
@@ -155,22 +158,23 @@ build() {
 		  --without-caps          \
 		|| exit 1
 
-		#  --enable-static-bins    \
-		#  --disable-shared        \
-
+		patch -p0 < ../libtool.patch || { rm Makefile ; exit 1 ; }
 	} || exit 1
 
-	#make -j$NCPU V=1 || exit 1
-	make -j1 V=1 || exit 1
+	make -j$NCPU V=1
+	$make -j1 V=1
+	#rm src/libpulsecommon-7.0.la
+	#env debug_cmd='set -x' make -j1 V=1 -C src libpulsecommon-7.0.la || exit 1
+	exit 1
 	make install-strip || exit 1
 	cd ..
 }
 
 for ARCH in $ARCH_LIST; do
-	build $ARCH &
+	build $ARCH
 done
 
-wait
+#wait
 
 for ARCH in $ARCH_LIST; do
 	[ -e $ARCH/install/bin/pulseaudio ] || exit 1
