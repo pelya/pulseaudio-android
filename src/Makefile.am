@@ -1905,7 +1905,7 @@ module_waveout_la_CFLAGS = $(AM_CFLAGS) -DPA_MODULE_NAME=module_waveout
 module_opensles_la_SOURCES = modules/module-opensles.c
 module_opensles_la_LDFLAGS = $(MODULE_LDFLAGS)
 module_opensles_la_LIBADD = $(MODULE_LIBADD) $(OPENSLES_LIBS)
-module_opensles_la_CFLAGS = $(AM_CFLAGS) $(OPENSLES_CFLAGS)
+module_opensles_la_CFLAGS = $(AM_CFLAGS) $(OPENSLES_CFLAGS) -DPA_MODULE_NAME=module_opensles
 
 # Hardware autodetection module
 module_detect_la_SOURCES = modules/module-detect.c

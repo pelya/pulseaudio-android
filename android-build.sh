@@ -140,18 +140,19 @@ build() {
 		  --disable-glib2         \
 		  --disable-gtk3          \
 		  --disable-gconf         \
+		  --disable-glib2         \
+		  --disable-gtk3          \
+		  --disable-gsettings     \
 		  --disable-avahi         \
 		  --disable-jack          \
 		  --disable-asyncns       \
 		  --disable-tcpwrap       \
 		  --disable-lirc          \
 		  --disable-dbus          \
-		  --disable-bluez4        \
 		  --disable-bluez5        \
 		  --disable-udev          \
 		  --disable-hal-compat    \
 		  --disable-openssl       \
-		  --disable-xen           \
 		  --disable-systemd-daemon \
 		  --disable-systemd-login \
 		  --disable-systemd-journal \
