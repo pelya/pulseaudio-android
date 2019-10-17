@@ -110,24 +110,18 @@ static int sink_process_msg(pa_msgobject *o, int code, void *data, int64_t offse
 
 	switch (code) {
 		case PA_SINK_MESSAGE_GET_LATENCY:
-			if (false) {
-				pa_usec_t now;
-				now = pa_rtclock_now();
-				*((int64_t*) data) = (int64_t)u->timestamp - (int64_t)now;
-			} else {
-				size_t n = 0;
+			size_t n = 0;
 
 #ifdef FIONREAD
-				int l;
+			int l;
 
-				if (ioctl(u->fd, FIONREAD, &l) >= 0 && l > 0)
-					n = (size_t) l;
+			if (ioctl(u->fd, FIONREAD, &l) >= 0 && l > 0)
+				n = (size_t) l;
 #endif
 
-				n += u->memchunk.length;
+			n += u->memchunk.length;
 
-				*((int64_t*) data) = pa_bytes_to_usec(n, &u->sink->sample_spec);
-			}
+			*((int64_t*) data) = pa_bytes_to_usec(n, &u->sink->sample_spec);
 			return 0;
 	}
 
@@ -311,54 +305,6 @@ static int process_render(struct userdata *u) {
 	}
 }
 
-static void thread_func_use_timing(void *userdata) {
-	struct userdata *u = userdata;
-
-	pa_assert(u);
-
-	pa_log_debug("Thread (use timing) starting up");
-
-	pa_thread_mq_install(&u->thread_mq);
-
-	u->timestamp = pa_rtclock_now();
-
-	for (;;) {
-		pa_usec_t now = 0;
-		int ret;
-
-		if (PA_SINK_IS_OPENED(u->sink->thread_info.state))
-			now = pa_rtclock_now();
-
-		if (PA_UNLIKELY(u->sink->thread_info.rewind_requested))
-			pa_sink_process_rewind(u->sink, 0);
-
-		/* Render some data and write it to the fifo */
-		if (PA_SINK_IS_OPENED(u->sink->thread_info.state)) {
-			if (u->timestamp <= now)
-				process_render_use_timing(u, now);
-
-			pa_rtpoll_set_timer_absolute(u->rtpoll, u->timestamp);
-		} else
-			pa_rtpoll_set_timer_disabled(u->rtpoll);
-
-		/* Hmm, nothing to do. Let's sleep */
-		if ((ret = pa_rtpoll_run(u->rtpoll)) < 0)
-			goto fail;
-
-		if (ret == 0)
-			goto finish;
-	}
-
-fail:
-	/* If this was no regular exit from the loop we have to continue
-	 * processing messages until we received PA_MESSAGE_SHUTDOWN */
-	pa_asyncmsgq_post(u->thread_mq.outq, PA_MSGOBJECT(u->core), PA_CORE_MESSAGE_UNLOAD_MODULE, u->module, 0, NULL, NULL);
-	pa_asyncmsgq_wait_for(u->thread_mq.inq, PA_MESSAGE_SHUTDOWN);
-
-finish:
-	pa_log_debug("Thread (use timing) shutting down");
-}
-
 static void thread_func(void *userdata) {
 	struct userdata *u = userdata;
 
@@ -501,10 +447,7 @@ int pa__init(pa_module *m) {
 		goto fail;
 	}
 
-	if (false)
-		u->sink = pa_sink_new(m->core, &data, PA_SINK_LATENCY|PA_SINK_DYNAMIC_LATENCY);
-	else
-		u->sink = pa_sink_new(m->core, &data, PA_SINK_LATENCY);
+	u->sink = pa_sink_new(m->core, &data, PA_SINK_LATENCY);
 	pa_sink_new_data_done(&data);
 
 	if (!u->sink) {
@@ -514,8 +457,6 @@ int pa__init(pa_module *m) {
 
 	u->sink->parent.process_msg = sink_process_msg;
 	u->sink->set_state_in_io_thread = sink_set_state_in_io_thread_cb;
-	if (false)
-		u->sink->update_requested_latency = sink_update_requested_latency_cb;
 	u->sink->userdata = u;
 
 	pa_sink_set_asyncmsgq(u->sink, u->thread_mq.inq);
@@ -524,14 +465,8 @@ int pa__init(pa_module *m) {
 	u->bytes_dropped = 0;
 	u->fifo_error = false;
 	u->buffer_size = pa_frame_align(pa_pipe_buf(u->fd), &u->sink->sample_spec);
-	if (false) {
-		u->block_usec = pa_bytes_to_usec(u->buffer_size, &u->sink->sample_spec);
-		pa_sink_set_latency_range(u->sink, 0, u->block_usec);
-		thread_routine = thread_func_use_timing;
-	} else {
-		pa_sink_set_fixed_latency(u->sink, pa_bytes_to_usec(u->buffer_size, &u->sink->sample_spec));
-		thread_routine = thread_func;
-	}
+	pa_sink_set_fixed_latency(u->sink, pa_bytes_to_usec(u->buffer_size, &u->sink->sample_spec));
+	thread_routine = thread_func;
 	pa_sink_set_max_request(u->sink, u->buffer_size);
 
 	u->rtpoll_item = pa_rtpoll_item_new(u->rtpoll, PA_RTPOLL_NEVER, 1);
