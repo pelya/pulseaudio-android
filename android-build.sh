@@ -161,6 +161,8 @@ build() {
 		|| exit 1
 
 		patch -p0 < ../libtool.patch || { rm Makefile ; exit 1 ; }
+
+		sed -i.old "s@`pwd`/install@/proc/self/cwd/usr@g" config.h
 	} || exit 1
 
 	make -j$NCPU V=1
