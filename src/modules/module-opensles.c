@@ -22,9 +22,7 @@
 #endif
 
 #include <SLES/OpenSLES.h>
-#ifdef __ANDROID__
 #include <SLES/OpenSLES_Android.h>
-#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -65,9 +63,6 @@ PA_MODULE_USAGE(
 
 #define DEFAULT_SINK_NAME "opensles"
 
-// Copypaste of pipe sink
-
-#define DEFAULT_FILE_NAME "fifo_output"
 
 struct userdata {
 	pa_core *core;
@@ -78,16 +73,11 @@ struct userdata {
 	pa_thread_mq thread_mq;
 	pa_rtpoll *rtpoll;
 
-	char *filename;
-	int fd;
-	bool do_unlink_fifo;
 	size_t buffer_size;
 	size_t bytes_dropped;
 	bool fifo_error;
 
 	pa_memchunk memchunk;
-
-	pa_rtpoll_item *rtpoll_item;
 
 	int write_type;
 	pa_usec_t block_usec;
@@ -110,19 +100,16 @@ static int sink_process_msg(pa_msgobject *o, int code, void *data, int64_t offse
 
 	switch (code) {
 		case PA_SINK_MESSAGE_GET_LATENCY:
+		{
 			size_t n = 0;
 
-#ifdef FIONREAD
-			int l;
-
-			if (ioctl(u->fd, FIONREAD, &l) >= 0 && l > 0)
-				n = (size_t) l;
-#endif
+			// n = latency in bytes
 
 			n += u->memchunk.length;
 
 			*((int64_t*) data) = pa_bytes_to_usec(n, &u->sink->sample_spec);
 			return 0;
+		}
 	}
 
 	return pa_sink_process_msg(o, code, data, offset, chunk);
@@ -185,7 +172,7 @@ static ssize_t pipe_sink_write(struct userdata *u, pa_memchunk *pchunk) {
 	for (;;) {
 		ssize_t l;
 
-		l = pa_write(u->fd, (uint8_t*) p + index, length, &u->write_type);
+		//l = pa_write(u->fd, (uint8_t*) p + index, length, &u->write_type);
 
 		pa_assert(l != 0);
 
@@ -220,47 +207,6 @@ static ssize_t pipe_sink_write(struct userdata *u, pa_memchunk *pchunk) {
 	return count;
 }
 
-static void process_render_use_timing(struct userdata *u, pa_usec_t now) {
-	size_t dropped = 0;
-	size_t consumed = 0;
-
-	pa_assert(u);
-
-	/* Fill the buffer up the latency size */
-	while (u->timestamp < now + u->block_usec) {
-		ssize_t written = 0;
-		pa_memchunk chunk;
-
-		pa_sink_render(u->sink, u->sink->thread_info.max_request, &chunk);
-
-		pa_assert(chunk.length > 0);
-
-		if ((written = pipe_sink_write(u, &chunk)) < 0)
-			written = -1 - written;
-
-		pa_memblock_unref(chunk.memblock);
-
-		u->timestamp += pa_bytes_to_usec(chunk.length, &u->sink->sample_spec);
-
-		dropped = chunk.length - written;
-
-		if (u->bytes_dropped != 0 && dropped != chunk.length) {
-			pa_log_debug("Pipe-sink continuously dropped %zu bytes", u->bytes_dropped);
-			u->bytes_dropped = 0;
-		}
-
-		if (u->bytes_dropped == 0 && dropped != 0)
-			pa_log_debug("Pipe-sink just dropped %zu bytes", dropped);
-
-		u->bytes_dropped += dropped;
-
-		consumed += chunk.length;
-
-		if (consumed >= u->sink->thread_info.max_request)
-			break;
-	}
-}
-
 static int process_render(struct userdata *u) {
 	pa_assert(u);
 
@@ -274,7 +220,7 @@ static int process_render(struct userdata *u) {
 		void *p;
 
 		p = pa_memblock_acquire(u->memchunk.memblock);
-		l = pa_write(u->fd, (uint8_t*) p + u->memchunk.index, u->memchunk.length, &u->write_type);
+		//l = pa_write(u->fd, (uint8_t*) p + u->memchunk.index, u->memchunk.length, &u->write_type);
 		pa_memblock_release(u->memchunk.memblock);
 
 		pa_assert(l != 0);
@@ -315,39 +261,22 @@ static void thread_func(void *userdata) {
 	pa_thread_mq_install(&u->thread_mq);
 
 	for (;;) {
-		struct pollfd *pollfd;
 		int ret;
-
-		pollfd = pa_rtpoll_item_get_pollfd(u->rtpoll_item, NULL);
 
 		if (PA_UNLIKELY(u->sink->thread_info.rewind_requested))
 			pa_sink_process_rewind(u->sink, 0);
 
 		/* Render some data and write it to the fifo */
 		if (PA_SINK_IS_OPENED(u->sink->thread_info.state)) {
-			if (pollfd->revents) {
-				if (process_render(u) < 0)
-					goto fail;
-
-				pollfd->revents = 0;
-			}
+			if (process_render(u) < 0)
+				goto fail;
 		}
-
-		/* Hmm, nothing to do. Let's sleep */
-		pollfd->events = (short) (u->sink->thread_info.state == PA_SINK_RUNNING ? POLLOUT : 0);
 
 		if ((ret = pa_rtpoll_run(u->rtpoll)) < 0)
 			goto fail;
 
 		if (ret == 0)
 			goto finish;
-
-		pollfd = pa_rtpoll_item_get_pollfd(u->rtpoll_item, NULL);
-
-		if (pollfd->revents & ~POLLOUT) {
-			pa_log("FIFO shutdown.");
-			goto fail;
-		}
 	}
 
 fail:
@@ -362,13 +291,14 @@ finish:
 
 int pa__init(pa_module *m) {
 	struct userdata *u;
-	struct stat st;
 	pa_sample_spec ss;
 	pa_channel_map map;
 	pa_modargs *ma;
 	struct pollfd *pollfd;
 	pa_sink_new_data data;
 	pa_thread_func_t thread_routine;
+	SLresult result;
+
 
 	pa_assert(m);
 
@@ -398,46 +328,14 @@ int pa__init(pa_module *m) {
 
 	u->write_type = 0;
 
-	u->filename = pa_runtime_path(pa_modargs_get_value(ma, "file", DEFAULT_FILE_NAME));
-	u->do_unlink_fifo = false;
 
-	if (mkfifo(u->filename, 0666) < 0) {
-		if (errno != EEXIST) {
-			pa_log("mkfifo('%s'): %s", u->filename, pa_cstrerror(errno));
-			goto fail;
-		}
-	} else {
-		u->do_unlink_fifo = true;
-
-		/* Our umask is 077, so the pipe won't be created with the requested
-		 * permissions. Let's fix the permissions with chmod(). */
-		if (chmod(u->filename, 0666) < 0)
-			pa_log_warn("chomd('%s'): %s", u->filename, pa_cstrerror(errno));
-	}
-
-	if ((u->fd = pa_open_cloexec(u->filename, O_RDWR, 0)) < 0) {
-		pa_log("open('%s'): %s", u->filename, pa_cstrerror(errno));
-		goto fail;
-	}
-
-	pa_make_fd_nonblock(u->fd);
-
-	if (fstat(u->fd, &st) < 0) {
-		pa_log("fstat('%s'): %s", u->filename, pa_cstrerror(errno));
-		goto fail;
-	}
-
-	if (!S_ISFIFO(st.st_mode)) {
-		pa_log("'%s' is not a FIFO.", u->filename);
-		goto fail;
-	}
 
 	pa_sink_new_data_init(&data);
 	data.driver = __FILE__;
 	data.module = m;
 	pa_sink_new_data_set_name(&data, pa_modargs_get_value(ma, "sink_name", DEFAULT_SINK_NAME));
-	pa_proplist_sets(data.proplist, PA_PROP_DEVICE_STRING, u->filename);
-	pa_proplist_setf(data.proplist, PA_PROP_DEVICE_DESCRIPTION, "Unix FIFO sink %s", u->filename);
+	pa_proplist_sets(data.proplist, PA_PROP_DEVICE_STRING, "OpenSLES");
+	pa_proplist_setf(data.proplist, PA_PROP_DEVICE_DESCRIPTION, "OpenSLES sink %s", "OpenSLES");
 	pa_sink_new_data_set_sample_spec(&data, &ss);
 	pa_sink_new_data_set_channel_map(&data, &map);
 
@@ -463,18 +361,13 @@ int pa__init(pa_module *m) {
 	pa_sink_set_rtpoll(u->sink, u->rtpoll);
 
 	u->bytes_dropped = 0;
-	u->fifo_error = false;
-	u->buffer_size = pa_frame_align(pa_pipe_buf(u->fd), &u->sink->sample_spec);
+	u->buffer_size = 8192;
+	//u->buffer_size = pa_frame_align(pa_pipe_buf(u->fd), &u->sink->sample_spec);
 	pa_sink_set_fixed_latency(u->sink, pa_bytes_to_usec(u->buffer_size, &u->sink->sample_spec));
 	thread_routine = thread_func;
 	pa_sink_set_max_request(u->sink, u->buffer_size);
 
-	u->rtpoll_item = pa_rtpoll_item_new(u->rtpoll, PA_RTPOLL_NEVER, 1);
-	pollfd = pa_rtpoll_item_get_pollfd(u->rtpoll_item, NULL);
-	pollfd->fd = u->fd;
-	pollfd->events = pollfd->revents = 0;
-
-	if (!(u->thread = pa_thread_new("pipe-sink", thread_routine, u))) {
+	if (!(u->thread = pa_thread_new("opensles-sink", thread_routine, u))) {
 		pa_log("Failed to create thread.");
 		goto fail;
 	}
@@ -527,20 +420,8 @@ void pa__done(pa_module *m) {
 	if (u->memchunk.memblock)
 		pa_memblock_unref(u->memchunk.memblock);
 
-	if (u->rtpoll_item)
-		pa_rtpoll_item_free(u->rtpoll_item);
-
 	if (u->rtpoll)
 		pa_rtpoll_free(u->rtpoll);
-
-	if (u->filename) {
-		if (u->do_unlink_fifo)
-			unlink(u->filename);
-		pa_xfree(u->filename);
-	}
-
-	if (u->fd >= 0)
-		pa_assert_se(pa_close(u->fd) == 0);
 
 	pa_xfree(u);
 }
