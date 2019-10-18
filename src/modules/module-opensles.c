@@ -61,7 +61,45 @@ PA_MODULE_USAGE(
 		"channel_map=<channel map>"
 );
 
+static const char* const valid_modargs[] = {
+	"sink_name",
+	"sink_properties",
+	"format",
+	"rate",
+	"channels",
+	"channel_map",
+	NULL
+};
+
 #define DEFAULT_SINK_NAME "opensles"
+
+#define OPENSLES_BUFFERS 255 /* maximum number of buffers */
+#define OPENSLES_BUFLEN  10   /* ms */
+/*
+ * 10ms of precision when mesasuring latency should be enough,
+ * with 255 buffers we can buffer 2.55s of audio.
+ */
+
+#define CHECK_OPENSL_ERROR(msg)                       \
+	if (PA_UNLIKELY(result != SL_RESULT_SUCCESS)) {   \
+		pa_log(msg " (%lu)", (unsigned long) result); \
+		goto error;                                   \
+	}
+
+#define Destroy(a) (*a)->Destroy(a);
+#define SetPlayState(a, b) (*a)->SetPlayState(a, b)
+#define RegisterCallback(a, b, c) (*a)->RegisterCallback(a, b, c)
+#define GetInterface(a, b, c) (*a)->GetInterface(a, b, c)
+#define Realize(a, b) (*a)->Realize(a, b)
+#define CreateOutputMix(a, b, c, d, e) (*a)->CreateOutputMix(a, b, c, d, e)
+#define CreateAudioPlayer(a, b, c, d, e, f, g) \
+	(*a)->CreateAudioPlayer(a, b, c, d, e, f, g)
+#define Enqueue(a, b, c) (*a)->Enqueue(a, b, c)
+#define Clear(a) (*a)->Clear(a)
+#define GetState(a, b) (*a)->GetState(a, b)
+#define SetPositionUpdatePeriod(a, b) (*a)->SetPositionUpdatePeriod(a, b)
+#define SetVolumeLevel(a, b) (*a)->SetVolumeLevel(a, b)
+#define SetMute(a, b) (*a)->SetMute(a, b)
 
 
 struct userdata {
@@ -75,25 +113,36 @@ struct userdata {
 
 	size_t buffer_size;
 	size_t bytes_dropped;
-	bool fifo_error;
 
 	pa_memchunk memchunk;
 
-	int write_type;
 	pa_usec_t block_usec;
 	pa_usec_t timestamp;
+
+	/* OpenSL objects */
+	SLObjectItf                     engineObject;
+	SLObjectItf                     outputMixObject;
+	SLAndroidSimpleBufferQueueItf   playerBufferQueue;
+	SLObjectItf                     playerObject;
+	SLVolumeItf                     volumeItf;
+	SLEngineItf                     engineEngine;
+	SLPlayItf                       playerPlay;
+
+	/* audio buffered through opensles */
+	uint8_t                        *buf;
+	size_t                          samples_per_buf;
+	int                             next_buf;
+
+	int                             rate;
+
+	/* if we can measure latency already */
+	bool                            started;
 };
 
-static const char* const valid_modargs[] = {
-	"sink_name",
-	"sink_properties",
-	"file",
-	"format",
-	"rate",
-	"channels",
-	"channel_map",
-	NULL
-};
+static int bytesPerSample(void)
+{
+	return 2 /* S16 */ * 2 /* stereo */;
+}
 
 static int sink_process_msg(pa_msgobject *o, int code, void *data, int64_t offset, pa_memchunk *chunk) {
 	struct userdata *u = PA_SINK(o)->userdata;
@@ -127,9 +176,6 @@ static int sink_set_state_in_io_thread_cb(pa_sink *s, pa_sink_state_t new_state,
 			u->timestamp = pa_rtclock_now();
 	} else if (PA_SINK_IS_OPENED(s->thread_info.state)) {
 		if (new_state == PA_SINK_SUSPENDED) {
-			/* Clear potential FIFO error flag */
-			u->fifo_error = false;
-
 			/* Continuously dropping data (clear counter on entering suspended state. */
 			if (u->bytes_dropped != 0) {
 				pa_log_debug("Pipe-sink continuously dropping data - clear statistics (%zu -> 0 bytes dropped)", u->bytes_dropped);
@@ -141,72 +187,6 @@ static int sink_set_state_in_io_thread_cb(pa_sink *s, pa_sink_state_t new_state,
 	return 0;
 }
 
-static void sink_update_requested_latency_cb(pa_sink *s) {
-	struct userdata *u;
-	size_t nbytes;
-
-	pa_sink_assert_ref(s);
-	pa_assert_se(u = s->userdata);
-
-	u->block_usec = pa_sink_get_requested_latency_within_thread(s);
-
-	if (u->block_usec == (pa_usec_t) -1)
-		u->block_usec = s->thread_info.max_latency;
-
-	nbytes = pa_usec_to_bytes(u->block_usec, &s->sample_spec);
-	pa_sink_set_max_request_within_thread(s, nbytes);
-}
-
-static ssize_t pipe_sink_write(struct userdata *u, pa_memchunk *pchunk) {
-	size_t index, length;
-	ssize_t count = 0;
-	void *p;
-
-	pa_assert(u);
-	pa_assert(pchunk);
-
-	index = pchunk->index;
-	length = pchunk->length;
-	p = pa_memblock_acquire(pchunk->memblock);
-
-	for (;;) {
-		ssize_t l;
-
-		//l = pa_write(u->fd, (uint8_t*) p + index, length, &u->write_type);
-
-		pa_assert(l != 0);
-
-		if (l < 0) {
-			if (errno == EAGAIN)
-				break;
-			else if (errno != EINTR) {
-				if (!u->fifo_error) {
-					pa_log("Failed to write data to FIFO: %s", pa_cstrerror(errno));
-					u->fifo_error = true;
-				}
-				count = -1 - count;
-				break;
-			}
-		} else {
-			if (u->fifo_error) {
-				pa_log_debug("Recovered from FIFO error");
-				u->fifo_error = false;
-			}
-			count += l;
-			index += l;
-			length -= l;
-
-			if (length <= 0) {
-				break;
-			}
-		}
-	}
-
-	pa_memblock_release(pchunk->memblock);
-
-	return count;
-}
-
 static int process_render(struct userdata *u) {
 	pa_assert(u);
 
@@ -216,7 +196,7 @@ static int process_render(struct userdata *u) {
 	pa_assert(u->memchunk.length > 0);
 
 	for (;;) {
-		ssize_t l;
+		ssize_t l = -1;
 		void *p;
 
 		p = pa_memblock_acquire(u->memchunk.memblock);
@@ -289,6 +269,18 @@ finish:
 	pa_log_debug("Thread shutting down");
 }
 
+static void PlayedCallback (SLAndroidSimpleBufferQueueItf caller, void *pContext)
+{
+	(void)caller;
+	struct userdata *sys = (struct userdata *)pContext;
+
+	pa_assert (caller == sys->playerBufferQueue);
+
+	//vlc_mutex_lock(&sys->lock);
+	sys->started = true;
+	//vlc_mutex_unlock(&sys->lock);
+}
+
 int pa__init(pa_module *m) {
 	struct userdata *u;
 	pa_sample_spec ss;
@@ -298,7 +290,6 @@ int pa__init(pa_module *m) {
 	pa_sink_new_data data;
 	pa_thread_func_t thread_routine;
 	SLresult result;
-
 
 	pa_assert(m);
 
@@ -326,10 +317,100 @@ int pa__init(pa_module *m) {
 		goto fail;
 	}
 
-	u->write_type = 0;
+	if (getenv("AUDIO_NATIVE_SAMPLE_RATE") != NULL && atoi(getenv("AUDIO_NATIVE_SAMPLE_RATE")) > 0) {
+		ss.rate = atoi(getenv("AUDIO_NATIVE_SAMPLE_RATE"));
+		pa_log("Configure native sample rate %d", ss.rate);
+	}
+	u->rate = ss.rate;
+	ss.format = PA_SAMPLE_S16LE;
+	ss.channels = 2;
 
+	// Init OpenSL ES
+	struct userdata *sys = u; // Just an alias, so I won't need to modify copypasted code
 
+	// create engine
+	result = slCreateEngine(&sys->engineObject, 0, NULL, 0, NULL, NULL);
+	CHECK_OPENSL_ERROR("Failed to create engine");
 
+	// realize the engine in synchronous mode
+	result = Realize(sys->engineObject, SL_BOOLEAN_FALSE);
+	CHECK_OPENSL_ERROR("Failed to realize engine");
+
+	// get the engine interface, needed to create other objects
+	result = GetInterface(sys->engineObject, SL_IID_ENGINE, &sys->engineEngine);
+	CHECK_OPENSL_ERROR("Failed to get the engine interface");
+
+	// create output mix, with environmental reverb specified as a non-required interface
+	const SLInterfaceID ids1[] = { SL_IID_VOLUME };
+	const SLboolean req1[] = { SL_BOOLEAN_FALSE };
+	result = CreateOutputMix(sys->engineEngine, &sys->outputMixObject, 1, ids1, req1);
+	CHECK_OPENSL_ERROR("Failed to create output mix");
+
+	// realize the output mix in synchronous mode
+	result = Realize(sys->outputMixObject, SL_BOOLEAN_FALSE);
+	CHECK_OPENSL_ERROR("Failed to realize output mix");
+
+	// configure audio source - this defines the number of samples you can enqueue.
+	SLDataLocator_AndroidSimpleBufferQueue loc_bufq = {
+		SL_DATALOCATOR_ANDROIDSIMPLEBUFFERQUEUE,
+		OPENSLES_BUFFERS
+	};
+
+	SLDataFormat_PCM format_pcm;
+	format_pcm.formatType       = SL_DATAFORMAT_PCM;
+	format_pcm.numChannels      = 2;
+	format_pcm.samplesPerSec    = ((SLuint32) u->rate * 1000);
+	format_pcm.bitsPerSample    = SL_PCMSAMPLEFORMAT_FIXED_16;
+	format_pcm.containerSize    = SL_PCMSAMPLEFORMAT_FIXED_16;
+	format_pcm.channelMask      = SL_SPEAKER_FRONT_LEFT | SL_SPEAKER_FRONT_RIGHT;
+	format_pcm.endianness       = SL_BYTEORDER_LITTLEENDIAN;
+
+	SLDataSource audioSrc = {&loc_bufq, &format_pcm};
+
+	// configure audio sink
+	SLDataLocator_OutputMix loc_outmix = {
+		SL_DATALOCATOR_OUTPUTMIX,
+		sys->outputMixObject
+	};
+	SLDataSink audioSnk = {&loc_outmix, NULL};
+
+	//create audio player
+	const SLInterfaceID ids2[] = { SL_IID_ANDROIDSIMPLEBUFFERQUEUE, SL_IID_VOLUME };
+	static const SLboolean req2[] = { SL_BOOLEAN_TRUE, SL_BOOLEAN_TRUE };
+
+	result = CreateAudioPlayer(sys->engineEngine, &sys->playerObject, &audioSrc,
+								&audioSnk, sizeof(ids2) / sizeof(*ids2),
+								ids2, req2);
+	CHECK_OPENSL_ERROR("Failed to create audio player");
+
+	result = Realize(sys->playerObject, SL_BOOLEAN_FALSE);
+	CHECK_OPENSL_ERROR("Failed to realize player object.");
+
+	result = GetInterface(sys->playerObject, SL_IID_PLAY, &sys->playerPlay);
+	CHECK_OPENSL_ERROR("Failed to get player interface.");
+
+	result = GetInterface(sys->playerObject, SL_IID_VOLUME, &sys->volumeItf);
+	CHECK_OPENSL_ERROR("failed to get volume interface.");
+
+	result = GetInterface(sys->playerObject, SL_IID_ANDROIDSIMPLEBUFFERQUEUE,
+												  &sys->playerBufferQueue);
+	CHECK_OPENSL_ERROR("Failed to get buff queue interface");
+
+	result = RegisterCallback(sys->playerBufferQueue, PlayedCallback, (void*) u);
+	CHECK_OPENSL_ERROR("Failed to register buff queue callback.");
+
+	// set the player's state to playing
+	result = SetPlayState(sys->playerPlay, SL_PLAYSTATE_PLAYING);
+	CHECK_OPENSL_ERROR("Failed to switch to playing state");
+
+	/* XXX: rounding shouldn't affect us at normal sampling rate */
+	sys->samples_per_buf = OPENSLES_BUFLEN * u->rate / 1000;
+	sys->buf = pa_xmalloc(sys->samples_per_buf * bytesPerSample() * OPENSLES_BUFFERS);
+
+	sys->started = false;
+	sys->next_buf = 0;
+
+	// Finish initializing PulseAudio sink
 	pa_sink_new_data_init(&data);
 	data.driver = __FILE__;
 	data.module = m;
@@ -361,11 +442,16 @@ int pa__init(pa_module *m) {
 	pa_sink_set_rtpoll(u->sink, u->rtpoll);
 
 	u->bytes_dropped = 0;
-	u->buffer_size = 8192;
-	//u->buffer_size = pa_frame_align(pa_pipe_buf(u->fd), &u->sink->sample_spec);
+
+	int buffer_size_ms = 100;
+	if (getenv("AUDIO_BUFFER_SIZE_MS") != NULL && atoi(getenv("AUDIO_BUFFER_SIZE_MS")) > 0) {
+		buffer_size_ms = atoi(getenv("AUDIO_BUFFER_SIZE_MS"));
+	}
+	u->buffer_size = pa_frame_align(pa_bytes_per_second(&u->sink->sample_spec) * buffer_size_ms / 1000, &u->sink->sample_spec);
 	pa_sink_set_fixed_latency(u->sink, pa_bytes_to_usec(u->buffer_size, &u->sink->sample_spec));
 	thread_routine = thread_func;
 	pa_sink_set_max_request(u->sink, u->buffer_size);
+	pa_log("OpenSLES buffer size = %d bytes / %d milliseconds, change with setenv AUDIO_BUFFER_SIZE_MS", u->buffer_size, buffer_size_ms);
 
 	if (!(u->thread = pa_thread_new("opensles-sink", thread_routine, u))) {
 		pa_log("Failed to create thread.");
@@ -379,10 +465,24 @@ int pa__init(pa_module *m) {
 	return 0;
 
 fail:
+error:
 	if (ma)
 		pa_modargs_free(ma);
 
 	pa__done(m);
+
+	if (sys->playerObject) {
+		Destroy(sys->playerObject);
+		sys->playerObject = NULL;
+		sys->playerBufferQueue = NULL;
+		sys->volumeItf = NULL;
+		sys->playerPlay = NULL;
+	}
+
+	if (sys->outputMixObject)
+		Destroy(sys->outputMixObject);
+	if (sys->engineObject)
+		Destroy(sys->engineObject);
 
 	return -1;
 }
@@ -404,6 +504,16 @@ void pa__done(pa_module *m) {
 	if (!(u = m->userdata))
 		return;
 
+	// Stop OpenSL ES audio playback
+	struct userdata *sys = u; // Just an alias, so I won't need to modify copypasted code
+
+	SetPlayState(sys->playerPlay, SL_PLAYSTATE_STOPPED);
+	//Flush remaining buffers if any.
+	Clear(sys->playerBufferQueue);
+
+	Destroy(sys->playerObject);
+	sys->playerObject = NULL;
+
 	if (u->sink)
 		pa_sink_unlink(u->sink);
 
@@ -411,6 +521,8 @@ void pa__done(pa_module *m) {
 		pa_asyncmsgq_send(u->thread_mq.inq, NULL, PA_MESSAGE_SHUTDOWN, NULL, 0, NULL);
 		pa_thread_free(u->thread);
 	}
+
+	pa_xfree(sys->buf);
 
 	pa_thread_mq_done(&u->thread_mq);
 
