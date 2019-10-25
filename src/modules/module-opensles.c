@@ -165,7 +165,7 @@ static int sink_process_msg(pa_msgobject *o, int code, void *data, int64_t offse
 
 			*((int64_t*) data) = pa_bytes_to_usec(n, &u->sink->sample_spec);
 
-			pa_log_debug("PA_SINK_MESSAGE_GET_LATENCY %lld", *((int64_t*) data));
+			//pa_log_debug("PA_SINK_MESSAGE_GET_LATENCY %lld", *((int64_t*) data));
 
 			return 0;
 		}
@@ -218,13 +218,6 @@ static int process_render(struct userdata *u, bool opened) {
 		return 0;
 	}
 
-	/*
-	if (st.count >= OPENSLES_BUFFERS) {
-		pa_log("st.count == OPENSLES_BUFFERS in %s", __func__);
-		return -1;
-	}
-	*/
-
 	if (opened) {
 		pa_sink_render_full(u->sink, unit_size, &u->memchunk);
 
@@ -243,7 +236,7 @@ static int process_render(struct userdata *u, bool opened) {
 	result = Enqueue(sys->playerBufferQueue,
 		&sys->buf[unit_size * sys->next_buf], unit_size);
 
-	pa_log_debug("Play %d bytes, pos %d result %d data %x st.count %d st.index %d", (int) unit_size, (int) (unit_size * sys->next_buf), (int) result, * ((int *) &sys->buf[unit_size * sys->next_buf]), (int) st.count, (int) st.index);
+	//pa_log_debug("Play %d bytes, pos %d result %d data %x st.count %d st.index %d", (int) unit_size, (int) (unit_size * sys->next_buf), (int) result, * ((int *) &sys->buf[unit_size * sys->next_buf]), (int) st.count, (int) st.index);
 
 	if (result == SL_RESULT_SUCCESS) {
 		sys->next_buf += 1;
@@ -272,18 +265,12 @@ static void thread_func(void *userdata) {
 	for (;;) {
 		int ret;
 
-		//pa_log_debug("%s:%d", __func__, __LINE__);
-
 		if (PA_UNLIKELY(u->sink->thread_info.rewind_requested))
 			pa_sink_process_rewind(u->sink, 0);
-
-		//pa_log_debug("%s:%d", __func__, __LINE__);
 
 		/* Render some data and write it */
 		if (process_render(u, PA_SINK_IS_OPENED(u->sink->thread_info.state)) < 0)
 			goto fail;
-
-		//pa_log_debug("%s:%d", __func__, __LINE__);
 
 		if ((ret = pa_rtpoll_run(u->rtpoll)) < 0)
 			goto fail;
@@ -310,7 +297,7 @@ static void PlayedCallback (SLAndroidSimpleBufferQueueItf caller, void *pContext
 
 	pa_assert (caller == sys->playerBufferQueue);
 
-	pa_log_debug("%s", __func__);
+	//pa_log_debug("%s", __func__);
 	// Unblock pa_rtpoll_run()
 	pa_asyncmsgq_send(u->rtpoll_msgq, PA_MSGOBJECT(u->sink), SINK_MESSAGE_RENDER, NULL, 0, NULL);
 }
