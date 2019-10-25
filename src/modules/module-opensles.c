@@ -214,7 +214,7 @@ static int process_render(struct userdata *u, bool opened) {
 		return -1;
 	}
 
-	if (st.count > 2) {
+	if (st.count >= 2) {
 		return 0;
 	}
 
@@ -465,7 +465,7 @@ int pa__init(pa_module *m) {
 
 	u->bytes_dropped = 0;
 
-	int buffer_size_ms = 100;
+	int buffer_size_ms = 20;
 	if (getenv("AUDIO_BUFFER_SIZE_MS") != NULL && atoi(getenv("AUDIO_BUFFER_SIZE_MS")) > 0) {
 		buffer_size_ms = atoi(getenv("AUDIO_BUFFER_SIZE_MS"));
 	}
