@@ -117,9 +117,6 @@ struct userdata {
 
 	pa_memchunk memchunk;
 
-	pa_usec_t block_usec;
-	pa_usec_t timestamp;
-
 	/* OpenSL objects */
 	SLObjectItf                     engineObject;
 	SLObjectItf                     outputMixObject;
@@ -149,9 +146,7 @@ static int sink_process_msg(pa_msgobject *o, int code, void *data, int64_t offse
 		{
 			size_t n = 0;
 
-			// n = latency in bytes
-
-			n += u->memchunk.length;
+			n += u->samples_per_buf * bytesPerSample();
 
 			*((int64_t*) data) = pa_bytes_to_usec(n, &u->sink->sample_spec);
 			return 0;
@@ -169,8 +164,8 @@ static int sink_set_state_in_io_thread_cb(pa_sink *s, pa_sink_state_t new_state,
 	pa_assert_se(u = s->userdata);
 
 	if (s->thread_info.state == PA_SINK_SUSPENDED || s->thread_info.state == PA_SINK_INIT) {
-		if (PA_SINK_IS_OPENED(new_state))
-			u->timestamp = pa_rtclock_now();
+		if (PA_SINK_IS_OPENED(new_state)) {
+		}
 	} else if (PA_SINK_IS_OPENED(s->thread_info.state)) {
 		if (new_state == PA_SINK_SUSPENDED) {
 			/* Continuously dropping data (clear counter on entering suspended state. */
@@ -184,7 +179,7 @@ static int sink_set_state_in_io_thread_cb(pa_sink *s, pa_sink_state_t new_state,
 	return 0;
 }
 
-static int process_render(struct userdata *u) {
+static int process_render(struct userdata *u, bool opened) {
 	pa_assert(u);
 
 	struct userdata *sys = u; // Just an alias, so I won't need to modify copypasted code
@@ -192,16 +187,20 @@ static int process_render(struct userdata *u) {
 	void *p;
 	SLresult result;
 
-	pa_sink_render_full(u->sink, unit_size, &u->memchunk);
+	if (opened) {
+		pa_sink_render_full(u->sink, unit_size, &u->memchunk);
 
-	pa_assert(u->memchunk.length > 0);
+		pa_assert(u->memchunk.length > 0);
 
-	p = pa_memblock_acquire(u->memchunk.memblock);
-	memcpy(&sys->buf[unit_size * sys->next_buf], (uint8_t*) p + u->memchunk.index, u->memchunk.length);
-	pa_memblock_release(u->memchunk.memblock);
+		p = pa_memblock_acquire(u->memchunk.memblock);
+		memcpy(&sys->buf[unit_size * sys->next_buf], (uint8_t*) p + u->memchunk.index, u->memchunk.length);
+		pa_memblock_release(u->memchunk.memblock);
 
-	pa_memblock_unref(u->memchunk.memblock);
-	pa_memchunk_reset(&u->memchunk);
+		pa_memblock_unref(u->memchunk.memblock);
+		pa_memchunk_reset(&u->memchunk);
+	} else {
+		pa_silence_memory(&sys->buf[unit_size * sys->next_buf], unit_size, &u->sink->sample_spec);
+	}
 
 	SLAndroidSimpleBufferQueueState st;
 	result = GetState(sys->playerBufferQueue, &st);
@@ -210,16 +209,19 @@ static int process_render(struct userdata *u) {
 		return -1;
 	}
 
-	if (st.count == OPENSLES_BUFFERS)
+	if (st.count == OPENSLES_BUFFERS) {
+		pa_log("st.count == OPENSLES_BUFFERS in %s", __func__);
 		return -1;
+	}
 
 	result = Enqueue(sys->playerBufferQueue,
 		&sys->buf[unit_size * sys->next_buf], unit_size);
 
-	pa_log_debug("Play %d bytes, pos %d result %d data %x", unit_size, (int)(unit_size * sys->next_buf), (int) result, * ((int *) &sys->buf[unit_size * sys->next_buf]));
+	pa_log_debug("Play %d bytes, pos %d result %d data %x stream opened %d", unit_size, (int)(unit_size * sys->next_buf), (int) result, * ((int *) &sys->buf[unit_size * sys->next_buf]), opened);
 
 	if (result == SL_RESULT_SUCCESS) {
-		if (++sys->next_buf == OPENSLES_BUFFERS)
+		sys->next_buf += 1;
+		if (sys->next_buf >= OPENSLES_BUFFERS)
 			sys->next_buf = 0;
 	} else {
 		/* XXX : if writing fails, we don't retry */
@@ -244,14 +246,18 @@ static void thread_func(void *userdata) {
 	for (;;) {
 		int ret;
 
+		pa_log_debug("%s:%d", __func__, __LINE__);
+
 		if (PA_UNLIKELY(u->sink->thread_info.rewind_requested))
 			pa_sink_process_rewind(u->sink, 0);
 
-		/* Render some data and write it to the fifo */
-		if (PA_SINK_IS_OPENED(u->sink->thread_info.state)) {
-			if (process_render(u) < 0)
-				goto fail;
-		}
+		pa_log_debug("%s:%d", __func__, __LINE__);
+
+		/* Render some data and write it */
+		if (process_render(u, PA_SINK_IS_OPENED(u->sink->thread_info.state)) < 0)
+			goto fail;
+
+		pa_log_debug("%s:%d", __func__, __LINE__);
 
 		if ((ret = pa_rtpoll_run(u->rtpoll)) < 0)
 			goto fail;
@@ -261,6 +267,7 @@ static void thread_func(void *userdata) {
 	}
 
 fail:
+	pa_log_debug("pa_rtpoll_run() failed");
 	/* If this was no regular exit from the loop we have to continue
 	 * processing messages until we received PA_MESSAGE_SHUTDOWN */
 	pa_asyncmsgq_post(u->thread_mq.outq, PA_MSGOBJECT(u->core), PA_CORE_MESSAGE_UNLOAD_MODULE, u->module, 0, NULL, NULL);
@@ -277,6 +284,7 @@ static void PlayedCallback (SLAndroidSimpleBufferQueueItf caller, void *pContext
 
 	pa_assert (caller == sys->playerBufferQueue);
 
+	//pa_log_debug("%s", __func__);
 }
 
 int pa__init(pa_module *m) {
@@ -388,8 +396,8 @@ int pa__init(pa_module *m) {
 												  &sys->playerBufferQueue);
 	CHECK_OPENSL_ERROR("Failed to get buff queue interface");
 
-	result = RegisterCallback(sys->playerBufferQueue, PlayedCallback, (void*) u);
-	CHECK_OPENSL_ERROR("Failed to register buff queue callback.");
+	//result = RegisterCallback(sys->playerBufferQueue, PlayedCallback, (void*) u);
+	//CHECK_OPENSL_ERROR("Failed to register buff queue callback.");
 
 	// set the player's state to playing
 	result = SetPlayState(sys->playerPlay, SL_PLAYSTATE_PLAYING);
