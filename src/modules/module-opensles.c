@@ -152,8 +152,16 @@ static int sink_process_msg(pa_msgobject *o, int code, void *data, int64_t offse
 		case PA_SINK_MESSAGE_GET_LATENCY:
 		{
 			size_t n = 0;
+			SLresult result;
+			SLAndroidSimpleBufferQueueState st;
 
-			n += u->samples_per_buf * bytesPerSample();
+			result = GetState(u->playerBufferQueue, &st);
+			if (PA_UNLIKELY(result != SL_RESULT_SUCCESS)) {
+				pa_log("Could not query buffer queue state in %s (%d)", __func__, (int)result);
+				return -1;
+			}
+
+			n = u->samples_per_buf * bytesPerSample() * st.count;
 
 			*((int64_t*) data) = pa_bytes_to_usec(n, &u->sink->sample_spec);
 
@@ -199,6 +207,24 @@ static int process_render(struct userdata *u, bool opened) {
 	void *p;
 	SLresult result;
 
+	SLAndroidSimpleBufferQueueState st;
+	result = GetState(sys->playerBufferQueue, &st);
+	if (PA_UNLIKELY(result != SL_RESULT_SUCCESS)) {
+		pa_log("Could not query buffer queue state in %s (%d)", __func__, (int)result);
+		return -1;
+	}
+
+	if (st.count > 2) {
+		return 0;
+	}
+
+	/*
+	if (st.count >= OPENSLES_BUFFERS) {
+		pa_log("st.count == OPENSLES_BUFFERS in %s", __func__);
+		return -1;
+	}
+	*/
+
 	if (opened) {
 		pa_sink_render_full(u->sink, unit_size, &u->memchunk);
 
@@ -213,20 +239,6 @@ static int process_render(struct userdata *u, bool opened) {
 	} else {
 		pa_silence_memory(&sys->buf[unit_size * sys->next_buf], unit_size, &u->sink->sample_spec);
 	}
-
-	SLAndroidSimpleBufferQueueState st;
-	result = GetState(sys->playerBufferQueue, &st);
-	if (PA_UNLIKELY(result != SL_RESULT_SUCCESS)) {
-		pa_log("Could not query buffer queue state in %s (%d)", __func__, (int)result);
-		return -1;
-	}
-
-	/*
-	if (st.count >= OPENSLES_BUFFERS) {
-		pa_log("st.count == OPENSLES_BUFFERS in %s", __func__);
-		return -1;
-	}
-	*/
 
 	result = Enqueue(sys->playerBufferQueue,
 		&sys->buf[unit_size * sys->next_buf], unit_size);
