@@ -216,7 +216,7 @@ static int process_render(struct userdata *u) {
 	result = Enqueue(sys->playerBufferQueue,
 		&sys->buf[unit_size * sys->next_buf], unit_size);
 
-	//pa_log_debug("Play %d bytes, pos %d result %d data %x", unit_size, (int)(unit_size * sys->next_buf), (int) result, * ((int *) &sys->buf[unit_size * sys->next_buf]));
+	pa_log_debug("Play %d bytes, pos %d result %d data %x", unit_size, (int)(unit_size * sys->next_buf), (int) result, * ((int *) &sys->buf[unit_size * sys->next_buf]));
 
 	if (result == SL_RESULT_SUCCESS) {
 		if (++sys->next_buf == OPENSLES_BUFFERS)

@@ -46,10 +46,11 @@ trap "trap_ctrlc" 2
 
 {
 	sleep 2
-	env PULSE_SERVER=tcp:192.168.42.129:4713 paplay music.ogg
+	#env PULSE_SERVER=tcp:192.168.42.129:4713 paplay music.ogg
+	env PULSE_SERVER=tcp:192.168.42.129:4713 pavucontrol
 } &
 
 adb shell "cd /data/local/tmp ; HOME=/data/local/tmp TMPDIR=/data/local/tmp LD_LIBRARY_PATH=/data/local/tmp \
 	./pulseaudio --disable-shm -n -F pulseaudio.conf --dl-search-path=/data/local/tmp \
-	--daemonize=false --use-pid-file=false --log-target=stderr --log-level=debug --exit-idle-time=0 --disallow-exit"
+	--daemonize=false --use-pid-file=false --log-target=stderr --log-level=debug --exit-idle-time=31622400 --disallow-exit"
 
