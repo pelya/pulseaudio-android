@@ -72,6 +72,10 @@ static const char* const valid_modargs[] = {
 	NULL
 };
 
+enum {
+    SINK_MESSAGE_RENDER = PA_SINK_MESSAGE_MAX,
+};
+
 #define DEFAULT_SINK_NAME "opensles"
 
 #define OPENSLES_BUFFERS 255 /* maximum number of buffers */
@@ -117,6 +121,9 @@ struct userdata {
 
 	pa_memchunk memchunk;
 
+	pa_rtpoll_item *rtpoll_item;
+	pa_asyncmsgq *rtpoll_msgq;
+
 	/* OpenSL objects */
 	SLObjectItf                     engineObject;
 	SLObjectItf                     outputMixObject;
@@ -149,8 +156,13 @@ static int sink_process_msg(pa_msgobject *o, int code, void *data, int64_t offse
 			n += u->samples_per_buf * bytesPerSample();
 
 			*((int64_t*) data) = pa_bytes_to_usec(n, &u->sink->sample_spec);
+
+			pa_log_debug("PA_SINK_MESSAGE_GET_LATENCY %lld", *((int64_t*) data));
+
 			return 0;
 		}
+		case SINK_MESSAGE_RENDER:
+			return 0;
 	}
 
 	return pa_sink_process_msg(o, code, data, offset, chunk);
@@ -209,15 +221,17 @@ static int process_render(struct userdata *u, bool opened) {
 		return -1;
 	}
 
-	if (st.count == OPENSLES_BUFFERS) {
+	/*
+	if (st.count >= OPENSLES_BUFFERS) {
 		pa_log("st.count == OPENSLES_BUFFERS in %s", __func__);
 		return -1;
 	}
+	*/
 
 	result = Enqueue(sys->playerBufferQueue,
 		&sys->buf[unit_size * sys->next_buf], unit_size);
 
-	pa_log_debug("Play %d bytes, pos %d result %d data %x stream opened %d", unit_size, (int)(unit_size * sys->next_buf), (int) result, * ((int *) &sys->buf[unit_size * sys->next_buf]), opened);
+	pa_log_debug("Play %d bytes, pos %d result %d data %x st.count %d st.index %d", (int) unit_size, (int) (unit_size * sys->next_buf), (int) result, * ((int *) &sys->buf[unit_size * sys->next_buf]), (int) st.count, (int) st.index);
 
 	if (result == SL_RESULT_SUCCESS) {
 		sys->next_buf += 1;
@@ -246,18 +260,18 @@ static void thread_func(void *userdata) {
 	for (;;) {
 		int ret;
 
-		pa_log_debug("%s:%d", __func__, __LINE__);
+		//pa_log_debug("%s:%d", __func__, __LINE__);
 
 		if (PA_UNLIKELY(u->sink->thread_info.rewind_requested))
 			pa_sink_process_rewind(u->sink, 0);
 
-		pa_log_debug("%s:%d", __func__, __LINE__);
+		//pa_log_debug("%s:%d", __func__, __LINE__);
 
 		/* Render some data and write it */
 		if (process_render(u, PA_SINK_IS_OPENED(u->sink->thread_info.state)) < 0)
 			goto fail;
 
-		pa_log_debug("%s:%d", __func__, __LINE__);
+		//pa_log_debug("%s:%d", __func__, __LINE__);
 
 		if ((ret = pa_rtpoll_run(u->rtpoll)) < 0)
 			goto fail;
@@ -280,11 +294,13 @@ finish:
 static void PlayedCallback (SLAndroidSimpleBufferQueueItf caller, void *pContext)
 {
 	(void)caller;
-	struct userdata *sys = (struct userdata *)pContext;
+	struct userdata *u = (struct userdata *)pContext;
 
 	pa_assert (caller == sys->playerBufferQueue);
 
-	//pa_log_debug("%s", __func__);
+	pa_log_debug("%s", __func__);
+	// Unblock pa_rtpoll_run()
+	pa_asyncmsgq_send(u->rtpoll_msgq, PA_MSGOBJECT(u->sink), SINK_MESSAGE_RENDER, NULL, 0, NULL);
 }
 
 int pa__init(pa_module *m) {
@@ -323,6 +339,14 @@ int pa__init(pa_module *m) {
 		pa_log("pa_thread_mq_init() failed.");
 		goto fail;
 	}
+
+	u->rtpoll_msgq = pa_asyncmsgq_new(0);
+	if (!u->rtpoll_msgq) {
+		pa_log("pa_thread_mq_init() failed.");
+		goto fail;
+	}
+
+	u->rtpoll_item = pa_rtpoll_item_new_asyncmsgq_read(u->rtpoll, PA_RTPOLL_EARLY-1, u->rtpoll_msgq);
 
 	if (getenv("AUDIO_NATIVE_SAMPLE_RATE") != NULL && atoi(getenv("AUDIO_NATIVE_SAMPLE_RATE")) > 0) {
 		ss.rate = atoi(getenv("AUDIO_NATIVE_SAMPLE_RATE"));
@@ -396,8 +420,8 @@ int pa__init(pa_module *m) {
 												  &sys->playerBufferQueue);
 	CHECK_OPENSL_ERROR("Failed to get buff queue interface");
 
-	//result = RegisterCallback(sys->playerBufferQueue, PlayedCallback, (void*) u);
-	//CHECK_OPENSL_ERROR("Failed to register buff queue callback.");
+	result = RegisterCallback(sys->playerBufferQueue, PlayedCallback, (void*) u);
+	CHECK_OPENSL_ERROR("Failed to register buff queue callback.");
 
 	// set the player's state to playing
 	result = SetPlayState(sys->playerPlay, SL_PLAYSTATE_PLAYING);
@@ -536,6 +560,12 @@ void pa__done(pa_module *m) {
 
 	if (u->memchunk.memblock)
 		pa_memblock_unref(u->memchunk.memblock);
+
+	if (u->rtpoll_item)
+		pa_rtpoll_item_free(u->rtpoll_item);
+
+	if (u->rtpoll_msgq)
+		pa_asyncmsgq_unref(u->rtpoll_msgq);
 
 	if (u->rtpoll)
 		pa_rtpoll_free(u->rtpoll);
