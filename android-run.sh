@@ -51,5 +51,5 @@ trap "trap_ctrlc" 2
 
 adb shell "cd /data/local/tmp ; HOME=/data/local/tmp TMPDIR=/data/local/tmp LD_LIBRARY_PATH=/data/local/tmp \
 	./pulseaudio --disable-shm -n -F pulseaudio.conf --dl-search-path=/data/local/tmp \
-	--daemonize=false --use-pid-file=false --log-target=stderr --log-level=debug"
+	--daemonize=false --use-pid-file=false --log-target=stderr --log-level=debug --exit-idle-time=0 --disallow-exit"
 

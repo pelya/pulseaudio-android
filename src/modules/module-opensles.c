@@ -134,9 +134,6 @@ struct userdata {
 	int                             next_buf;
 
 	int                             rate;
-
-	/* if we can measure latency already */
-	bool                            started;
 };
 
 static int bytesPerSample(void)
@@ -219,6 +216,8 @@ static int process_render(struct userdata *u) {
 	result = Enqueue(sys->playerBufferQueue,
 		&sys->buf[unit_size * sys->next_buf], unit_size);
 
+	//pa_log_debug("Play %d bytes, pos %d result %d data %x", unit_size, (int)(unit_size * sys->next_buf), (int) result, * ((int *) &sys->buf[unit_size * sys->next_buf]));
+
 	if (result == SL_RESULT_SUCCESS) {
 		if (++sys->next_buf == OPENSLES_BUFFERS)
 			sys->next_buf = 0;
@@ -278,9 +277,6 @@ static void PlayedCallback (SLAndroidSimpleBufferQueueItf caller, void *pContext
 
 	pa_assert (caller == sys->playerBufferQueue);
 
-	//vlc_mutex_lock(&sys->lock);
-	sys->started = true;
-	//vlc_mutex_unlock(&sys->lock);
 }
 
 int pa__init(pa_module *m) {
@@ -403,7 +399,6 @@ int pa__init(pa_module *m) {
 	sys->samples_per_buf = OPENSLES_BUFLEN * u->rate / 1000;
 	sys->buf = pa_xmalloc(sys->samples_per_buf * bytesPerSample() * OPENSLES_BUFFERS);
 
-	sys->started = false;
 	sys->next_buf = 0;
 
 	// Finish initializing PulseAudio sink
