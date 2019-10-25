@@ -1,7 +1,8 @@
 /***
   This file is part of PulseAudio.
 
-  Copyright 2004-2008 Lennart Poettering
+  Copyright 2019 Sergii Pylypenko
+  Copyright 2019 VideoLAN
 
   PulseAudio is free software; you can redistribute it and/or modify
   it under the terms of the GNU Lesser General Public License as published
@@ -124,7 +125,6 @@ struct userdata {
 	SLObjectItf                     outputMixObject;
 	SLAndroidSimpleBufferQueueItf   playerBufferQueue;
 	SLObjectItf                     playerObject;
-	SLVolumeItf                     volumeItf;
 	SLEngineItf                     engineEngine;
 	SLPlayItf                       playerPlay;
 
@@ -342,10 +342,8 @@ int pa__init(pa_module *m) {
 	result = GetInterface(sys->engineObject, SL_IID_ENGINE, &sys->engineEngine);
 	CHECK_OPENSL_ERROR("Failed to get the engine interface");
 
-	// create output mix, with environmental reverb specified as a non-required interface
-	const SLInterfaceID ids1[] = { SL_IID_VOLUME };
-	const SLboolean req1[] = { SL_BOOLEAN_FALSE };
-	result = CreateOutputMix(sys->engineEngine, &sys->outputMixObject, 1, ids1, req1);
+	// create output mix
+	result = CreateOutputMix(sys->engineEngine, &sys->outputMixObject, 0, NULL, NULL);
 	CHECK_OPENSL_ERROR("Failed to create output mix");
 
 	// realize the output mix in synchronous mode
@@ -377,12 +375,11 @@ int pa__init(pa_module *m) {
 	SLDataSink audioSnk = {&loc_outmix, NULL};
 
 	//create audio player
-	const SLInterfaceID ids2[] = { SL_IID_ANDROIDSIMPLEBUFFERQUEUE, SL_IID_VOLUME };
-	static const SLboolean req2[] = { SL_BOOLEAN_TRUE, SL_BOOLEAN_TRUE };
+	const SLInterfaceID ids2[] = { SL_IID_ANDROIDSIMPLEBUFFERQUEUE };
+	static const SLboolean req2[] = { SL_BOOLEAN_TRUE };
 
 	result = CreateAudioPlayer(sys->engineEngine, &sys->playerObject, &audioSrc,
-								&audioSnk, sizeof(ids2) / sizeof(*ids2),
-								ids2, req2);
+								&audioSnk, 1, ids2, req2);
 	CHECK_OPENSL_ERROR("Failed to create audio player");
 
 	result = Realize(sys->playerObject, SL_BOOLEAN_FALSE);
@@ -390,9 +387,6 @@ int pa__init(pa_module *m) {
 
 	result = GetInterface(sys->playerObject, SL_IID_PLAY, &sys->playerPlay);
 	CHECK_OPENSL_ERROR("Failed to get player interface.");
-
-	result = GetInterface(sys->playerObject, SL_IID_VOLUME, &sys->volumeItf);
-	CHECK_OPENSL_ERROR("failed to get volume interface.");
 
 	result = GetInterface(sys->playerObject, SL_IID_ANDROIDSIMPLEBUFFERQUEUE,
 												  &sys->playerBufferQueue);
@@ -484,7 +478,6 @@ error:
 		Destroy(sys->playerObject);
 		sys->playerObject = NULL;
 		sys->playerBufferQueue = NULL;
-		sys->volumeItf = NULL;
 		sys->playerPlay = NULL;
 	}
 
