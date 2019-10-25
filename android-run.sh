@@ -44,8 +44,10 @@ trap_ctrlc () {
 # when signal 2 (SIGINT) is received
 trap "trap_ctrlc" 2
 
-echo "Now run in other terminal:"
-echo "env PULSE_SERVER=tcp:192.168.42.129:4712 paplay music.ogg"
+{
+	sleep 2
+	env PULSE_SERVER=tcp:192.168.42.129:4713 paplay music.ogg
+} &
 
 adb shell "cd /data/local/tmp ; HOME=/data/local/tmp TMPDIR=/data/local/tmp LD_LIBRARY_PATH=/data/local/tmp \
 	./pulseaudio --disable-shm -n -F pulseaudio.conf --dl-search-path=/data/local/tmp \

@@ -190,45 +190,47 @@ static int sink_set_state_in_io_thread_cb(pa_sink *s, pa_sink_state_t new_state,
 static int process_render(struct userdata *u) {
 	pa_assert(u);
 
-	if (u->memchunk.length <= 0)
-		pa_sink_render(u->sink, u->buffer_size, &u->memchunk);
+	struct userdata *sys = u; // Just an alias, so I won't need to modify copypasted code
+	const size_t unit_size = sys->samples_per_buf * bytesPerSample();
+	void *p;
+	SLresult result;
+
+	pa_sink_render_full(u->sink, unit_size, &u->memchunk);
 
 	pa_assert(u->memchunk.length > 0);
 
-	for (;;) {
-		ssize_t l = -1;
-		void *p;
+	p = pa_memblock_acquire(u->memchunk.memblock);
+	memcpy(&sys->buf[unit_size * sys->next_buf], (uint8_t*) p + u->memchunk.index, u->memchunk.length);
+	pa_memblock_release(u->memchunk.memblock);
 
-		p = pa_memblock_acquire(u->memchunk.memblock);
-		//l = pa_write(u->fd, (uint8_t*) p + u->memchunk.index, u->memchunk.length, &u->write_type);
-		pa_memblock_release(u->memchunk.memblock);
+	pa_memblock_unref(u->memchunk.memblock);
+	pa_memchunk_reset(&u->memchunk);
 
-		pa_assert(l != 0);
-
-		if (l < 0) {
-
-			if (errno == EINTR)
-				continue;
-			else if (errno == EAGAIN)
-				return 0;
-			else {
-				pa_log("Failed to write data to FIFO: %s", pa_cstrerror(errno));
-				return -1;
-			}
-
-		} else {
-
-			u->memchunk.index += (size_t) l;
-			u->memchunk.length -= (size_t) l;
-
-			if (u->memchunk.length <= 0) {
-				pa_memblock_unref(u->memchunk.memblock);
-				pa_memchunk_reset(&u->memchunk);
-			}
-		}
-
-		return 0;
+	SLAndroidSimpleBufferQueueState st;
+	result = GetState(sys->playerBufferQueue, &st);
+	if (PA_UNLIKELY(result != SL_RESULT_SUCCESS)) {
+		pa_log("Could not query buffer queue state in %s (%d)", __func__, (int)result);
+		return -1;
 	}
+
+	if (st.count == OPENSLES_BUFFERS)
+		return -1;
+
+	result = Enqueue(sys->playerBufferQueue,
+		&sys->buf[unit_size * sys->next_buf], unit_size);
+
+	if (result == SL_RESULT_SUCCESS) {
+		if (++sys->next_buf == OPENSLES_BUFFERS)
+			sys->next_buf = 0;
+	} else {
+		/* XXX : if writing fails, we don't retry */
+		pa_log("error %d when writing %d bytes %s",
+				(int)result, (int)unit_size,
+				(result == SL_RESULT_BUFFER_INSUFFICIENT) ? " (buffer insufficient)" : "");
+		return -1;
+	}
+
+	return 0;
 }
 
 static void thread_func(void *userdata) {
@@ -283,10 +285,10 @@ static void PlayedCallback (SLAndroidSimpleBufferQueueItf caller, void *pContext
 
 int pa__init(pa_module *m) {
 	struct userdata *u;
+	struct userdata *sys = NULL;
 	pa_sample_spec ss;
 	pa_channel_map map;
 	pa_modargs *ma;
-	struct pollfd *pollfd;
 	pa_sink_new_data data;
 	pa_thread_func_t thread_routine;
 	SLresult result;
@@ -306,6 +308,7 @@ int pa__init(pa_module *m) {
 	}
 
 	u = pa_xnew0(struct userdata, 1);
+	sys = u; // Just an alias, so I won't need to modify copypasted code
 	u->core = m->core;
 	u->module = m;
 	m->userdata = u;
@@ -319,14 +322,13 @@ int pa__init(pa_module *m) {
 
 	if (getenv("AUDIO_NATIVE_SAMPLE_RATE") != NULL && atoi(getenv("AUDIO_NATIVE_SAMPLE_RATE")) > 0) {
 		ss.rate = atoi(getenv("AUDIO_NATIVE_SAMPLE_RATE"));
-		pa_log("Configure native sample rate %d", ss.rate);
+		pa_log("Native audio sample rate %d", ss.rate);
 	}
 	u->rate = ss.rate;
 	ss.format = PA_SAMPLE_S16LE;
 	ss.channels = 2;
 
 	// Init OpenSL ES
-	struct userdata *sys = u; // Just an alias, so I won't need to modify copypasted code
 
 	// create engine
 	result = slCreateEngine(&sys->engineObject, 0, NULL, 0, NULL, NULL);
@@ -447,11 +449,18 @@ int pa__init(pa_module *m) {
 	if (getenv("AUDIO_BUFFER_SIZE_MS") != NULL && atoi(getenv("AUDIO_BUFFER_SIZE_MS")) > 0) {
 		buffer_size_ms = atoi(getenv("AUDIO_BUFFER_SIZE_MS"));
 	}
-	u->buffer_size = pa_frame_align(pa_bytes_per_second(&u->sink->sample_spec) * buffer_size_ms / 1000, &u->sink->sample_spec);
+	u->buffer_size = pa_bytes_per_second(&u->sink->sample_spec) * buffer_size_ms / 1000;
+	// Align PulseAudio buffer size to OpenSL ES buf chunk size
+	u->buffer_size = (u->buffer_size / (sys->samples_per_buf * bytesPerSample())) * (sys->samples_per_buf * bytesPerSample());
+	u->buffer_size = pa_frame_align(u->buffer_size, &u->sink->sample_spec);
+	if (u->buffer_size % (sys->samples_per_buf * bytesPerSample()) != 0) {
+		pa_log("PulseAudio buffer size %d does not divide evenly by OpenSL ES buffer frame size %d", (int)u->buffer_size, (int)sys->samples_per_buf * bytesPerSample());
+		goto fail;
+	}
 	pa_sink_set_fixed_latency(u->sink, pa_bytes_to_usec(u->buffer_size, &u->sink->sample_spec));
 	thread_routine = thread_func;
 	pa_sink_set_max_request(u->sink, u->buffer_size);
-	pa_log("OpenSLES buffer size = %d bytes / %d milliseconds, change with setenv AUDIO_BUFFER_SIZE_MS", u->buffer_size, buffer_size_ms);
+	pa_log("OpenSLES buffer size = %d bytes = %d milliseconds, change with setenv AUDIO_BUFFER_SIZE_MS", (int) u->buffer_size, buffer_size_ms);
 
 	if (!(u->thread = pa_thread_new("opensles-sink", thread_routine, u))) {
 		pa_log("Failed to create thread.");
@@ -471,7 +480,7 @@ error:
 
 	pa__done(m);
 
-	if (sys->playerObject) {
+	if (sys && sys->playerObject) {
 		Destroy(sys->playerObject);
 		sys->playerObject = NULL;
 		sys->playerBufferQueue = NULL;
