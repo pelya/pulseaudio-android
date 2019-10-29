@@ -78,7 +78,7 @@ enum {
 
 #define DEFAULT_SINK_NAME "opensles"
 
-#define OPENSLES_BUFFERS 255 /* maximum number of buffers */
+#define OPENSLES_BUFFERS 11 /* maximum number of buffers */
 #define OPENSLES_BUFLEN  10   /* ms */
 /*
  * 10ms of precision when mesasuring latency should be enough,
@@ -117,7 +117,7 @@ struct userdata {
 	pa_rtpoll *rtpoll;
 
 	size_t buffer_size;
-	size_t bytes_dropped;
+	size_t buffer_count;
 
 	pa_memchunk memchunk;
 
@@ -134,16 +134,10 @@ struct userdata {
 
 	/* audio buffered through opensles */
 	uint8_t                        *buf;
-	size_t                          samples_per_buf;
 	int                             next_buf;
 
 	int                             rate;
 };
-
-static int bytesPerSample(void)
-{
-	return 2 /* S16 */ * 2 /* stereo */;
-}
 
 static int sink_process_msg(pa_msgobject *o, int code, void *data, int64_t offset, pa_memchunk *chunk) {
 	struct userdata *u = PA_SINK(o)->userdata;
@@ -161,7 +155,7 @@ static int sink_process_msg(pa_msgobject *o, int code, void *data, int64_t offse
 				return -1;
 			}
 
-			n = u->samples_per_buf * bytesPerSample() * st.count;
+			n = u->buffer_size * st.count;
 
 			*((int64_t*) data) = pa_bytes_to_usec(n, &u->sink->sample_spec);
 
@@ -174,6 +168,29 @@ static int sink_process_msg(pa_msgobject *o, int code, void *data, int64_t offse
 	}
 
 	return pa_sink_process_msg(o, code, data, offset, chunk);
+}
+
+static void sink_update_requested_latency_cb(pa_sink *s) {
+	struct userdata *u;
+	pa_usec_t block_usec;
+
+	pa_sink_assert_ref(s);
+	pa_assert_se(u = s->userdata);
+
+	block_usec = pa_sink_get_requested_latency_within_thread(s);
+
+	if (block_usec == (pa_usec_t) -1)
+		block_usec = s->thread_info.max_latency;
+
+	u->buffer_count = block_usec / 1000 / OPENSLES_BUFLEN;
+	if (u->buffer_count < 1)
+		u->buffer_count = 1;
+	if (u->buffer_count > OPENSLES_BUFFERS - 1)
+		u->buffer_count = OPENSLES_BUFFERS - 1;
+
+	pa_sink_set_max_request_within_thread(s, u->buffer_size * u->buffer_count);
+
+	pa_log("%s: set latency to %d usec = %d buffer chunks of %d ms", __func__, (int)block_usec, (int)u->buffer_count, OPENSLES_BUFLEN);
 }
 
 /* Called from the IO thread. */
@@ -189,10 +206,6 @@ static int sink_set_state_in_io_thread_cb(pa_sink *s, pa_sink_state_t new_state,
 	} else if (PA_SINK_IS_OPENED(s->thread_info.state)) {
 		if (new_state == PA_SINK_SUSPENDED) {
 			/* Continuously dropping data (clear counter on entering suspended state. */
-			if (u->bytes_dropped != 0) {
-				pa_log_debug("Pipe-sink continuously dropping data - clear statistics (%zu -> 0 bytes dropped)", u->bytes_dropped);
-				u->bytes_dropped = 0;
-			}
 		}
 	}
 
@@ -203,7 +216,6 @@ static int process_render(struct userdata *u, bool opened) {
 	pa_assert(u);
 
 	struct userdata *sys = u; // Just an alias, so I won't need to modify copypasted code
-	const size_t unit_size = sys->samples_per_buf * bytesPerSample();
 	void *p;
 	SLresult result;
 
@@ -214,29 +226,29 @@ static int process_render(struct userdata *u, bool opened) {
 		return -1;
 	}
 
-	if (st.count >= 2) {
+	if (st.count > u->buffer_count) {
 		return 0;
 	}
 
 	if (opened) {
-		pa_sink_render_full(u->sink, unit_size, &u->memchunk);
+		pa_sink_render_full(u->sink, sys->buffer_size, &u->memchunk);
 
 		pa_assert(u->memchunk.length > 0);
 
 		p = pa_memblock_acquire(u->memchunk.memblock);
-		memcpy(&sys->buf[unit_size * sys->next_buf], (uint8_t*) p + u->memchunk.index, u->memchunk.length);
+		memcpy(&sys->buf[sys->buffer_size * sys->next_buf], (uint8_t*) p + u->memchunk.index, u->memchunk.length);
 		pa_memblock_release(u->memchunk.memblock);
 
 		pa_memblock_unref(u->memchunk.memblock);
 		pa_memchunk_reset(&u->memchunk);
 	} else {
-		pa_silence_memory(&sys->buf[unit_size * sys->next_buf], unit_size, &u->sink->sample_spec);
+		pa_silence_memory(&sys->buf[sys->buffer_size * sys->next_buf], sys->buffer_size, &u->sink->sample_spec);
 	}
 
 	result = Enqueue(sys->playerBufferQueue,
-		&sys->buf[unit_size * sys->next_buf], unit_size);
+		&sys->buf[sys->buffer_size * sys->next_buf], sys->buffer_size);
 
-	//pa_log_debug("Play %d bytes, pos %d result %d data %x st.count %d st.index %d", (int) unit_size, (int) (unit_size * sys->next_buf), (int) result, * ((int *) &sys->buf[unit_size * sys->next_buf]), (int) st.count, (int) st.index);
+	//pa_log_debug("Play %d bytes, pos %d result %d data %x st.count %d st.index %d", (int) sys->buffer_size, (int) (sys->buffer_size * sys->next_buf), (int) result, * ((int *) &sys->buf[unit_size * sys->next_buf]), (int) st.count, (int) st.index);
 
 	if (result == SL_RESULT_SUCCESS) {
 		sys->next_buf += 1;
@@ -245,7 +257,7 @@ static int process_render(struct userdata *u, bool opened) {
 	} else {
 		/* XXX : if writing fails, we don't retry */
 		pa_log("error %d when writing %d bytes %s",
-				(int)result, (int)unit_size,
+				(int)result, (int)sys->buffer_size,
 				(result == SL_RESULT_BUFFER_INSUFFICIENT) ? " (buffer insufficient)" : "");
 		return -1;
 	}
@@ -426,12 +438,6 @@ int pa__init(pa_module *m) {
 	result = SetPlayState(sys->playerPlay, SL_PLAYSTATE_PLAYING);
 	CHECK_OPENSL_ERROR("Failed to switch to playing state");
 
-	/* XXX: rounding shouldn't affect us at normal sampling rate */
-	sys->samples_per_buf = OPENSLES_BUFLEN * u->rate / 1000;
-	sys->buf = pa_xmalloc(sys->samples_per_buf * bytesPerSample() * OPENSLES_BUFFERS);
-
-	sys->next_buf = 0;
-
 	// Finish initializing PulseAudio sink
 	pa_sink_new_data_init(&data);
 	data.driver = __FILE__;
@@ -448,7 +454,7 @@ int pa__init(pa_module *m) {
 		goto fail;
 	}
 
-	u->sink = pa_sink_new(m->core, &data, PA_SINK_LATENCY);
+	u->sink = pa_sink_new(m->core, &data, PA_SINK_LATENCY|PA_SINK_DYNAMIC_LATENCY);
 	pa_sink_new_data_done(&data);
 
 	if (!u->sink) {
@@ -458,29 +464,28 @@ int pa__init(pa_module *m) {
 
 	u->sink->parent.process_msg = sink_process_msg;
 	u->sink->set_state_in_io_thread = sink_set_state_in_io_thread_cb;
+	u->sink->update_requested_latency = sink_update_requested_latency_cb;
 	u->sink->userdata = u;
 
 	pa_sink_set_asyncmsgq(u->sink, u->thread_mq.inq);
 	pa_sink_set_rtpoll(u->sink, u->rtpoll);
 
-	u->bytes_dropped = 0;
+	u->buffer_count = 1;
 
-	int buffer_size_ms = 20;
-	if (getenv("AUDIO_BUFFER_SIZE_MS") != NULL && atoi(getenv("AUDIO_BUFFER_SIZE_MS")) > 0) {
-		buffer_size_ms = atoi(getenv("AUDIO_BUFFER_SIZE_MS"));
-	}
+	int buffer_size_ms = OPENSLES_BUFLEN;
 	u->buffer_size = pa_bytes_per_second(&u->sink->sample_spec) * buffer_size_ms / 1000;
 	// Align PulseAudio buffer size to OpenSL ES buf chunk size
-	u->buffer_size = (u->buffer_size / (sys->samples_per_buf * bytesPerSample())) * (sys->samples_per_buf * bytesPerSample());
 	u->buffer_size = pa_frame_align(u->buffer_size, &u->sink->sample_spec);
-	if (u->buffer_size % (sys->samples_per_buf * bytesPerSample()) != 0) {
-		pa_log("PulseAudio buffer size %d does not divide evenly by OpenSL ES buffer frame size %d", (int)u->buffer_size, (int)sys->samples_per_buf * bytesPerSample());
-		goto fail;
-	}
-	pa_sink_set_fixed_latency(u->sink, pa_bytes_to_usec(u->buffer_size, &u->sink->sample_spec));
+	pa_sink_set_latency_range(u->sink, pa_bytes_to_usec(u->buffer_size, &u->sink->sample_spec),
+								(OPENSLES_BUFFERS - 1) * pa_bytes_to_usec(u->buffer_size, &u->sink->sample_spec));
+	pa_sink_set_max_request(u->sink, u->buffer_size * (OPENSLES_BUFFERS - 1));
+	pa_log("OpenSLES buffer size = %d bytes = %d milliseconds", (int) u->buffer_size, buffer_size_ms);
+
+	// OpenSL output buffer
+	sys->buf = pa_xmalloc(sys->buffer_size * OPENSLES_BUFFERS);
+	sys->next_buf = 0;
+
 	thread_routine = thread_func;
-	pa_sink_set_max_request(u->sink, u->buffer_size);
-	pa_log("OpenSLES buffer size = %d bytes = %d milliseconds, change with setenv AUDIO_BUFFER_SIZE_MS", (int) u->buffer_size, buffer_size_ms);
 
 	if (!(u->thread = pa_thread_new("opensles-sink", thread_routine, u))) {
 		pa_log("Failed to create thread.");
