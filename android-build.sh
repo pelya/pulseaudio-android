@@ -3,6 +3,7 @@
 BUILD_PARALLEL=false
 NCPU=8
 ARCH_LIST="arm64-v8a x86_64 x86 armeabi-v7a"
+ARCH_LIST="arm64-v8a"
 
 [ -e libtool-2.4.6.tar.gz ] || wget http://ftpmirror.gnu.org/libtool/libtool-2.4.6.tar.gz || exit 1
 [ -e 12916e229c769da4929f6df7f038ab51cf0cb067.tar.gz ] || wget https://github.com/json-c/json-c/archive/12916e229c769da4929f6df7f038ab51cf0cb067.tar.gz || exit 1
@@ -115,7 +116,9 @@ build() {
 		LIBSNDFILE_CFLAGS=-I`pwd`/libsndfile-1.0.25/install/include \
 		LIBSNDFILE_LIBS="-L`pwd`/libsndfile-1.0.25/install/lib -lsndfile" \
 		ALLOW_UNRESOLVED_SYMBOLS=1 \
-		ac_cv_func_mkfifo=yes \
+		ac_cv_func_mkfifo=no \
+		ac_cv_func_getuid=no \
+		ac_cv_func_getuid=seteuid \
 		ax_cv_PTHREAD_PRIO_INHERIT=no \
 		ac_cv_header_langinfo_h=no \
 		ac_cv_header_glob_h=no \
