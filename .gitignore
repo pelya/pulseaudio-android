@@ -4,7 +4,6 @@
 ABOUT-NLS
 build*
 *~
-*.tar.gz
 *.pc
 PulseAudioConfig.cmake
 PulseAudioConfigVersion.cmake
