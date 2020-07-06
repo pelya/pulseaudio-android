@@ -5,7 +5,6 @@ NCPU=8
 ARCH_LIST="arm64-v8a x86_64 x86 armeabi-v7a"
 #ARCH_LIST="arm64-v8a"
 
-[ -e libtool-2.4.6.tar.gz ] || wget http://ftpmirror.gnu.org/libtool/libtool-2.4.6.tar.gz || exit 1
 [ -e 12916e229c769da4929f6df7f038ab51cf0cb067.tar.gz ] || wget https://github.com/json-c/json-c/archive/12916e229c769da4929f6df7f038ab51cf0cb067.tar.gz || exit 1
 [ -e libsndfile-1.0.25.tar.gz ] || wget http://www.mega-nerd.com/libsndfile/files/libsndfile-1.0.25.tar.gz || exit 1
 
