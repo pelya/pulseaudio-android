@@ -121,6 +121,7 @@ build() {
 		ax_cv_PTHREAD_PRIO_INHERIT=no \
 		ac_cv_header_langinfo_h=no \
 		ac_cv_header_glob_h=no \
+		ac_cv_header_execinfo_h=no \
 		../setCrossEnvironment-$ARCH.sh \
 		  ../configure            \
 		  --prefix=`pwd`/install  \
