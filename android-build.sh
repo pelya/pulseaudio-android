@@ -25,6 +25,7 @@ build() {
 
 	mkdir -p $ARCH
 	cd $ARCH
+	cp -f ../.version ./
 
 	[ -e libtool-master/install/lib/libltdl.so ] || {
 		rm -rf libtool-master
@@ -116,7 +117,6 @@ build() {
 		LIBSNDFILE_CFLAGS=-I`pwd`/libsndfile-1.0.25/install/include \
 		LIBSNDFILE_LIBS="-L`pwd`/libsndfile-1.0.25/install/lib -lsndfile" \
 		ALLOW_UNRESOLVED_SYMBOLS=1 \
-		VERSION="`cat ../.version`" \
 		ac_cv_func_mkfifo=no \
 		ac_cv_func_getuid=no \
 		ac_cv_func_getuid=seteuid \

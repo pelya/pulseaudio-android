@@ -30,9 +30,9 @@ AM_INIT_AUTOMAKE([foreign 1.11 -Wall -Wno-portability subdir-objects silent-rule
 
 AM_MAINTAINER_MODE([enable])
 
-AS_IF([! test -n "$VERSION"], [
-   AC_MSG_ERROR([git-version-gen failed])
-])
+#AS_IF([! test -n "$VERSION"], [
+#   AC_MSG_ERROR([git-version-gen failed])
+#])
 
 m4_define(pa_major, `echo $VERSION | cut -d. -f1 | cut -d- -f1`)
 m4_define(pa_minor, `echo $VERSION | cut -d. -f2 | cut -d- -f1`)
