@@ -83,6 +83,7 @@ build() {
 			--disable-shared \
 			--disable-external-libs \
 			--disable-alsa \
+			--disable-sqlite \
 			--enable-static \
 			|| exit 1
 		echo 'int main () {}' > programs/sndfile-play.c
